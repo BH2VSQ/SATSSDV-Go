@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SATSSDV-Go</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark">SD</div><div><strong>SATSSDV-Go</strong><small>Satellite Digital Image Workstation</small></div></div>
+      <nav class="nav"><button class="nav-btn active" data-page="workbench" data-i18n="nav.workbench">工作台</button><button class="nav-btn" data-page="album" data-i18n="nav.album">相册</button></nav>
+      <div class="top-actions"><span class="system-state"><i></i><span id="global-state">待机</span></span><select id="language-select" aria-label="Language"><option value="zh-CN">简体中文</option><option value="en">English</option><option value="ja-JP">日本語</option></select><button class="icon-btn" id="settings-open" title="设置" data-i18n-title="nav.settings">⚙</button></div>
+    </header>
+
+    <main id="page-workbench" class="page active">
+      <div class="profile-rows">
+        <div class="profile-row"><div class="profile-label"><b>RX PROFILE</b><small data-i18n="rx.title">接收 RX</small></div><div id="rx-profile-list" class="profile-list"></div><span class="profile-meta" id="rx-meta">RX 待机</span></div>
+        <div class="profile-row"><div class="profile-label"><b>TX PROFILE</b><small data-i18n="tx.title">发送 TX</small></div><div id="tx-profile-list" class="profile-list"></div><span class="profile-meta" id="tx-meta">TX 就绪</span></div>
+      </div>
+      <div class="workbench">
+        <section class="pane rx-pane">
+          <div class="pane-title"><div><span class="eyebrow">RECEIVE</span><h2 data-i18n="rx.title">接收 RX</h2></div><div class="pane-actions"><button class="secondary-btn compact" id="rx-toggle">停止 RX</button><span class="state-pill idle" id="rx-pill">RX IDLE</span></div></div>
+          <div class="image-view"><div class="empty-image"><div class="image-glyph">▧</div><b data-i18n="rx.wait">等待接收音频</b><small>SSDV / PCSI progressive reconstruction</small></div></div>
+          <div class="image-metadata"><span>CALL <b id="rx-callsign">---</b></span><span>IMAGE ID <b id="rx-image-id">--</b></span><span>PACKETS <b id="rx-packets">0 / 0</b></span><span>MODE <b id="rx-mode">---</b></span></div>
+          <div class="spectrum-header"><b data-i18n="rx.spectrum">RX 瀑布图</b><span data-i18n="waterfall.rxInput">INPUT · AUDIO WATERFALL</span></div>
+          <div class="spectrum waterfall"><canvas id="rx-spectrum" aria-label="RX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.rxWaiting">等待 RX 音频</div></div>
+          <div class="spectrum-footer"><span>LEVEL <b id="rx-level">-∞ dBFS</b></span><span>PEAK <b id="rx-peak">---</b></span><span data-i18n="waterfall.frequencyAxis">横轴：频率 · 纵轴：时间</span></div>
+        </section>
+
+        <section class="pane tx-pane">
+          <div class="pane-title">
+            <div><span class="eyebrow">TRANSMIT</span><h2 data-i18n="tx.title">发送 TX</h2></div>
+            <div class="pane-actions tx-pane-actions">
+              <div class="tx-transmission" role="group" aria-label="TX transmission settings">
+                <b class="tx-transmission-title" data-i18n="tx.transmission">发射设置</b>
+                <label class="transmission-quality"><span class="tx-control-label" data-i18n="quality">图片质量</span><select id="quality-select"><option value="low" data-i18n="quality.low">低质量 320×240</option><option value="medium" selected data-i18n="quality.medium">中质量 448×336</option><option value="high" data-i18n="quality.high">高质量 640×480</option></select></label>
+                <label class="check-row transmission-repeat"><input id="repeat-check" type="checkbox"/><span data-i18n="tx.repeat">循环发送</span></label>
+                <label class="transmission-interval"><span class="tx-control-label" data-i18n="tx.interval">发送间隔（秒）</span><input id="send-interval" type="number" value="120" min="0" max="86400"/></label>
+              </div>
+              <button class="tx-toggle idle" id="tx-toggle" type="button" disabled data-i18n="tx.start">开始发射</button>
+              <span class="state-pill idle" id="tx-pill" data-i18n="tx.idle">TX IDLE</span>
+            </div>
+          </div>
+
+          <section class="template-strip" aria-label="TX template presets">
+            <div class="template-strip-head">
+              <label class="template-select-label" for="template-select"><b data-i18n="template.title">发射模板</b>
+                <select id="template-select" aria-label="选择发射模板"></select>
+              </label>
+              <button class="secondary-btn compact" id="template-add" type="button" data-i18n="template.addPreset">＋ 新建预设</button>
+              <button class="secondary-btn compact" id="template-duplicate" type="button" data-i18n="template.duplicatePreset">复制当前</button>
+              <button class="text-btn danger-text" id="template-delete" type="button" data-i18n="template.deletePreset">删除当前</button>
+            </div>
+            <div class="template-name-row">
+              <label for="template-name" data-i18n="template.presetName">预设名称</label>
+              <input id="template-name" type="text" maxlength="48" value="CQ" aria-label="Template name"/>
+              <button class="secondary-btn compact primary-small" id="template-save" type="button" data-i18n="template.savePreset">保存预设</button>
+              <small data-i18n="template.presetHint">可添加多个独立发射模板预设</small>
+            </div>
+          </section>
+
+          <div class="tx-main">
+            <div class="tx-preview-column">
+              <div class="tx-canvas"><canvas id="template-canvas" width="448" height="336" aria-label="TX template canvas"></canvas></div>
+              <div class="tx-progress"><i id="tx-progress"></i></div>
+            <div class="tx-qso-fields">
+              <div class="section-heading"><b data-i18n="template.qsoFields">本次 QSO 信息</b><span class="mini-label">PER TRANSMISSION</span></div>
+              <label><span data-i18n="template.myCall">本台呼号</span><input id="tx-my-call" type="text" maxlength="24" placeholder="N0CALL"/></label>
+              <label><span data-i18n="template.hisCall">对方呼号</span><input id="tx-his-call" type="text" maxlength="24" placeholder="N0TEST"/></label>
+              <label><span data-i18n="template.qth">QTH</span><input id="tx-qth" type="text" maxlength="64" placeholder="EXAMPLE QTH"/></label>
+              <label><span data-i18n="template.locator">网格定位</span><input id="tx-locator" type="text" maxlength="12" placeholder="JJ00"/></label>
+              <label><span data-i18n="template.report">RST / 报告</span><input id="tx-report" type="text" maxlength="16" value="595"/></label>
+              <label><span data-i18n="template.message">消息</span><input id="tx-message" type="text" maxlength="128"/></label>
+            </div>
+            </div>
+            <aside class="tx-side">
+              <div class="side-section template-editor">
+                <div class="section-heading">
+                  <b data-i18n="template.componentsTitle">模板组件</b>
+                  <div class="component-actions">
+                    <button class="text-btn danger-text clear-background-action" id="template-clear-background" data-i18n="gallery.clearBackground" title="清除共享底图">清除底图</button>
+                    <button class="secondary-btn compact" id="template-add-text" data-i18n="template.addText">＋ 文字</button>
+                    <button class="secondary-btn compact" id="template-add-image" data-i18n="template.addImage">＋ 图像</button>
+                    <button class="secondary-btn compact" id="template-add-rx" data-i18n="template.addRX">上次 RX</button>
+                  </div>
+                </div>
+                <div class="component-list" id="template-components"></div>
+                <div class="template-properties">
+                  <div class="property-head"><b data-i18n="template.componentProperties">组件属性</b><button class="text-btn danger-text" id="component-delete" data-i18n="template.deleteComponent">删除所选组件</button></div>
+                  <label class="template-field-full field-label" id="component-text-field"><span data-i18n="template.content">文字内容</span><textarea id="component-text" rows="2" placeholder="CQ SATELLITE or {MYCALL}"></textarea></label>
+                  <label class="template-field-full field-label" id="component-source-field"><span data-i18n="template.imageSource">图像来源</span><select id="component-asset"><option value="">未选择</option></select></label>
+                  <div class="template-drag-hint" data-i18n="template.dragHint">直接在预览画布中拖动组件调整位置</div>
+                  <div class="template-prop-grid">
+                    <label class="component-range-field" id="component-image-scale-field"><span data-i18n="template.imageScale">等比例缩放 %</span><output id="component-image-scale-value">35%</output><input id="component-image-scale" type="range" min="5" max="100" step="1"/></label>
+                    <label class="component-range-field" id="component-font-size-field"><span data-i18n="template.fontSize">字号 px</span><output id="component-font-size-value">28 px</output><input id="component-font-size" type="range" min="6" max="160" step="1"/></label>
+                    <label class="component-range-field"><span data-i18n="template.outlineWidth">描边宽度 px</span><output id="component-outline-width-value">2 px</output><input id="component-outline-width" type="range" min="0" max="20" step="0.5"/></label>
+                  </div>
+                  <div class="template-color-row">
+                    <label id="component-color-field"><span data-i18n="template.color">文字颜色</span><input id="component-color" type="color" value="#ffffff"/></label>
+                    <label><span data-i18n="template.outlineColor">描边颜色</span><input id="component-outline-color" type="color" value="#000000"/></label>
+                    <label id="component-bold-field"><input id="component-bold" type="checkbox"/> <span data-i18n="template.bold">粗体</span></label>
+                    <label><input id="component-visible" type="checkbox" checked/> <span data-i18n="template.visible">显示</span></label>
+                    <label><input id="component-outline" type="checkbox" checked/> <span data-i18n="template.outline">描边</span></label>
+                  </div>
+                </div>
+              </div>
+
+            </aside>
+          </div>
+
+          <div class="spectrum-header"><b data-i18n="tx.spectrum">TX 瀑布图</b><span data-i18n="waterfall.txOutput">OUTPUT · AUDIO WATERFALL</span></div>
+          <div class="spectrum tx-spectrum waterfall"><canvas id="tx-spectrum" aria-label="TX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.txWaiting">等待 TX 音频</div></div>
+          <div class="spectrum-footer"><span>OUTPUT <b id="tx-level">-∞ dBFS</b></span><span>PEAK <b id="tx-peak">---</b></span><span>MODE <b id="tx-mode-label">SSDV AX.25</b></span></div>
+        </section>
+      </div>
+      <div class="warning-strip" data-i18n="status.incomplete">协议编解码仍在开发验证中，当前版本不应直接用于空中发射。</div>
+    </main>
+
+    <main id="page-album" class="page simple-page album-page">
+      <div class="album-toolbar">
+        <div><span class="eyebrow">RX / TX HISTORY</span><h2 data-i18n="album.title">图像相册</h2><small data-i18n="album.subtitle">历史接收与发送图像，自动记录时间戳</small></div>
+        <div class="album-actions"><select id="album-filter"><option value="all" data-i18n="album.all">全部图像</option><option value="rx" data-i18n="album.rx">仅接收 RX</option><option value="tx" data-i18n="album.tx">仅发送 TX</option></select></div>
+      </div>
+      <div class="album-grid" id="album-list"><div class="album-empty" data-i18n="album.empty">相册暂无图像。</div></div>
+      <div class="album-footnote" data-i18n="album.footnote">点击缩略图查看大图，右键可导出或删除记录。</div>
+    </main>
+  </div>
+
+  <div id="app-toast" class="app-toast" role="status" aria-live="polite" hidden></div>
+
+  <div class="modal-backdrop" id="settings-modal" hidden>
+    <section class="settings-modal">
+      <header class="modal-heading"><div><span class="eyebrow" data-i18n="settings.configuration">应用程序设置</span><h2 data-i18n="nav.settings">设备设置</h2></div><button class="icon-btn" id="settings-close">×</button></header>
+      <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button class="settings-tab active" type="button" data-settings-tab="general" data-i18n="settings.tabGeneral">设备与电台</button>
+        <button class="settings-tab" type="button" data-settings-tab="display" data-i18n="settings.tabDisplay">显示设置</button>
+      </nav>
+      <div class="settings-content">
+        <div class="settings-page" id="settings-page-general">
+        <section class="settings-section"><h3 data-i18n="ptt.title">PTT 发射控制</h3><label class="field-label" data-i18n="ptt.mode">控制方式</label><select id="ptt-mode"><option value="vox" data-i18n="ptt.vox">VOX</option><option value="hamlib" data-i18n="ptt.hamlib">Hamlib Net Rigctl</option><option value="rts" data-i18n="ptt.rts">串口 RTS</option><option value="dtr" data-i18n="ptt.dtr">串口 DTR</option></select>
+          <div id="hamlib-fields" class="conditional-fields"><label class="field-label" data-i18n="ptt.address">rigctld 地址</label><input id="rigctl-address" type="text" value="127.0.0.1:4532" placeholder="127.0.0.1:4532"/><div class="ptt-test-row"><span class="test-status" id="hamlib-test-status">待机</span><button class="test-btn" id="hamlib-test-btn" data-i18n="ptt.test">测试 PTT</button></div><small data-i18n="ptt.autoRelease">最长 15 秒，后端自动释放</small></div>
+          <div id="serial-fields" class="conditional-fields" hidden><label class="field-label" data-i18n="ptt.port">串口</label><div class="serial-row"><select id="serial-port"><option value="">未发现串口</option></select><button class="secondary-btn" id="serial-refresh" data-i18n="ptt.refresh">刷新串口</button></div><div class="check-row"><input type="checkbox" id="active-high" checked/><label for="active-high" data-i18n="ptt.activeHigh">高电平有效</label></div><div class="ptt-test-row"><span class="test-status" id="serial-test-status">待机</span><button class="test-btn" id="serial-test-btn" data-i18n="ptt.test">测试 PTT</button></div><small data-i18n="ptt.autoRelease">最长 15 秒，后端自动释放</small></div>
+          <div id="vox-hint" class="info-hint" data-i18n="ptt.voxHint">VOX 由电台检测音频自动发射，不需要软件 PTT 测试。</div>
+        </section>
+        <section class="settings-section"><h3 data-i18n="audio.title">音频设备</h3><div class="two-fields"><div><label class="field-label" data-i18n="audio.rxDevice">RX 输入设备</label><select id="rx-device"><option value="" data-i18n="audio.default">系统默认</option></select></div><div><label class="field-label" data-i18n="audio.txDevice">TX 输出设备</label><select id="tx-device"><option value="" data-i18n="audio.default">系统默认</option></select></div></div><button class="secondary-btn" id="audio-refresh" data-i18n="audio.refresh">刷新音频设备</button><small id="audio-device-status" data-i18n="audio.fullDuplexHint">共享输入和输出流，支持软件全双工。</small><label class="field-label" data-i18n="audio.sampleRate">采样率</label><select id="sample-rate"><option>19200</option><option>44100</option><option selected>48000</option><option>96000</option></select><small data-i18n="audio.duplexDetail">输入和输出采用独立共享音频流，TX 播放期间 RX 保持采集。</small></section>
+        <section class="settings-section"><h3 data-i18n="station.title">本站身份信息</h3><div class="two-fields"><div><label class="field-label" data-i18n="station.callsign">本站呼号</label><input id="callsign" type="text" value="N0CALL"/></div><div><label class="field-label" data-i18n="station.locator">网格定位</label><input id="locator" type="text" value="JJ00"/></div></div></section>
+        </div>
+        <div class="settings-page" id="settings-page-display" hidden>
+          <section class="settings-section"><h3 data-i18n="waterfall.title">音频瀑布图参数</h3>
+            <div class="waterfall-settings-grid">
+              <label class="waterfall-range"><span data-i18n="waterfall.minFrequency">最低频率</span><output id="waterfall-min-frequency-value">0 Hz</output><input id="waterfall-min-frequency" type="range" min="0" max="47000" step="100" value="0"/></label>
+              <label class="waterfall-range"><span data-i18n="waterfall.maxFrequency">最高频率</span><output id="waterfall-max-frequency-value">5000 Hz</output><input id="waterfall-max-frequency" type="range" min="100" max="48000" step="100" value="5000"/></label>
+              <label class="waterfall-range"><span data-i18n="waterfall.minDb">最低电平</span><output id="waterfall-min-db-value">-110 dBFS</output><input id="waterfall-min-db" type="range" min="-120" max="-10" step="1" value="-110"/></label>
+              <label class="waterfall-range"><span data-i18n="waterfall.maxDb">最高电平</span><output id="waterfall-max-db-value">-20 dBFS</output><input id="waterfall-max-db" type="range" min="-90" max="0" step="1" value="-20"/></label>
+              <label class="waterfall-range"><span data-i18n="waterfall.rowsPerSecond">滚动速度</span><output id="waterfall-rows-value">15 行/秒</output><input id="waterfall-rows" type="range" min="1" max="40" step="1" value="15"/></label>
+              <label class="waterfall-range"><span data-i18n="waterfall.history">历史时长</span><output id="waterfall-history-value">20 秒</output><input id="waterfall-history" type="range" min="5" max="60" step="1" value="20"/></label>
+            </div>
+            <small data-i18n="waterfall.hint">横轴为频率，纵轴为时间。颜色表示信号强度，修改后实时预览，点击保存应用。</small>
+          </section>
+          <section class="settings-section"><h3 data-i18n="waterfall.colors">瀑布图颜色</h3>
+            <div class="waterfall-color-grid">
+              <label><span data-i18n="waterfall.background">背景色</span><input id="waterfall-background-color" type="color" value="#07111b"/></label>
+              <label><span data-i18n="waterfall.lowColor">弱信号</span><input id="waterfall-low-color" type="color" value="#153a78"/></label>
+              <label><span data-i18n="waterfall.midColor">中等信号</span><input id="waterfall-mid-color" type="color" value="#168fae"/></label>
+              <label><span data-i18n="waterfall.highColor">强信号</span><input id="waterfall-high-color" type="color" value="#39c6b0"/></label>
+              <label><span data-i18n="waterfall.peakColor">峰值信号</span><input id="waterfall-peak-color" type="color" value="#f7d45b"/></label>
+            </div>
+            <div class="waterfall-demo"><canvas id="waterfall-demo" width="640" height="100"></canvas></div>
+            <button class="secondary-btn" id="waterfall-reset" type="button" data-i18n="waterfall.reset">恢复默认显示设置</button>
+          </section>
+        </div>
+      </div>
+      <footer class="modal-footer"><span id="settings-message" class="settings-message"></span><button class="secondary-btn" id="settings-cancel" data-i18n="cancel">取消</button><button class="primary-btn" id="settings-save" data-i18n="save">保存</button></footer>
+    </section>
+  </div>
+
+  <dialog id="image-library-dialog" class="image-library-dialog">
+    <header class="dialog-title">
+      <div><strong data-i18n="gallery.title">模板图片图库</strong><small data-i18n="gallery.subtitle">图片保存在本机用户配置目录，模板通过资源 ID 引用</small></div>
+      <div class="image-library-toolbar"><button class="primary-btn" id="gallery-import" data-i18n="gallery.import">导入图片</button><button class="icon-btn" id="gallery-close" aria-label="Close">×</button></div>
+    </header>
+    <div id="gallery-feedback" class="gallery-feedback" role="status" aria-live="polite"></div>
+    <div id="image-library-grid" class="image-library-grid"><div class="image-library-empty" data-i18n="gallery.loading">正在读取图库…</div></div>
+  </dialog>
+  <dialog id="album-preview-dialog" class="album-preview-dialog"><button class="preview-close" id="album-preview-close">×</button><img id="album-preview-image" alt="Album image preview"/><div id="album-preview-caption"></div></dialog>
+  <script src="app.js"></script>
+</body>
+</html>
