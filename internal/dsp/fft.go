@@ -8,6 +8,8 @@ import (
 type SpectrumBin struct {
 	FrequencyHz   float64 `json:"frequencyHz"`
 	MagnitudeDBFS float64 `json:"magnitudeDbfs"`
+	Real          float64 `json:"real"`
+	Imag          float64 `json:"imag"`
 }
 
 // Spectrum computes a Hann-windowed real-input FFT. Input is never modified.
@@ -29,12 +31,18 @@ func Spectrum(samples []float32, sampleRate int) ([]SpectrumBin, error) {
 	out := make([]SpectrumBin, n/2+1)
 	windowGain := float64(n) / 2
 	for k := range out {
-		mag := math.Hypot(re[k], im[k]) / windowGain
+		scale := 1.0
 		if k != 0 && k != n/2 {
-			mag *= 2
+			scale = 2
 		}
+		real := re[k] / windowGain * scale
+		imag := im[k] / windowGain * scale
+		mag := math.Hypot(real, imag)
 		db := 20 * math.Log10(math.Max(mag, 1e-12))
-		out[k] = SpectrumBin{FrequencyHz: float64(k) * float64(sampleRate) / float64(n), MagnitudeDBFS: db}
+		out[k] = SpectrumBin{
+			FrequencyHz:   float64(k) * float64(sampleRate) / float64(n),
+			MagnitudeDBFS: db, Real: real, Imag: imag,
+		}
 	}
 	return out, nil
 }

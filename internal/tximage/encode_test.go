@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
 )
 
 func txFixture() *image.RGBA {
@@ -49,5 +50,36 @@ func TestEncodeSSDVImageAtAllLinkProfiles(t *testing.T) {
 		if result.PacketCount <= 0 || len(result.Waveform) == 0 || result.SampleRate != 48000 {
 			t.Fatalf("%s: invalid encoding result: packets=%d waveform=%d rate=%d", profile, result.PacketCount, len(result.Waveform), result.SampleRate)
 		}
+	}
+}
+
+func TestEncodeAX25SupportsDestinationAndLocalSSID(t *testing.T) {
+	result, err := EncodeImageWithAX25(txFixture(), string(domain.SSDVAX25), "low", "N0CALL", 9, 19200, 7, "JA1ABC")
+	if err != nil {
+		t.Fatalf("AX.25 encode with SSID and destination callsign failed: %v", err)
+	}
+	if result.PacketCount == 0 || len(result.Waveform) == 0 {
+		t.Fatal("AX.25 encoder returned an empty transmission")
+	}
+	if _, err := EncodeImageWithAX25(txFixture(), string(domain.SSDVAX25), "low", "N0CALL", 9, 19200, 16, "JA1ABC"); err == nil {
+		t.Fatal("AX.25 source SSID above 15 should be rejected")
+	}
+	if _, err := EncodeImageWithAX25(txFixture(), string(domain.SSDVAX25), "low", "N0CALL", 9, 19200, 0, "BAD CALL"); err == nil {
+		t.Fatal("invalid AX.25 destination callsign should be rejected")
+	}
+}
+
+func TestPCSITransmitPresetsReducePacketCount(t *testing.T) {
+	source := txFixture()
+	result, err := EncodeImage(source, string(domain.PCSICCSDS1200), "low", "N0CALL", 9, 19200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := pcsi.NewEncoder(result.Image, pcsi.Config{Callsign: "N0CALL", ImageID: 9, BitDepth: 12, ChromaCompression: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PacketCount >= legacy.PacketCount() {
+		t.Fatalf("TX preset did not lower packet count: new=%d old=%d", result.PacketCount, legacy.PacketCount())
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ccsds"
 )
@@ -268,5 +269,51 @@ func TestStreamingRXHandlesArbitraryAudioBlockBoundaries(t *testing.T) {
 				t.Fatalf("replayed capture delivered %d duplicate packets", duplicateCount)
 			}
 		})
+	}
+}
+
+func TestAX25StreamDecoderAcceptsAndReportsAnySourceSSID(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	for y := 0; y < 240; y++ {
+		for x := 0; x < 320; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: uint8(x ^ y), A: 255})
+		}
+	}
+	packets, err := ssdv.EncodeImage(img, ssdv.EncodeConfig{Callsign: "N0CALL", ImageID: 63, Quality: 4, FEC: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ssid := range []uint8{0, 1, 7, 15} {
+		enc, err := NewEncoder(Config{Profile: domain.SSDVAX25, Source: ax25.Address{Callsign: "N0CALL", SSID: ssid}, Destination: ax25.Address{Callsign: "CQ"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wave, err := enc.EncodePacket(packets[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec, err := NewStreamDecoder(domain.SSDVAX25, 19200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []ReceivedPacket
+		for off := 0; off < len(wave); {
+			end := off + 401
+			if end > len(wave) {
+				end = len(wave)
+			}
+			batch, feedErr := dec.Feed(wave[off:end])
+			if feedErr != nil {
+				t.Fatal(feedErr)
+			}
+			got = append(got, batch...)
+			off = end
+		}
+		if len(got) != 1 {
+			t.Fatalf("SSID %d: got %d packets", ssid, len(got))
+		}
+		if !got[0].HasAX25SSID || got[0].AX25SourceSSID != ssid {
+			t.Fatalf("SSID %d: decoded metadata %+v", ssid, got[0])
+		}
 	}
 }

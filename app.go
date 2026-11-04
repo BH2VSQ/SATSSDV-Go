@@ -55,6 +55,8 @@ type App struct {
 	rxSpectrumMu     sync.Mutex
 	rxSpectrumWindow []float32
 	rxQueue          chan []float32
+	rxQueueMu        sync.Mutex
+	rxGapPending     bool
 	rxCancel         context.CancelFunc
 	rxDone           chan struct{}
 	rxManager        *rxengine.Manager
@@ -278,8 +280,11 @@ func (a *App) initializeAudio() error {
 		workerParent = context.Background()
 	}
 	workerCtx, workerCancel := context.WithCancel(workerParent)
-	queue := make(chan []float32, 256)
+	queue := make(chan []float32, 512)
 	workerDone := make(chan struct{})
+	a.rxQueueMu.Lock()
+	a.rxGapPending = false
+	a.rxQueueMu.Unlock()
 	a.mu.Lock()
 	a.audioRuntime, a.audioDuplex = runtimeAudio, duplex
 	a.audioError = ""
@@ -311,6 +316,9 @@ func (a *App) closeAudio() error {
 	a.audioDuplex, a.audioRuntime = nil, nil
 	a.rxQueue, a.rxCancel, a.rxDone = nil, nil, nil
 	a.mu.Unlock()
+	a.rxQueueMu.Lock()
+	a.rxGapPending = false
+	a.rxQueueMu.Unlock()
 	if rxCancel != nil {
 		rxCancel()
 	}
@@ -408,6 +416,87 @@ func (a *App) StopTX() {
 	}
 }
 
+// Start1500HzTestTone transmits a windowed 1500 Hz tone for at most 60 seconds
+// through the configured TX audio/PTT path. A backend timeout cancels it even
+// when the UI remains open or its event loop is stalled.
+func (a *App) Start1500HzTestTone() error {
+	a.txGate.Lock()
+	a.mu.Lock()
+	duplex, parent, rate, runner := a.audioDuplex, a.ctx, a.settings.AudioSampleRate, a.pttTest
+	a.mu.Unlock()
+	if duplex == nil {
+		a.txGate.Unlock()
+		return audio.ErrRuntimeUnavailable
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if a.runtimeChanging || a.txReserved || (runner != nil && runner.State().Active) || duplex.State().TXActive {
+		a.txGate.Unlock()
+		return errors.New("TX is already active or PTT test is running")
+	}
+	if rate < 8000 || rate > 192000 {
+		a.txGate.Unlock()
+		return fmt.Errorf("invalid TX sample rate %d", rate)
+	}
+	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+	done := make(chan struct{})
+	a.txReserved = true
+	a.mu.Lock()
+	a.txCancel, a.txDone = cancel, done
+	appCtx := a.ctx
+	a.mu.Unlock()
+	a.txGate.Unlock()
+	if appCtx != nil {
+		runtime.EventsEmit(appCtx, "tx:tone-state", map[string]any{"active": true})
+	}
+	if appCtx != nil {
+		runtime.EventsEmit(appCtx, "tx:state", map[string]any{"active": true})
+	}
+	go func() {
+		defer close(done)
+		defer func() {
+			cancel()
+			a.txGate.Lock()
+			a.txReserved = false
+			a.mu.Lock()
+			if a.txDone == done {
+				a.txCancel, a.txDone = nil, nil
+			}
+			currentCtx := a.ctx
+			a.mu.Unlock()
+			a.txGate.Unlock()
+			if currentCtx != nil {
+				runtime.EventsEmit(currentCtx, "tx:tone-state", map[string]any{"active": false})
+				runtime.EventsEmit(currentCtx, "tx:state", map[string]any{"active": false})
+			}
+		}()
+		const duration = 60.0
+		samples := make([]float32, int(float64(rate)*duration))
+		const frequency = 1500.0
+		ramp := int(float64(rate) * 0.01)
+		for i := range samples {
+			gain := 0.30
+			if ramp > 0 && i < ramp {
+				gain *= float64(i) / float64(ramp)
+			}
+			if ramp > 0 && len(samples)-i <= ramp {
+				gain *= float64(len(samples)-i-1) / float64(ramp)
+			}
+			samples[i] = float32(gain * math.Sin(2*math.Pi*frequency*float64(i)/float64(rate)))
+		}
+		err := duplex.Transmit(ctx, samples, func(progress float64) {
+			a.emitTXProgress(samples, rate, progress)
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if currentCtx := a.getContext(); currentCtx != nil {
+				runtime.EventsEmit(currentCtx, "tx:error", err.Error())
+			}
+		}
+	}()
+	return nil
+}
+
 type RenderedTXImage struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
@@ -416,7 +505,7 @@ type RenderedTXImage struct {
 
 // StartTXRendered transmits the currently selected template as one image.
 // Repeat mode resends this same rendered image at the configured interval.
-func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSeconds int) error {
+func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSeconds int, ax25To string) error {
 	if intervalSeconds < 0 || intervalSeconds > 86400 {
 		return errors.New("TX interval must be between 0 and 86400 seconds")
 	}
@@ -437,12 +526,16 @@ func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSecond
 		return errors.New("rendered TX template is not a PNG")
 	}
 	a.mu.Lock()
-	profile, quality := a.settings.TXProfile, a.settings.Quality
+	profile, quality, ax25SSID := a.settings.TXProfile, a.settings.Quality, a.settings.AX25SSID
 	a.mu.Unlock()
+	ax25To = strings.ToUpper(strings.TrimSpace(ax25To))
+	if ax25To == "" {
+		ax25To = "CQ"
+	}
 	if _, err := domain.ParseProfile(profile); err != nil {
 		return err
 	}
-	job := txqueue.Job{ID: image.ID, ImageName: image.Name, ImageDataBase64: image.PNGBase64, Profile: profile, Quality: quality}
+	job := txqueue.Job{ID: image.ID, ImageName: image.Name, ImageDataBase64: image.PNGBase64, Profile: profile, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
 	return a.startTransmission(job, repeat, intervalSeconds)
 }
 
@@ -549,22 +642,23 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 	if duplex == nil {
 		return audio.ErrRuntimeUnavailable
 	}
-	result, err := tximage.EncodeImage(source, job.Profile, job.Quality, callsign, imageID, rate)
+	result, err := tximage.EncodeImageWithAX25(source, job.Profile, job.Quality, callsign, imageID, rate, uint8(job.AX25SSID), job.AX25To)
 	if err != nil {
 		return err
 	}
 	if appCtx := a.getContext(); appCtx != nil {
 		runtime.EventsEmit(appCtx, "tx:progress", 0.0)
 	}
+	transmissionStartedAt := time.Now().UTC()
 	if err := duplex.Transmit(ctx, result.Waveform, func(progress float64) {
 		a.emitTXProgress(result.Waveform, result.SampleRate, progress)
 	}); err != nil {
 		return err
 	}
-	return a.archiveTXImage(result.Image, job, callsign, imageID, result.PacketCount)
+	return a.archiveTXImage(result.Image, job, callsign, imageID, result.PacketCount, transmissionStartedAt)
 }
 
-func (a *App) archiveTXImage(img image.Image, job txqueue.Job, callsign string, imageID uint8, packetCount int) error {
+func (a *App) archiveTXImage(img image.Image, job txqueue.Job, callsign string, imageID uint8, packetCount int, transmissionStartedAt time.Time) error {
 	dir, err := a.requireDataDir()
 	if err != nil {
 		return err
@@ -575,7 +669,10 @@ func (a *App) archiveTXImage(img image.Image, job txqueue.Job, callsign string, 
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		return err
 	}
-	created := time.Now().UTC()
+	created := transmissionStartedAt.UTC()
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
 	name := fmt.Sprintf("TX_%s_%03d.png", created.Format("20060102T150405.000Z"), imageID)
 	path := filepath.Join(imageDir, name)
 	f, err := os.Create(path)
@@ -708,6 +805,12 @@ func (a *App) handleRXAudio(samples []float32) {
 }
 
 func (a *App) enqueueRXSamples(samples []float32) {
+	// Keep the capture callback non-blocking. If the decoder falls behind,
+	// preserve all audio already queued and remember a single discontinuity.
+	// The old implementation drained the entire queue on overflow, potentially
+	// throwing away several seconds of a valid image transmission at once.
+	a.rxQueueMu.Lock()
+	defer a.rxQueueMu.Unlock()
 	a.mu.Lock()
 	queue := a.rxQueue
 	a.mu.Unlock()
@@ -717,32 +820,28 @@ func (a *App) enqueueRXSamples(samples []float32) {
 	if samples == nil {
 		select {
 		case queue <- nil:
+			a.rxGapPending = false
 		default:
+			a.rxGapPending = true
 		}
 		return
+	}
+	if a.rxGapPending {
+		// Reserve two queue slots atomically from this producer's point of
+		// view: one for the discontinuity marker and one for the current block.
+		// Sending only the marker would create a reset on every callback while
+		// continuously dropping the corresponding audio block.
+		if cap(queue)-len(queue) < 2 {
+			return
+		}
+		queue <- nil
+		a.rxGapPending = false
 	}
 	block := append([]float32(nil), samples...)
 	select {
 	case queue <- block:
 	default:
-		// Sustained DSP overload drops stale buffered audio as one explicit
-		// discontinuity, then resumes from the most recent capture block.
-		for {
-			select {
-			case <-queue:
-			default:
-				goto drained
-			}
-		}
-	drained:
-		select {
-		case queue <- nil:
-		default:
-		}
-		select {
-		case queue <- block:
-		default:
-		}
+		a.rxGapPending = true
 	}
 }
 
@@ -790,12 +889,14 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 }
 
 func (a *App) handleRXImageUpdate(update rxengine.Update) {
-	if update.PNGBase64 != "" && update.Complete {
+	// Archive every decodable preview, not only the final packet-complete image.
+	// The same RX album record is updated as the scan grows and when it completes.
+	if update.PNGBase64 != "" && (update.ArchivePreview || update.Complete) {
 		if err := a.archiveRXImage(update); err != nil {
 			update.Error = err.Error()
 		}
 	}
-	if update.Codec == "SSDV" && update.Complete && update.PacketDataBase64 != "" {
+	if update.Codec == "SSDV" && update.PacketDataBase64 != "" {
 		if path, err := a.archiveRXSSDVPackets(update); err != nil {
 			if update.Error == "" {
 				update.Error = err.Error()
@@ -818,6 +919,12 @@ func (a *App) archiveRXImage(update rxengine.Update) error {
 	if err != nil {
 		return fmt.Errorf("decode reconstructed PNG: %w", err)
 	}
+	if len(data) == 0 || len(data) > 16*1024*1024 {
+		return errors.New("reconstructed PNG is empty or exceeds the 16 MiB album limit")
+	}
+	if _, err := png.DecodeConfig(bytes.NewReader(data)); err != nil {
+		return fmt.Errorf("validate reconstructed PNG: %w", err)
+	}
 	dir, err := a.requireDataDir()
 	if err != nil {
 		return err
@@ -829,29 +936,89 @@ func (a *App) archiveRXImage(update rxengine.Update) error {
 		return err
 	}
 	created := time.Now().UTC()
-	name := fmt.Sprintf("RX_%s_%03d.png", created.Format("20060102T150405.000Z"), update.ImageID)
+	name := fmt.Sprintf("RX_%s_%s_%03d.png", created.Format("20060102T150405.000000000Z"), safeAlbumName(update.Callsign), update.ImageID)
 	path := filepath.Join(imageDir, name)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return err
 	}
+	indexPath := filepath.Join(dir, "album.json")
 	var index album.Index
-	if err := storage.LoadJSON(filepath.Join(dir, "album.json"), &index); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := storage.LoadJSON(indexPath, &index); err != nil && !errors.Is(err, os.ErrNotExist) {
 		_ = os.Remove(path)
 		return err
 	}
-	index.Records = append(index.Records, album.Record{
-		ID:   fmt.Sprintf("rx-%s-%d", created.Format("20060102150405.000000000"), update.ImageID),
-		Type: "RX", ImagePath: path, ImageWidth: update.ImageWidth, ImageHeight: update.ImageHeight,
-		CreatedAt: created, Profile: update.Profile,
-		Callsign: update.Callsign, ImageID: uint16(update.ImageID),
-		PacketsReceived: update.PacketsReceived, PacketsExpected: update.PacketsExpected,
-		Quality: "received", Status: "complete",
-	})
-	if err := storage.SaveJSON(filepath.Join(dir, "album.json"), index); err != nil {
+	status := "receiving"
+	if update.Complete {
+		status = "complete"
+	}
+	var previousPath string
+	updated := false
+	for i := len(index.Records) - 1; i >= 0; i-- {
+		record := &index.Records[i]
+		if record.Type == "RX" && record.Profile == update.Profile && record.Callsign == update.Callsign &&
+			record.ImageID == uint16(update.ImageID) && record.SessionID == update.SessionID {
+			previousPath = record.ImagePath
+			record.ImagePath = path
+			record.ImageWidth, record.ImageHeight = update.ImageWidth, update.ImageHeight
+			record.PacketsReceived, record.PacketsExpected = update.PacketsReceived, update.PacketsExpected
+			record.Status = status
+			if update.Complete {
+				record.CreatedAt = created
+			}
+			if update.Codec == "SSDV" {
+				record.Quality = fmt.Sprintf("JPEG Q%d", update.Quality)
+			} else {
+				record.Quality = "PCSI preview"
+			}
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		quality := "PCSI preview"
+		if update.Codec == "SSDV" {
+			quality = fmt.Sprintf("JPEG Q%d", update.Quality)
+		}
+		index.Records = append(index.Records, album.Record{
+			ID:   fmt.Sprintf("rx-%s-%d-%s", created.Format("20060102150405.000000000"), update.ImageID, safeAlbumName(update.Profile)),
+			Type: "RX", ImagePath: path, ImageWidth: update.ImageWidth, ImageHeight: update.ImageHeight,
+			CreatedAt: created, Profile: update.Profile, Callsign: update.Callsign, ImageID: uint16(update.ImageID), SessionID: update.SessionID,
+			PacketsReceived: update.PacketsReceived, PacketsExpected: update.PacketsExpected, Quality: quality, Status: status,
+		})
+	}
+	duplicatePaths := collapseRXSessionRecords(&index, update)
+	if err := storage.SaveJSON(indexPath, index); err != nil {
 		_ = os.Remove(path)
 		return err
+	}
+	removeUnreferencedAlbumFiles(index, dir, duplicatePaths)
+	if previousPath != "" && previousPath != path {
+		root, rootErr := filepath.Abs(filepath.Join(dir, "album", "images"))
+		target, targetErr := filepath.Abs(previousPath)
+		if rootErr == nil && targetErr == nil {
+			rel, relErr := filepath.Rel(root, target)
+			if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				_ = os.Remove(target)
+			}
+		}
 	}
 	return nil
+}
+
+func safeAlbumName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "UNKNOWN"
+	}
+	var out strings.Builder
+	for _, r := range value {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			out.WriteRune(r)
+		} else {
+			out.WriteByte('_')
+		}
+	}
+	return out.String()
 }
 
 func (a *App) archiveRXSSDVPackets(update rxengine.Update) (string, error) {
@@ -873,7 +1040,7 @@ func (a *App) archiveRXSSDVPackets(update rxengine.Update) (string, error) {
 		return "", err
 	}
 	created := time.Now().UTC()
-	name := fmt.Sprintf("RX_%s_%03d.ssdv", created.Format("20060102T150405.000Z"), update.ImageID)
+	name := fmt.Sprintf("RX_%s_%s_%03d.ssdv", created.Format("20060102T150405.000000000Z"), safeAlbumName(update.Callsign), update.ImageID)
 	path := filepath.Join(imageDir, name)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", err
@@ -883,32 +1050,57 @@ func (a *App) archiveRXSSDVPackets(update rxengine.Update) (string, error) {
 		_ = os.Remove(path)
 		return "", err
 	}
-	// Attach the raw packet archive to the just-created image record so one RX
-	// operation does not create two visually identical album entries.
+	// Attach/update the raw packet archive on the same RX record as its image
+	// preview. Partial archives retain packet IDs in each 256-byte packet, so
+	// gaps remain detectable and can be recovered from a later capture.
 	attached := false
+	var previousPath string
 	for i := len(index.Records) - 1; i >= 0; i-- {
 		record := &index.Records[i]
-		if record.Type == "RX" && record.Profile == update.Profile && record.Callsign == update.Callsign &&
-			record.ImageID == uint16(update.ImageID) && record.PacketPath == "" && record.ImagePath != "" {
-			record.PacketPath = path
-			record.PacketsReceived, record.PacketsExpected = update.PacketsReceived, update.PacketsExpected
-			record.Quality = fmt.Sprintf("JPEG Q%d", update.Quality)
-			attached = true
-			break
+		if record.Type != "RX" || record.Profile != update.Profile || record.Callsign != update.Callsign ||
+			record.ImageID != uint16(update.ImageID) || record.SessionID != update.SessionID {
+			continue
 		}
+		previousPath = record.PacketPath
+		record.PacketPath = path
+		record.ImageWidth, record.ImageHeight = update.ImageWidth, update.ImageHeight
+		record.PacketsReceived, record.PacketsExpected = update.PacketsReceived, update.PacketsExpected
+		record.Quality = fmt.Sprintf("JPEG Q%d", update.Quality)
+		if update.Complete {
+			record.Status = "complete"
+			record.CreatedAt = created
+		} else if record.Status != "complete" {
+			record.Status = "receiving"
+		}
+		attached = true
+		break
 	}
 	if !attached {
+		status := "receiving"
+		if update.Complete {
+			status = "packet-complete-image-unavailable"
+		}
 		index.Records = append(index.Records, album.Record{
-			ID:   fmt.Sprintf("rx-ssdv-%s-%d", created.Format("20060102150405.000000000"), update.ImageID),
+			ID:   fmt.Sprintf("rx-ssdv-%s-%d-%s", created.Format("20060102150405.000000000"), update.ImageID, safeAlbumName(update.Profile)),
 			Type: "RX", PacketPath: path, ImageWidth: update.ImageWidth, ImageHeight: update.ImageHeight,
-			CreatedAt: created, Profile: update.Profile, Callsign: update.Callsign, ImageID: uint16(update.ImageID),
+			CreatedAt: created, Profile: update.Profile, Callsign: update.Callsign, ImageID: uint16(update.ImageID), SessionID: update.SessionID,
 			PacketsReceived: update.PacketsReceived, PacketsExpected: update.PacketsExpected,
-			Quality: fmt.Sprintf("JPEG Q%d", update.Quality), Status: "packet-complete-image-unavailable",
+			Quality: fmt.Sprintf("JPEG Q%d", update.Quality), Status: status,
 		})
 	}
+	duplicatePaths := collapseRXSessionRecords(&index, update)
 	if err := storage.SaveJSON(filepath.Join(dir, "album.json"), index); err != nil {
 		_ = os.Remove(path)
 		return "", err
+	}
+	removeUnreferencedAlbumFiles(index, dir, duplicatePaths)
+	if previousPath != "" && previousPath != path {
+		root, _ := filepath.Abs(filepath.Join(dir, "album", "packets"))
+		previous, _ := filepath.Abs(previousPath)
+		rel, relErr := filepath.Rel(root, previous)
+		if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			_ = os.Remove(previous)
+		}
 	}
 	return path, nil
 }
@@ -1069,6 +1261,7 @@ func (a *App) GetAlbum() ([]album.Record, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		return []album.Record{}, nil
 	}
+	album.SortNewestFirst(idx.Records)
 	return idx.Records, err
 }
 func (a *App) GetGallery() ([]gallery.Asset, error) {
@@ -1176,15 +1369,14 @@ func (a *App) GetLatestRXImageData() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for i := len(items) - 1; i >= 0; i-- {
-		if items[i].Type != "RX" || items[i].ImagePath == "" {
-			continue
-		}
-		stat, err := os.Stat(items[i].ImagePath)
+	// Resolve the most recent RX image at any supported output resolution.
+	// Do not filter by Quality: Last RX must support low, medium and high.
+	for _, item := range album.NewestRXImages(items) {
+		stat, err := os.Stat(item.ImagePath)
 		if err != nil || !stat.Mode().IsRegular() || stat.Size() <= 0 || stat.Size() > 16*1024*1024 {
 			continue
 		}
-		data, err := os.ReadFile(items[i].ImagePath)
+		data, err := os.ReadFile(item.ImagePath)
 		if err != nil {
 			continue
 		}

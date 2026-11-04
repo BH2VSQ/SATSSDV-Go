@@ -14,6 +14,12 @@ export function DeleteAlbumRecord(arg1:string):Promise<void>;
 
 export function DeleteGalleryImage(arg1:string):Promise<void>;
 
+export function ExportAlbumRecord(arg1:string):Promise<number>;
+
+export function ExportAlbumToDirectory():Promise<number>;
+
+export function ExportTemplatePack():Promise<string>;
+
 export function GetAlbum():Promise<Array<album.Record>>;
 
 export function GetAlbumImageData(arg1:string):Promise<string>;
@@ -46,17 +52,21 @@ export function GetTemplates():Promise<Array<template.Template>>;
 
 export function ImportGalleryImage(arg1:string):Promise<gallery.Asset>;
 
+export function ImportTemplatePack():Promise<number>;
+
 export function RefreshSerialPorts():Promise<Array<string>>;
 
 export function SaveSettings(arg1:main.Settings):Promise<void>;
 
 export function SaveTemplates(arg1:Array<template.Template>):Promise<void>;
 
+export function Start1500HzTestTone():Promise<void>;
+
 export function StartPTTTest():Promise<void>;
 
 export function StartRX():Promise<void>;
 
-export function StartTXRendered(arg1:main.RenderedTXImage,arg2:boolean,arg3:number):Promise<void>;
+export function StartTXRendered(arg1:main.RenderedTXImage,arg2:boolean,arg3:number,arg4:string):Promise<void>;
 
 export function StopPTTTest():Promise<void>;
 

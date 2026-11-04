@@ -56,6 +56,7 @@ func TestNormalizeWaterfallSettingsUsesSupportedNyquistCeiling(t *testing.T) {
 
 func TestWaterfallSettingsJSONRoundTrip(t *testing.T) {
 	want := DefaultSettings()
+	want.AX25SSID = 6
 	want.Waterfall = WaterfallSettings{
 		MinFrequencyHz: 1200, MaxFrequencyHz: 9600, MinDBFS: -100, MaxDBFS: -15,
 		RowsPerSecond: 24, HistorySeconds: 45, BackgroundColor: "#010203",
@@ -72,6 +73,9 @@ func TestWaterfallSettingsJSONRoundTrip(t *testing.T) {
 	if got.Waterfall != want.Waterfall {
 		t.Fatalf("waterfall settings did not persist through JSON: got %+v want %+v", got.Waterfall, want.Waterfall)
 	}
+	if got.AX25SSID != want.AX25SSID {
+		t.Fatalf("AX.25 SSID did not persist through JSON: got %d want %d", got.AX25SSID, want.AX25SSID)
+	}
 }
 
 func TestNormalizeSettingsKeepsWaterfallSettings(t *testing.T) {
@@ -82,5 +86,17 @@ func TestNormalizeSettingsKeepsWaterfallSettings(t *testing.T) {
 	got := normalizeSettings(Settings{Waterfall: want})
 	if got.Waterfall != want {
 		t.Fatalf("normalizeSettings did not retain display preferences: got %+v want %+v", got.Waterfall, want)
+	}
+}
+
+func TestNormalizeSettingsClampsAX25SSID(t *testing.T) {
+	if got := normalizeSettings(Settings{AX25SSID: 7}).AX25SSID; got != 7 {
+		t.Fatalf("valid AX.25 SSID not retained: got %d", got)
+	}
+	if got := normalizeSettings(Settings{AX25SSID: 16}).AX25SSID; got != 0 {
+		t.Fatalf("out-of-range AX.25 SSID should fall back to zero, got %d", got)
+	}
+	if got := normalizeSettings(Settings{AX25SSID: -1}).AX25SSID; got != 0 {
+		t.Fatalf("negative AX.25 SSID should fall back to zero, got %d", got)
 	}
 }

@@ -334,3 +334,101 @@ func TestPCSIMMTPayloadMatchesPythonReferenceVector(t *testing.T) {
 		t.Fatalf("PCSI MMT payload differs from the Python reference: got %x want %s", got, referenceSHA256)
 	}
 }
+
+func TestPCSIReconstructionConvergesWithoutGreenChromaArtifacts(t *testing.T) {
+	const width, height = 64, 64
+	src := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			src.SetRGBA(x, y, color.RGBA{R: 220, A: 255})
+		}
+	}
+	enc, err := NewEncoder(src, Config{Callsign: "N0CALL", BitDepth: 12, ChromaCompression: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packets := make([][]byte, 0, enc.PacketCount())
+	var info PacketInfo
+	for packetNumber := 0; packetNumber < enc.PacketCount(); packetNumber++ {
+		packet, err := enc.EncodePacket(packetNumber)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packets = append(packets, packet)
+		info, err = ParsePacket(packet)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	decode := func(iterations int) (*image.RGBA, ReconstructionStats) {
+		t.Helper()
+		state := NewDecoderState(info)
+		for _, packet := range packets {
+			if err := state.Add(packet); err != nil {
+				t.Fatal(err)
+			}
+		}
+		decoded, stats, err := state.Reconstruct(iterations)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decoded, stats
+	}
+	quick, quickStats := decode(24)
+	converged, finalStats := decode(96)
+	if quickStats.Coverage < 0.9 || finalStats.Coverage != quickStats.Coverage {
+		t.Fatalf("unexpected packet coverage: quick=%+v final=%+v", quickStats, finalStats)
+	}
+	quickCenter := quick.RGBAAt(32, 32)
+	finalCenter := converged.RGBAAt(32, 32)
+	if finalCenter.R < quickCenter.R+40 {
+		t.Fatalf("OWL-QN did not improve the recovered red channel: quick=%v final=%v", quickCenter, finalCenter)
+	}
+	if finalCenter.R < finalCenter.G+60 || finalCenter.R < finalCenter.B+60 {
+		t.Fatalf("red reference image has a chroma/green artifact: center=%v", finalCenter)
+	}
+}
+
+func TestPCSIEncoderPrecomputedColorPlanesPreserveWireOutput(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: uint8(x * 3), G: uint8(y * 3), B: uint8(x ^ y), A: 255})
+		}
+	}
+	enc, err := NewEncoder(img, Config{Callsign: "N0CALL", BitDepth: 12, ChromaCompression: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := enc.EncodePacket(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := ParsePacket(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Width != 64 || info.Height != 64 || info.YCbCrPixels <= 0 {
+		t.Fatalf("unexpected packet metadata: %+v", info)
+	}
+}
+
+func TestHigherPCSIChromaCompressionReducesPacketCount(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 640, 480))
+	for y := 0; y < 480; y++ {
+		for x := 0; x < 640; x++ {
+			img.SetRGBA(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: uint8(x + y), A: 255})
+		}
+	}
+	base, err := NewEncoder(img, Config{Callsign: "N0CALL", BitDepth: 12, ChromaCompression: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed, err := NewEncoder(img, Config{Callsign: "N0CALL", BitDepth: 12, ChromaCompression: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compressed.PacketCount() >= base.PacketCount() {
+		t.Fatalf("chroma compression did not reduce airtime packets: baseline=%d tuned=%d", base.PacketCount(), compressed.PacketCount())
+	}
+}

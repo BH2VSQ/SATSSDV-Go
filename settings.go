@@ -15,6 +15,7 @@ type Settings struct {
 	TXProfile                 string            `json:"txProfile"`
 	Quality                   string            `json:"quality"`
 	Callsign                  string            `json:"callsign"`
+	AX25SSID                  int               `json:"ax25Ssid"`
 	Locator                   string            `json:"locator"`
 	AudioSampleRate           int               `json:"audioSampleRate"`
 	RXInputDevice             string            `json:"rxInputDevice"`
@@ -122,6 +123,9 @@ func normalizeSettings(s Settings) Settings {
 	}
 	if s.Callsign != "" {
 		d.Callsign = s.Callsign
+	}
+	if s.AX25SSID >= 0 && s.AX25SSID <= 15 {
+		d.AX25SSID = s.AX25SSID
 	}
 	if s.Locator != "" {
 		d.Locator = s.Locator

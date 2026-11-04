@@ -89,9 +89,12 @@ func init() {
 	messages[Chinese]["album.all"] = "全部图像"
 	messages[Chinese]["album.rx"] = "仅接收 RX"
 	messages[Chinese]["album.tx"] = "仅发送 TX"
-	messages[Chinese]["album.empty"] = "相册暂无图像。完成接收或发射后会自动归档。"
+	messages[Chinese]["album.empty"] = "相册暂无图像。接收过程中也会自动保存可用预览和原始包。"
+	messages[Chinese]["album.noPreview"] = "尚无可解码预览，原始接收包已保存。"
 	messages[Chinese]["album.footnote"] = "点击缩略图查看大图；可导出带时间戳的 PNG 或删除记录。"
-	messages[Chinese]["album.export"] = "导出 PNG"
+	messages[Chinese]["album.export"] = "导出文件"
+	messages[Chinese]["album.exportAll"] = "导出相册到文件夹"
+	messages[Chinese]["album.exported"] = "已导出 {count} 个文件"
 	messages[Chinese]["album.delete"] = "删除记录"
 
 	messages[English]["template.componentsTitle"] = "Template Components"
@@ -116,9 +119,12 @@ func init() {
 	messages[English]["album.all"] = "All Images"
 	messages[English]["album.rx"] = "RX Only"
 	messages[English]["album.tx"] = "TX Only"
-	messages[English]["album.empty"] = "No images yet. Completed RX and TX images are archived automatically."
+	messages[English]["album.empty"] = "No images yet. Available previews and raw packets are also saved during RX."
+	messages[English]["album.noPreview"] = "No decoded preview yet; received packets are saved."
 	messages[English]["album.footnote"] = "Click a thumbnail to preview. Export timestamped PNGs or delete records."
-	messages[English]["album.export"] = "Export PNG"
+	messages[English]["album.export"] = "Export Files"
+	messages[English]["album.exportAll"] = "Export Album to Folder"
+	messages[English]["album.exported"] = "Exported {count} files"
 	messages[English]["album.delete"] = "Delete Record"
 
 	messages[Japanese]["template.componentsTitle"] = "テンプレートコンポーネント"
@@ -143,9 +149,12 @@ func init() {
 	messages[Japanese]["album.all"] = "すべての画像"
 	messages[Japanese]["album.rx"] = "RX のみ"
 	messages[Japanese]["album.tx"] = "TX のみ"
-	messages[Japanese]["album.empty"] = "アルバムに画像はありません。受信または送信完了時に自動保存されます。"
+	messages[Japanese]["album.empty"] = "画像はありません。受信中のプレビューと受信パケットも自動保存されます。"
+	messages[Japanese]["album.noPreview"] = "デコード済みプレビューはありません。受信パケットは保存済みです。"
 	messages[Japanese]["album.footnote"] = "サムネイルをクリックしてプレビュー。タイムスタンプ付き PNG の保存や記録削除ができます。"
-	messages[Japanese]["album.export"] = "PNG を保存"
+	messages[Japanese]["album.export"] = "ファイルを保存"
+	messages[Japanese]["album.exportAll"] = "アルバムをフォルダーにエクスポート"
+	messages[Japanese]["album.exported"] = "{count} 個のファイルをエクスポートしました"
 	messages[Japanese]["album.delete"] = "記録を削除"
 
 	// Dynamic TX template presets and visible operation feedback.
@@ -157,7 +166,7 @@ func init() {
 			"template.deleteConfirm": "确定删除模板“{name}”吗？", "template.saved": "模板预设已保存", "template.created": "已创建模板预设：{name}",
 			"template.deleted": "已删除模板预设：{name}", "template.addedText": "已添加文字组件", "template.addedImage": "已添加图片组件",
 			"template.backgroundSet": "已设置模板底图：{name}", "template.backgroundCleared": "已清除模板底图", "template.noSelection": "请先选择一个模板预设",
-			"template.componentLimit": "每个模板最多支持 64 个组件", "template.componentDeleted": "已删除所选组件", "action.failed": "操作失败：{error}",
+			"template.componentLimit": "每个模板最多支持 64 个组件", "template.componentDeleted": "已删除所选组件", "template.packImport": "导入模板包", "template.packExport": "导出模板包", "template.packImported": "已导入 {count} 个模板", "template.packExported": "模板包已导出", "action.failed": "操作失败：{error}",
 		},
 		English: {
 			"template.addPreset": "＋ New Preset", "template.duplicatePreset": "Duplicate", "template.deletePreset": "Delete",
@@ -166,7 +175,7 @@ func init() {
 			"template.deleteConfirm": "Delete template ‘{name}’?", "template.saved": "Template preset saved", "template.created": "Created template preset: {name}",
 			"template.deleted": "Deleted template preset: {name}", "template.addedText": "Text component added", "template.addedImage": "Image component added",
 			"template.backgroundSet": "Template background set: {name}", "template.backgroundCleared": "Template background cleared", "template.noSelection": "Select a template preset first",
-			"template.componentLimit": "A template can contain up to 64 components", "template.componentDeleted": "Selected component deleted", "action.failed": "Operation failed: {error}",
+			"template.componentLimit": "A template can contain up to 64 components", "template.componentDeleted": "Selected component deleted", "template.packImport": "Import Pack", "template.packExport": "Export Pack", "template.packImported": "Imported {count} templates", "template.packExported": "Template pack exported", "action.failed": "Operation failed: {error}",
 		},
 		Japanese: {
 			"template.addPreset": "＋ 新規プリセット", "template.duplicatePreset": "複製", "template.deletePreset": "削除",
@@ -175,7 +184,7 @@ func init() {
 			"template.deleteConfirm": "テンプレート「{name}」を削除しますか？", "template.saved": "テンプレートを保存しました", "template.created": "テンプレートを作成しました: {name}",
 			"template.deleted": "テンプレートを削除しました: {name}", "template.addedText": "テキストを追加しました", "template.addedImage": "画像コンポーネントを追加しました",
 			"template.backgroundSet": "背景を設定しました: {name}", "template.backgroundCleared": "背景をクリアしました", "template.noSelection": "先にテンプレートを選択してください",
-			"template.componentLimit": "1 つのテンプレートには最大 64 個のコンポーネントを追加できます", "template.componentDeleted": "コンポーネントを削除しました", "action.failed": "操作に失敗しました: {error}",
+			"template.componentLimit": "1 つのテンプレートには最大 64 個のコンポーネントを追加できます", "template.componentDeleted": "コンポーネントを削除しました", "template.packImport": "テンプレートをインポート", "template.packExport": "テンプレートをエクスポート", "template.packImported": "{count} 個のテンプレートをインポートしました", "template.packExported": "テンプレートをエクスポートしました", "action.failed": "操作に失敗しました: {error}",
 		},
 	} {
 		for key, value := range values {

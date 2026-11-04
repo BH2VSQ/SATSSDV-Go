@@ -54,13 +54,15 @@ type owlqnHistoryPair struct {
 }
 
 type pcsiObjective struct {
-	width, height int
-	plan          *dct2DPlan
-	positions     []int
-	observations  []float64
-	spatial       []float64
-	residual      []float64
-	gradient      []float64
+	width, height     int
+	plan              *dct2DPlan
+	positions         []int
+	observations      []float64
+	spatial           []float64
+	residual          []float64
+	gradient          []float64
+	coefficientMatrix []float64
+	matrixGradient    []float64
 }
 
 func newPCSIObjective(width, height int, positions []int, observations []uint8) (*pcsiObjective, error) {
@@ -75,6 +77,7 @@ func newPCSIObjective(width, height int, positions []int, observations []uint8) 
 		width: width, height: height, plan: newDCT2DPlan(width, height),
 		positions: append([]int(nil), positions...), observations: make([]float64, len(observations)),
 		spatial: make([]float64, n), residual: make([]float64, n), gradient: make([]float64, n),
+		coefficientMatrix: make([]float64, n), matrixGradient: make([]float64, n),
 	}
 	for i, position := range positions {
 		if position < 0 || position >= n {
@@ -89,7 +92,17 @@ func (o *pcsiObjective) evaluate(coefficients []float64, gradient bool) (float64
 	if len(coefficients) != len(o.spatial) {
 		return 0, nil, errors.New("PCSI coefficient vector has an invalid length")
 	}
-	if err := o.plan.transform(coefficients, o.spatial, true); err != nil {
+	// The reference PCSI solver flattens its coefficient vector as
+	// reshape((width, height)).T. That is column-major with respect to the
+	// 2-D DCT matrix, while the Go DCT plan consumes row-major matrices.
+	// Convert explicitly in both directions; treating this vector as row-major
+	// produces a valid-looking but spatially scrambled/noisy reconstruction.
+	for x := 0; x < o.width; x++ {
+		for y := 0; y < o.height; y++ {
+			o.coefficientMatrix[y*o.width+x] = coefficients[x*o.height+y]
+		}
+	}
+	if err := o.plan.transform(o.coefficientMatrix, o.spatial, true); err != nil {
 		return 0, nil, err
 	}
 	clear(o.residual)
@@ -104,8 +117,13 @@ func (o *pcsiObjective) evaluate(coefficients []float64, gradient bool) (float64
 	if !gradient {
 		return loss, nil, nil
 	}
-	if err := o.plan.transform(o.residual, o.gradient, false); err != nil {
+	if err := o.plan.transform(o.residual, o.matrixGradient, false); err != nil {
 		return 0, nil, err
+	}
+	for x := 0; x < o.width; x++ {
+		for y := 0; y < o.height; y++ {
+			o.gradient[x*o.height+y] = o.matrixGradient[y*o.width+x]
+		}
 	}
 	return loss, o.gradient, nil
 }
@@ -178,7 +196,11 @@ func reconstructChannelContext(ctx context.Context, width, height int, columnInd
 			case pseudo[i] > 0:
 				orthant[i] = -1
 			}
-			if direction[i]*orthant[i] <= 0 {
+			// Only coefficients currently at zero are constrained to enter
+			// the selected orthant. A non-zero coefficient must be allowed to
+			// move back toward zero; masking that direction freezes OWL-QN
+			// immediately after an overshooting line-search step.
+			if x[i] == 0 && direction[i]*orthant[i] <= 0 {
 				direction[i] = 0
 			}
 		}
@@ -186,7 +208,7 @@ func reconstructChannelContext(ctx context.Context, width, height int, columnInd
 		if slope >= -1e-14 {
 			for i := range direction {
 				direction[i] = -pseudo[i]
-				if direction[i]*orthant[i] <= 0 {
+				if x[i] == 0 && direction[i]*orthant[i] <= 0 {
 					direction[i] = 0
 				}
 			}
@@ -247,7 +269,12 @@ func reconstructChannelContext(ctx context.Context, width, height int, columnInd
 	}
 
 	spatial := make([]float64, n)
-	if err := objective.plan.transform(x, spatial, true); err != nil {
+	for column := 0; column < width; column++ {
+		for row := 0; row < height; row++ {
+			objective.coefficientMatrix[row*width+column] = x[column*height+row]
+		}
+	}
+	if err := objective.plan.transform(objective.coefficientMatrix, spatial, true); err != nil {
 		return nil, nil, err
 	}
 	return spatial, x, nil

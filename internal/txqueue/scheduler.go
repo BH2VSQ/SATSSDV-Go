@@ -14,6 +14,8 @@ type Job struct {
 	ImageDataBase64 string `json:"imageDataBase64,omitempty"`
 	Profile         string `json:"profile"`
 	Quality         string `json:"quality"`
+	AX25SSID        int    `json:"ax25Ssid,omitempty"`
+	AX25To          string `json:"ax25To,omitempty"`
 }
 type Config struct {
 	Repeat    bool          `json:"repeat"`
@@ -63,7 +65,9 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 			}
 			emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "completed"})
 			if i < len(jobs)-1 || cfg.Repeat {
-				if err := sleep(ctx, cfg.Interval); err != nil {
+				if err := sleepWithCountdown(ctx, cfg.Interval, func(remaining time.Duration) {
+					emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "countdown", Error: fmt.Sprintf("%d", int(remaining.Seconds()))})
+				}); err != nil {
 					return err
 				}
 			}
@@ -92,5 +96,36 @@ func sleep(ctx context.Context, d time.Duration) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+// sleepWithCountdown emits a one-second countdown while preserving prompt cancellation.
+func sleepWithCountdown(ctx context.Context, d time.Duration, tick func(time.Duration)) error {
+	end := time.Now().Add(d)
+	deadline := time.NewTimer(d)
+	defer deadline.Stop()
+	if tick != nil {
+		tick(d)
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			if tick != nil {
+				tick(0)
+			}
+			return nil
+		case <-ticker.C:
+			if tick != nil {
+				remaining := time.Until(end)
+				if remaining < 0 {
+					remaining = 0
+				}
+				tick(remaining)
+			}
+		}
 	}
 }

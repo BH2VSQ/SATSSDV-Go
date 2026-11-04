@@ -12,21 +12,24 @@ import (
 )
 
 type ReceivedPacket struct {
-	Profile     string `json:"profile"`
-	Codec       string `json:"codec"`
-	Callsign    string `json:"callsign"`
-	ImageID     uint8  `json:"imageId"`
-	PacketID    uint16 `json:"packetId"`
-	ImageWidth  int    `json:"imageWidth,omitempty"`
-	ImageHeight int    `json:"imageHeight,omitempty"`
-	Quality     uint8  `json:"quality,omitempty"`
-	EOI         bool   `json:"eoi,omitempty"`
-	Subsampling uint8  `json:"subsampling,omitempty"`
-	MCUOffset   uint8  `json:"mcuOffset,omitempty"`
-	MCUIndex    uint16 `json:"mcuIndex,omitempty"`
-	MCUCount    uint32 `json:"mcuCount,omitempty"`
-	FEC         bool   `json:"fec"`
-	Raw         []byte `json:"raw"`
+	Profile         string `json:"profile"`
+	Codec           string `json:"codec"`
+	Callsign        string `json:"callsign"`
+	ImageID         uint8  `json:"imageId"`
+	PacketID        uint16 `json:"packetId"`
+	ImageWidth      int    `json:"imageWidth,omitempty"`
+	ImageHeight     int    `json:"imageHeight,omitempty"`
+	Quality         uint8  `json:"quality,omitempty"`
+	EOI             bool   `json:"eoi,omitempty"`
+	Subsampling     uint8  `json:"subsampling,omitempty"`
+	MCUOffset       uint8  `json:"mcuOffset,omitempty"`
+	MCUIndex        uint16 `json:"mcuIndex,omitempty"`
+	MCUCount        uint32 `json:"mcuCount,omitempty"`
+	FEC             bool   `json:"fec"`
+	HasAX25SSID     bool   `json:"hasAX25SSID,omitempty"`
+	AX25SourceSSID  uint8  `json:"ax25SourceSSID,omitempty"`
+	AX25Destination string `json:"ax25Destination,omitempty"`
+	Raw             []byte `json:"raw"`
 }
 
 // DecodeAudio decodes a captured waveform in one profile. It supports block
@@ -62,6 +65,8 @@ func DecodeAudioAtRate(profileID domain.TransportMode, samples []float32, captur
 		return nil, err
 	}
 	var payloads [][]byte
+	var payloadSSIDs []uint8
+	var payloadDestinations []string
 	if profile.LinkLayer == "AX.25 UI / HDLC" {
 		for _, initial := range []bool{true, false} {
 			nrzi := ax25.NRZIDecode(bits, initial)
@@ -71,6 +76,8 @@ func DecodeAudioAtRate(profileID domain.TransportMode, samples []float32, captur
 			}
 			for _, frame := range frames {
 				payloads = append(payloads, frame.Information)
+				payloadSSIDs = append(payloadSSIDs, frame.Source.SSID)
+				payloadDestinations = append(payloadDestinations, frame.Destination.Callsign)
 			}
 			if len(payloads) > 0 {
 				break
@@ -83,9 +90,16 @@ func DecodeAudioAtRate(profileID domain.TransportMode, samples []float32, captur
 		}
 	}
 	packets := make([]ReceivedPacket, 0, len(payloads))
-	for _, payload := range payloads {
+	for payloadIndex, payload := range payloads {
 		var item ReceivedPacket
 		item.Profile, item.Codec, item.Raw = string(profile.ID), profile.ImageCodec, append([]byte(nil), payload...)
+		if profile.LinkLayer == "AX.25 UI / HDLC" && payloadIndex < len(payloadSSIDs) {
+			item.HasAX25SSID = true
+			item.AX25SourceSSID = payloadSSIDs[payloadIndex]
+			if payloadIndex < len(payloadDestinations) {
+				item.AX25Destination = payloadDestinations[payloadIndex]
+			}
+		}
 		if profile.ImageCodec == "SSDV" {
 			p, parseErr := ssdv.ParsePacket(payload)
 			if parseErr != nil {

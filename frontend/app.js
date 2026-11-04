@@ -7,11 +7,11 @@
   };
   const $ = (id) => document.getElementById(id);
   const api = () => window.go?.main?.App;
-  const state = { settings: {language:'zh-CN',ptt:{mode:'vox',activeHigh:true},quality:'medium',waterfall:{...DEFAULT_WATERFALL_SETTINGS},callsign:'N0CALL',locator:'JJ00',rxProfile:'ssdv-ax25',txProfile:'ssdv-ax25'}, profiles: [], ports: [], audioDevices: {inputs:[],outputs:[]}, audioDevicesLoaded: false, locale: 'zh-CN', ptt: { active: false }, audio: { connected:false, rxActive:false, txActive:false }, countdown: null, templates: [], selectedTemplate: 0, selectedComponent: '', gallery: [], album: [], templateBackgroundAssetId: '', txFields:{myCall:'N0CALL',hisCall:'',qth:'',locator:'JJ00',report:'595',message:''}, txActive: false, txPreparing: false, imageDataCache: new Map(), imageElementCache: new Map(), imageOutlineCache: new WeakMap(), componentBounds: new Map(), previewRenderVersion: 0, previewRAF: 0, previewPendingResolve: null, latestRXData: '', latestRXLoaded:false, waterfallPreview: null, settingsTab: 'general', pendingDeleteKey:'', pendingDeleteButton:null };
+  const state = { settings: {language:'zh-CN',ptt:{mode:'vox',activeHigh:true},quality:'medium',waterfall:{...DEFAULT_WATERFALL_SETTINGS},callsign:'N0CALL',locator:'JJ00',rxProfile:'ssdv-ax25',txProfile:'ssdv-ax25'}, profiles: [], ports: [], audioDevices: {inputs:[],outputs:[]}, audioDevicesLoaded: false, locale: 'zh-CN', ptt: { active: false }, audio: { connected:false, rxActive:false, txActive:false }, countdown: null, templates: [], selectedTemplate: 0, selectedComponent: '', gallery: [], album: [], templateBackgroundAssetId: '', txFields:{myCall:'N0CALL',hisCall:'',qth:'',locator:'JJ00',report:'595',message:''}, txActive: false, txToneActive: false, txPreparing: false, imageDataCache: new Map(), imageElementCache: new Map(), imageOutlineCache: new WeakMap(), componentBounds: new Map(), previewRenderVersion: 0, previewRAF: 0, previewPendingResolve: null, latestRXData: '', latestRXLoaded:false, waterfallPreview: null, settingsTab: 'general', pendingDeleteKey:'', pendingDeleteButton:null,repeatIntervalBase:null,repeatCountdownTimer:null };
   const fallback = {
-    'zh-CN': {'common.confirmDelete':'再次点击确认删除','common.confirmDeleteHint':'请再次点击删除按钮确认操作。','tx.start':'开始发射','tx.stop':'停止发射','tx.preparing':'正在准备…','tx.idle':'TX IDLE','tx.active':'TX ACTIVE','tx.done':'发射完成','nav.workbench':'工作台','nav.album':'相册','nav.settings':'设置','ptt.test':'测试 PTT','ptt.stop':'停止 PTT 测试','ptt.idle':'待机','ptt.active':'PTT 测试中','ptt.remaining':'剩余 {seconds} 秒','ptt.voxHint':'VOX 由电台检测音频自动发射，不需要软件 PTT 测试。','ptt.refresh':'刷新串口','ptt.autoRelease':'最长 15 秒，后端自动释放','audio.refresh':'刷新音频设备','audio.defaultDevice':'默认','audio.ready':'音频就绪','audio.off':'音频未连接','audio.rxOn':'停止 RX','audio.rxOff':'启动 RX','audio.unavailable':'音频后端未启用，请使用 CGO + malgo 标签构建。','quality.low':'低质量 320×240','quality.medium':'中质量 448×336','quality.high':'高质量 640×480','tx.repeat':'循环发送','tx.interval':'发送间隔（秒）','rx.complete':'接收完成','rx.progress':'接收进度','rx.ssdvPending':'SSDV 图像重建完成','rx.packetCount':'已接收 {received} / {expected} 个数据包','template.addText':'＋ 文字','template.addRX':'＋ 上次 RX','template.addImage':'＋ 图像','template.noComponent':'请选择或添加组件','template.saved':'模板已保存','template.defaultText':'CQ SSTV','template.noImage':'无可用图库图像','template.content':'文字内容','template.fontSize':'字号 px','template.imageScale':'等比例缩放 %','template.dragHint':'直接在预览画布中拖动组件调整位置','template.rxPlaceholder':'暂无 RX 图像','template.outlineWidth':'描边宽度 px','template.color':'文字颜色','template.bold':'粗体','template.visible':'可见','template.outline':'描边','template.deleteComponent':'删除所选组件','template.qsoFields':'本次 QSO 信息','template.hisCall':'对方呼号','template.qth':'QTH','template.report':'RST / 报告','template.message':'消息','template.imageSource':'图片组件来源','template.outlineColor':'描边颜色','template.componentsTitle':'模板组件','template.componentProperties':'组件属性','template.saveSlot':'保存当前槽位','template.presetHint':'支持添加、复制和管理最多 32 个独立预设','template.myCall':'本台呼号','template.locator':'网格定位','tx.transmission':'发射设置','gallery.open':'打开图片图库','gallery.title':'模板图片图库','gallery.subtitle':'图片保存在本机用户配置目录，模板通过资源 ID 引用','gallery.import':'导入图片','gallery.loading':'正在读取图库…','gallery.empty':'图库为空。导入图片后可设为模板底图或添加为组件。','gallery.setBackground':'设为模板底图','gallery.addLayer':'添加为图层','gallery.delete':'删除图片','gallery.background':'模板底图','gallery.noBackground':'未设置，可从图库选择底图','gallery.clearBackground':'清除底图','gallery.imported':'已导入图库：{name}','gallery.deleted':'已删除图片：{name}','gallery.inUse':'图片已从模板引用中移除','album.title':'图像相册','album.subtitle':'历史接收与发送图像，自动记录时间戳','album.all':'全部图像','album.rx':'仅接收 RX','album.tx':'仅发送 TX','album.empty':'相册暂无图像。完成接收或发射后会自动归档。','album.footnote':'点击缩略图查看大图；可导出带时间戳的 PNG 或删除记录。','album.preview':'查看大图','album.export':'导出 PNG','album.delete':'删除记录','album.deleted':'相册记录已删除'},
-    en: {'common.confirmDelete':'Click again to confirm','common.confirmDeleteHint':'Click the delete action again to confirm.','tx.start':'Start TX','tx.stop':'Stop TX','tx.preparing':'Preparing…','tx.idle':'TX IDLE','tx.active':'TX ACTIVE','tx.done':'Transmission complete','nav.workbench':'Workbench','nav.album':'Album','nav.settings':'Settings','ptt.test':'Test PTT','ptt.stop':'Stop PTT test','ptt.idle':'Idle','ptt.active':'PTT test active','ptt.remaining':'{seconds}s remaining','ptt.voxHint':'VOX keys the radio from audio and does not require a software PTT test.','ptt.refresh':'Refresh ports','ptt.autoRelease':'Maximum 15 seconds; backend auto-release','audio.refresh':'Refresh audio devices','audio.defaultDevice':'Default','audio.ready':'Audio ready','audio.off':'Audio off','audio.rxOn':'Stop RX','audio.rxOff':'Start RX','audio.unavailable':'Audio backend is disabled. Build with CGO and the malgo tag.','quality.low':'Low 320×240','quality.medium':'Medium 448×336','quality.high':'High 640×480','tx.repeat':'Repeat transmission','tx.interval':'Interval (seconds)','rx.complete':'RX complete','rx.progress':'RX progress','rx.ssdvPending':'SSDV image reconstructed','rx.packetCount':'Received {received} / {expected} packets','template.addText':'＋ Text','template.addRX':'＋ Last RX','template.addImage':'＋ Image','template.noComponent':'Select or add a component','template.saved':'Template saved','template.defaultText':'CQ SATELLITE','template.noImage':'No gallery image available','template.content':'Text content','template.fontSize':'Font px','template.imageScale':'Uniform scale %','template.dragHint':'Drag components directly on the preview canvas to reposition them','template.rxPlaceholder':'No RX image yet','template.outlineWidth':'Outline px','template.color':'Text color','template.bold':'Bold','template.visible':'Visible','template.outline':'Outline','template.deleteComponent':'Delete selected component','template.qsoFields':'QSO fields','template.hisCall':'His callsign','template.qth':'QTH','template.report':'RST / Report','template.message':'Message','template.imageSource':'Image component source','template.outlineColor':'Outline color','template.componentsTitle':'Template Components','template.componentProperties':'Component Properties','template.saveSlot':'Save Current Slot','template.presetHint':'Create, duplicate and manage up to 32 independent presets.','template.myCall':'My callsign','template.locator':'Locator','tx.transmission':'Transmission','gallery.open':'Open Image Library','gallery.title':'Template Image Library','gallery.subtitle':'Images are stored locally and referenced by asset ID.','gallery.import':'Import Images','gallery.loading':'Loading image library…','gallery.empty':'The library is empty. Import images to set a template background or add an image component.','gallery.setBackground':'Set as Template Background','gallery.addLayer':'Add as Layer','gallery.delete':'Delete Image','gallery.background':'Template Background','gallery.noBackground':'Not set. Choose a background from the image library.','gallery.clearBackground':'Clear Background','gallery.imported':'Imported to library: {name}','gallery.deleted':'Deleted image: {name}','gallery.inUse':'Removed deleted image references from templates.','album.title':'Image Album','album.subtitle':'Timestamped RX and TX image history','album.all':'All Images','album.rx':'RX Only','album.tx':'TX Only','album.empty':'No images in the album yet. Completed RX/TX images are archived automatically.','album.footnote':'Click a thumbnail to preview. Export timestamped PNGs or delete records.','album.preview':'Preview','album.export':'Export PNG','album.delete':'Delete Record','album.deleted':'Album record deleted'},
-    'ja-JP': {'common.confirmDelete':'もう一度クリックして削除','common.confirmDeleteHint':'削除操作を確定するには、もう一度クリックしてください。','tx.start':'送信開始','tx.stop':'送信停止','tx.preparing':'準備中…','tx.idle':'TX IDLE','tx.active':'TX ACTIVE','tx.done':'送信完了','nav.workbench':'ワークベンチ','nav.album':'アルバム','nav.settings':'設定','ptt.test':'PTT テスト','ptt.stop':'PTT テスト停止','ptt.idle':'待機中','ptt.active':'PTT テスト中','ptt.remaining':'残り {seconds} 秒','ptt.voxHint':'VOX は音声を検出して送信するため、ソフトウェア PTT テストは不要です。','ptt.refresh':'ポート更新','ptt.autoRelease':'最大 15 秒、バックエンドが自動解除','audio.refresh':'オーディオデバイス更新','audio.defaultDevice':'既定','audio.ready':'オーディオ準備完了','audio.off':'オーディオ未接続','audio.rxOn':'RX 停止','audio.rxOff':'RX 開始','audio.unavailable':'オーディオバックエンドが無効です。CGO と malgo タグでビルドしてください。','quality.low':'低 320×240','quality.medium':'中 448×336','quality.high':'高 640×480','tx.repeat':'繰り返し送信','tx.interval':'送信間隔（秒）','rx.complete':'受信完了','rx.progress':'受信進捗','rx.ssdvPending':'SSDV 画像の再構築が完了しました','rx.packetCount':'受信 {received} / {expected} パケット','template.addText':'＋ テキスト','template.addRX':'＋ 最終 RX','template.addImage':'＋ 画像','template.noComponent':'コンポーネントを選択または追加','template.saved':'テンプレートを保存しました','template.defaultText':'CQ SATELLITE','template.noImage':'画像ライブラリに画像がありません','template.content':'テキスト内容','template.fontSize':'文字サイズ px','template.imageScale':'均等拡大縮小 %','template.dragHint':'プレビュー上でコンポーネントをドラッグして位置を調整','template.rxPlaceholder':'RX 画像なし','template.outlineWidth':'縁取り幅 px','template.color':'文字色','template.bold':'太字','template.visible':'表示','template.outline':'縁取り','template.deleteComponent':'選択したコンポーネントを削除','template.qsoFields':'今回の QSO 情報','template.hisCall':'相手局コールサイン','template.qth':'QTH','template.report':'RST / レポート','template.message':'メッセージ','template.imageSource':'画像コンポーネントのソース','template.outlineColor':'縁取り色','template.componentsTitle':'テンプレートコンポーネント','template.componentProperties':'コンポーネント設定','template.saveSlot':'選択スロットを保存','template.presetHint':'最大32件の独立したプリセットを作成、複製、管理できます。','template.myCall':'自局コールサイン','template.locator':'グリッドロケーター','tx.transmission':'送信設定','gallery.open':'画像ライブラリを開く','gallery.title':'テンプレート画像ライブラリ','gallery.subtitle':'画像はローカルに保存され、アセット ID で参照されます。','gallery.import':'画像をインポート','gallery.loading':'画像ライブラリを読み込み中…','gallery.empty':'ライブラリは空です。画像をインポートしてテンプレート背景または画像コンポーネントとして使用できます。','gallery.setBackground':'テンプレート背景に設定','gallery.addLayer':'レイヤーとして追加','gallery.delete':'画像を削除','gallery.background':'テンプレート背景','gallery.noBackground':'未設定。画像ライブラリから背景を選択してください。','gallery.clearBackground':'背景をクリア','gallery.imported':'ライブラリに追加しました: {name}','gallery.deleted':'画像を削除しました: {name}','gallery.inUse':'テンプレートから削除画像の参照を解除しました。','album.title':'画像アルバム','album.subtitle':'RX/TX 画像履歴とタイムスタンプ','album.all':'すべて','album.rx':'RX のみ','album.tx':'TX のみ','album.empty':'アルバムに画像はありません。受信または送信完了時に自動保存されます。','album.footnote':'サムネイルをクリックしてプレビュー。タイムスタンプ付き PNG の保存や記録削除ができます。','album.preview':'プレビュー','album.export':'PNG を保存','album.delete':'記録を削除','album.deleted':'アルバム記録を削除しました。'}
+    'zh-CN': {'common.confirmDelete':'再次点击确认删除','common.confirmDeleteHint':'请再次点击删除按钮确认操作。','tx.start':'开始发射','tx.stop':'停止发射','tx.preparing':'正在准备…','tx.idle':'TX IDLE','tx.active':'TX ACTIVE','tx.done':'发射完成','tx.testTone':'1500 Hz 测试音','tx.testToneActive':'音调发射中','nav.workbench':'工作台','nav.album':'相册','nav.settings':'设置','ptt.test':'测试 PTT','ptt.stop':'停止 PTT 测试','ptt.idle':'待机','ptt.active':'PTT 测试中','ptt.remaining':'剩余 {seconds} 秒','ptt.voxHint':'VOX 由电台检测音频自动发射，不需要软件 PTT 测试。','ptt.refresh':'刷新串口','ptt.autoRelease':'最长 15 秒，后端自动释放','audio.refresh':'刷新音频设备','audio.defaultDevice':'默认','audio.ready':'音频就绪','audio.off':'音频未连接','audio.rxOn':'停止 RX','audio.rxOff':'启动 RX','audio.unavailable':'音频后端未启用，请使用 CGO + malgo 标签构建。','quality.low':'低质量 320×240','quality.medium':'中质量 448×336','quality.high':'高质量 640×480','tx.repeat':'循环发送','tx.interval':'发送间隔（秒）','rx.complete':'接收完成','rx.progress':'接收进度','rx.ssdvPending':'SSDV 图像重建完成','rx.packetCount':'已接收 {received} / {expected} 个数据包','template.addText':'＋ 文字','template.addRX':'＋ 上次 RX','template.addImage':'＋ 图像','template.noComponent':'请选择或添加组件','template.saved':'模板已保存','template.defaultText':'CQ SSTV','template.noImage':'无可用图库图像','template.content':'文字内容','template.fontSize':'字号 px','template.imageScale':'等比例缩放 %','template.dragHint':'直接在预览画布中拖动组件调整位置','template.rxPlaceholder':'暂无 RX 图像','template.outlineWidth':'描边宽度 px','template.color':'文字颜色','template.bold':'粗体','template.visible':'可见','template.outline':'描边','template.deleteComponent':'删除所选组件','template.qsoFields':'本次 QSO 信息','template.hisCall':'对方呼号','template.qth':'QTH','template.report':'RST / 报告','template.message':'消息','template.imageSource':'图片组件来源','template.outlineColor':'描边颜色','template.componentsTitle':'模板组件','template.componentProperties':'组件属性','template.saveSlot':'保存当前槽位','template.presetHint':'支持添加、复制和管理最多 32 个独立预设','template.myCall':'本台呼号','template.ax25SSID':'AX.25 SSID（本站）','template.locator':'网格定位','tx.transmission':'发射设置','gallery.open':'打开图片图库','gallery.title':'模板图片图库','gallery.subtitle':'图片保存在本机用户配置目录，模板通过资源 ID 引用','gallery.import':'导入图片','gallery.loading':'正在读取图库…','gallery.empty':'图库为空。导入图片后可设为模板底图或添加为组件。','gallery.setBackground':'设为模板底图','gallery.addLayer':'添加为图层','gallery.delete':'删除图片','gallery.background':'模板底图','gallery.noBackground':'未设置，可从图库选择底图','gallery.clearBackground':'清除底图','gallery.imported':'已导入图库：{name}','gallery.deleted':'已删除图片：{name}','gallery.inUse':'图片已从模板引用中移除','album.title':'图像相册','album.subtitle':'历史接收与发送图像，自动记录时间戳','album.all':'全部图像','album.rx':'仅接收 RX','album.tx':'仅发送 TX','album.empty':'相册暂无图像。完成接收或发射后会自动归档。','album.footnote':'点击缩略图查看大图；可导出带时间戳的 PNG 或删除记录。','album.preview':'查看大图','album.export':'导出 PNG','album.delete':'删除记录','album.deleted':'相册记录已删除'},
+    en: {'common.confirmDelete':'Click again to confirm','common.confirmDeleteHint':'Click the delete action again to confirm.','tx.start':'Start TX','tx.stop':'Stop TX','tx.preparing':'Preparing…','tx.idle':'TX IDLE','tx.active':'TX ACTIVE','tx.done':'Transmission complete','tx.testTone':'1500 Hz Tone','tx.testToneActive':'Tone TX active','nav.workbench':'Workbench','nav.album':'Album','nav.settings':'Settings','ptt.test':'Test PTT','ptt.stop':'Stop PTT test','ptt.idle':'Idle','ptt.active':'PTT test active','ptt.remaining':'{seconds}s remaining','ptt.voxHint':'VOX keys the radio from audio and does not require a software PTT test.','ptt.refresh':'Refresh ports','ptt.autoRelease':'Maximum 15 seconds; backend auto-release','audio.refresh':'Refresh audio devices','audio.defaultDevice':'Default','audio.ready':'Audio ready','audio.off':'Audio off','audio.rxOn':'Stop RX','audio.rxOff':'Start RX','audio.unavailable':'Audio backend is disabled. Build with CGO and the malgo tag.','quality.low':'Low 320×240','quality.medium':'Medium 448×336','quality.high':'High 640×480','tx.repeat':'Repeat transmission','tx.interval':'Interval (seconds)','rx.complete':'RX complete','rx.progress':'RX progress','rx.ssdvPending':'SSDV image reconstructed','rx.packetCount':'Received {received} / {expected} packets','template.addText':'＋ Text','template.addRX':'＋ Last RX','template.addImage':'＋ Image','template.noComponent':'Select or add a component','template.saved':'Template saved','template.defaultText':'CQ SATELLITE','template.noImage':'No gallery image available','template.content':'Text content','template.fontSize':'Font px','template.imageScale':'Uniform scale %','template.dragHint':'Drag components directly on the preview canvas to reposition them','template.rxPlaceholder':'No RX image yet','template.outlineWidth':'Outline px','template.color':'Text color','template.bold':'Bold','template.visible':'Visible','template.outline':'Outline','template.deleteComponent':'Delete selected component','template.qsoFields':'QSO fields','template.hisCall':'His callsign','template.qth':'QTH','template.report':'RST / Report','template.message':'Message','template.imageSource':'Image component source','template.outlineColor':'Outline color','template.componentsTitle':'Template Components','template.componentProperties':'Component Properties','template.saveSlot':'Save Current Slot','template.presetHint':'Create, duplicate and manage up to 32 independent presets.','template.myCall':'My callsign','template.ax25SSID':'AX.25 SSID (local station)','template.locator':'Locator','tx.transmission':'Transmission','gallery.open':'Open Image Library','gallery.title':'Template Image Library','gallery.subtitle':'Images are stored locally and referenced by asset ID.','gallery.import':'Import Images','gallery.loading':'Loading image library…','gallery.empty':'The library is empty. Import images to set a template background or add an image component.','gallery.setBackground':'Set as Template Background','gallery.addLayer':'Add as Layer','gallery.delete':'Delete Image','gallery.background':'Template Background','gallery.noBackground':'Not set. Choose a background from the image library.','gallery.clearBackground':'Clear Background','gallery.imported':'Imported to library: {name}','gallery.deleted':'Deleted image: {name}','gallery.inUse':'Removed deleted image references from templates.','album.title':'Image Album','album.subtitle':'Timestamped RX and TX image history','album.all':'All Images','album.rx':'RX Only','album.tx':'TX Only','album.empty':'No images in the album yet. Completed RX/TX images are archived automatically.','album.footnote':'Click a thumbnail to preview. Export timestamped PNGs or delete records.','album.preview':'Preview','album.export':'Export PNG','album.delete':'Delete Record','album.deleted':'Album record deleted'},
+    'ja-JP': {'common.confirmDelete':'もう一度クリックして削除','common.confirmDeleteHint':'削除操作を確定するには、もう一度クリックしてください。','tx.start':'送信開始','tx.stop':'送信停止','tx.preparing':'準備中…','tx.idle':'TX IDLE','tx.active':'TX ACTIVE','tx.done':'送信完了','tx.testTone':'1500 Hz テスト音','tx.testToneActive':'テスト音送信中','nav.workbench':'ワークベンチ','nav.album':'アルバム','nav.settings':'設定','ptt.test':'PTT テスト','ptt.stop':'PTT テスト停止','ptt.idle':'待機中','ptt.active':'PTT テスト中','ptt.remaining':'残り {seconds} 秒','ptt.voxHint':'VOX は音声を検出して送信するため、ソフトウェア PTT テストは不要です。','ptt.refresh':'ポート更新','ptt.autoRelease':'最大 15 秒、バックエンドが自動解除','audio.refresh':'オーディオデバイス更新','audio.defaultDevice':'既定','audio.ready':'オーディオ準備完了','audio.off':'オーディオ未接続','audio.rxOn':'RX 停止','audio.rxOff':'RX 開始','audio.unavailable':'オーディオバックエンドが無効です。CGO と malgo タグでビルドしてください。','quality.low':'低 320×240','quality.medium':'中 448×336','quality.high':'高 640×480','tx.repeat':'繰り返し送信','tx.interval':'送信間隔（秒）','rx.complete':'受信完了','rx.progress':'受信進捗','rx.ssdvPending':'SSDV 画像の再構築が完了しました','rx.packetCount':'受信 {received} / {expected} パケット','template.addText':'＋ テキスト','template.addRX':'＋ 最終 RX','template.addImage':'＋ 画像','template.noComponent':'コンポーネントを選択または追加','template.saved':'テンプレートを保存しました','template.defaultText':'CQ SATELLITE','template.noImage':'画像ライブラリに画像がありません','template.content':'テキスト内容','template.fontSize':'文字サイズ px','template.imageScale':'均等拡大縮小 %','template.dragHint':'プレビュー上でコンポーネントをドラッグして位置を調整','template.rxPlaceholder':'RX 画像なし','template.outlineWidth':'縁取り幅 px','template.color':'文字色','template.bold':'太字','template.visible':'表示','template.outline':'縁取り','template.deleteComponent':'選択したコンポーネントを削除','template.qsoFields':'今回の QSO 情報','template.hisCall':'相手局コールサイン','template.qth':'QTH','template.report':'RST / レポート','template.message':'メッセージ','template.imageSource':'画像コンポーネントのソース','template.outlineColor':'縁取り色','template.componentsTitle':'テンプレートコンポーネント','template.componentProperties':'コンポーネント設定','template.saveSlot':'選択スロットを保存','template.presetHint':'最大32件の独立したプリセットを作成、複製、管理できます。','template.myCall':'自局コールサイン','template.ax25SSID':'AX.25 SSID（自局）','template.locator':'グリッドロケーター','tx.transmission':'送信設定','gallery.open':'画像ライブラリを開く','gallery.title':'テンプレート画像ライブラリ','gallery.subtitle':'画像はローカルに保存され、アセット ID で参照されます。','gallery.import':'画像をインポート','gallery.loading':'画像ライブラリを読み込み中…','gallery.empty':'ライブラリは空です。画像をインポートしてテンプレート背景または画像コンポーネントとして使用できます。','gallery.setBackground':'テンプレート背景に設定','gallery.addLayer':'レイヤーとして追加','gallery.delete':'画像を削除','gallery.background':'テンプレート背景','gallery.noBackground':'未設定。画像ライブラリから背景を選択してください。','gallery.clearBackground':'背景をクリア','gallery.imported':'ライブラリに追加しました: {name}','gallery.deleted':'画像を削除しました: {name}','gallery.inUse':'テンプレートから削除画像の参照を解除しました。','album.title':'画像アルバム','album.subtitle':'RX/TX 画像履歴とタイムスタンプ','album.all':'すべて','album.rx':'RX のみ','album.tx':'TX のみ','album.empty':'アルバムに画像はありません。受信または送信完了時に自動保存されます。','album.footnote':'サムネイルをクリックしてプレビュー。タイムスタンプ付き PNG の保存や記録削除ができます。','album.preview':'プレビュー','album.export':'PNG を保存','album.delete':'記録を削除','album.deleted':'アルバム記録を削除しました。'}
   };
   const templatePresetLabels = {
     'zh-CN': {
@@ -105,13 +105,22 @@
   function runAction(action) {
     Promise.resolve().then(action).catch(error => setMessage(tr('action.failed', {error:error?.message || String(error)}), true));
   }
+  function renderAX25AddressFields(){
+    const enabled=state.settings?.txProfile==='ssdv-ax25';
+    const field=$('tx-ax25-ssid-field'),input=$('tx-ax25-ssid');
+    if(!field||!input)return;
+    field.hidden=!enabled;
+    input.disabled=!enabled;
+    const value=Number(state.settings?.ax25Ssid);
+    input.value=String(Number.isInteger(value)&&value>=0&&value<=15?value:0);
+  }
   function renderProfiles() {
     for(const pane of ['rx','tx']) {
       const parent=$(`${pane}-profile-list`); parent.replaceChildren();
       const current=state.settings?.[pane==='rx'?'rxProfile':'txProfile'];
       state.profiles.forEach(p=>{const b=document.createElement('button');b.className='profile-btn'+(p.id===current?' active':'');b.textContent=p.name;b.addEventListener('click',async()=>{state.settings[pane==='rx'?'rxProfile':'txProfile']=p.id;renderProfiles();$(`${pane}-meta`).textContent=p.name;if(pane==='tx')$('tx-mode-label').textContent=p.name;renderTXState();try{await call('SaveSettings',state.settings);}catch(e){setMessage(e.message,true);}});parent.appendChild(b);});
     }
-    const tx=state.profiles.find(p=>p.id===state.settings?.txProfile);if(tx)$('tx-mode-label').textContent=tx.name;renderTXState();
+    const tx=state.profiles.find(p=>p.id===state.settings?.txProfile);if(tx)$('tx-mode-label').textContent=tx.name;renderAX25AddressFields();clearHisCallForCQTemplate();renderTXState();
   }
   function renderPorts(preserveCurrent=false) {
     const sel=$('serial-port');
@@ -186,17 +195,44 @@
       ctx.restore();
     }
     ctx.save();ctx.strokeStyle='rgba(190,215,230,.16)';ctx.lineWidth=Math.max(1,dpr);
-    for(let i=1;i<10;i++){const x=Math.round(w*i/10)+.5;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();}
     for(let i=1;i<4;i++){const y=Math.round(h*i/4)+.5;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
-    ctx.fillStyle='rgba(225,238,246,.78)';ctx.font=`${Math.max(8,9*dpr)}px Segoe UI, sans-serif`;ctx.textBaseline='top';
     const minHz=view.frequencyStart??cfg.minFrequencyHz,maxHz=view.frequencyEnd??cfg.maxFrequencyHz;
-    for(let i=0;i<=4;i++){
-      const x=w*i/4,hz=Math.round(minHz+(maxHz-minHz)*i/4);
-      const label=hz>=1000?`${(hz/1000).toFixed(hz%1000?1:0)}k`:`${hz}`;
-      ctx.fillText(label,Math.min(w-34*dpr,x+2*dpr),2*dpr);
+    ctx.fillStyle='rgba(225,238,246,.84)';ctx.font=`${Math.max(8,8*dpr)}px Segoe UI, sans-serif`;ctx.textBaseline='top';ctx.textAlign='center';
+    const firstTick=Math.ceil(minHz/500)*500;
+    for(let hz=firstTick;hz<=maxHz+0.01;hz+=500){
+      const x=(hz-minHz)/Math.max(1,maxHz-minHz)*w;
+      ctx.strokeStyle='rgba(190,215,230,.24)';ctx.beginPath();ctx.moveTo(Math.round(x)+.5,0);ctx.lineTo(Math.round(x)+.5,h);ctx.stroke();
+      ctx.fillStyle='rgba(225,238,246,.9)';ctx.fillText(String(hz),clamp(x,14*dpr,w-14*dpr),2*dpr);
     }
     ctx.restore();
     const watermark=canvas.parentElement?.querySelector('.spectrum-watermark');if(watermark)watermark.hidden=view.count>0;
+  }
+  function drawConstellationGrid(canvas){
+    if(!canvas)return;
+    const rect=canvas.getBoundingClientRect(),dpr=Math.max(1,window.devicePixelRatio||1);
+    const side=Math.max(1,Math.floor(Math.min(rect.width,rect.height)*dpr));
+    if(canvas.width!==side||canvas.height!==side){canvas.width=side;canvas.height=side;}
+    const ctx=canvas.getContext('2d'),center=side/2,radius=side*.43;
+    ctx.clearRect(0,0,side,side);ctx.fillStyle='#0d1720';ctx.fillRect(0,0,side,side);
+    ctx.strokeStyle='rgba(155,180,198,.2)';ctx.lineWidth=Math.max(1,dpr);
+    for(const fraction of [.25,.5,.75,1]){ctx.beginPath();ctx.arc(center,center,radius*fraction,0,Math.PI*2);ctx.stroke();}
+    ctx.beginPath();ctx.moveTo(center-radius,center);ctx.lineTo(center+radius,center);ctx.moveTo(center,center-radius);ctx.lineTo(center,center+radius);ctx.stroke();
+  }
+  function drawConstellationData(canvas,bins,cfg){
+    if(!canvas)return;drawConstellationGrid(canvas);
+    if(!Array.isArray(bins)||!bins.length)return;
+    const ctx=canvas.getContext('2d'),side=canvas.width,center=side/2,radius=side*.40;
+    const selected=bins.filter(b=>Number(b.frequencyHz)>=cfg.minFrequencyHz&&Number(b.frequencyHz)<=cfg.maxFrequencyHz&&Number.isFinite(Number(b.real))&&Number.isFinite(Number(b.imag)));
+    let peak=0;for(const b of selected)peak=Math.max(peak,Math.hypot(Number(b.real),Number(b.imag)));
+    if(!(peak>0))return;
+    for(const b of selected){
+      const real=Number(b.real),imag=Number(b.imag),magnitude=Math.hypot(real,imag);
+      if(magnitude<peak*.035)continue;
+      const x=center+(real/peak)*radius,y=center-(imag/peak)*radius;
+      const level=Math.max(0,Math.min(1,(Number(b.magnitudeDbfs)-cfg.minDbfs)/(cfg.maxDbfs-cfg.minDbfs)));
+      ctx.fillStyle=`rgba(${Math.round(75+level*155)},${Math.round(165+level*75)},${Math.round(220-level*125)},${.28+level*.66})`;
+      const pointSize=Math.max(1,1.25*side/132);ctx.beginPath();ctx.arc(x,y,pointSize,0,Math.PI*2);ctx.fill();
+    }
   }
   function resetWaterfallView(canvas){
     const cfg=effectiveWaterfallSettings(),dpr=Math.max(1,window.devicePixelRatio||1),rect=canvas.getBoundingClientRect();
@@ -206,7 +242,7 @@
     const view={buffer,cursor:0,count:0,lastRowAt:0,frequencyStart:cfg.minFrequencyHz,frequencyEnd:cfg.maxFrequencyHz};
     waterfallViews.set(canvas.id,view);renderWaterfallGrid(canvas,view,cfg);return view;
   }
-  function drawIdleWaterfall(canvas){if(!canvas)return;resetWaterfallView(canvas);const watermark=canvas.parentElement?.querySelector('.spectrum-watermark');if(watermark)watermark.hidden=false;window.addEventListener('resize',()=>resetWaterfallView(canvas));}
+  function drawIdleWaterfall(canvas){if(!canvas)return;resetWaterfallView(canvas);drawConstellationGrid($(canvas.id==='rx-spectrum'?'rx-constellation':'tx-constellation'));const watermark=canvas.parentElement?.querySelector('.spectrum-watermark');if(watermark)watermark.hidden=false;window.addEventListener('resize',()=>{resetWaterfallView(canvas);drawConstellationGrid($(canvas.id==='rx-spectrum'?'rx-constellation':'tx-constellation'));});}
   function drawWaterfallData(canvas,bins){
     if(!canvas||!Array.isArray(bins)||bins.length<2)return;
     let view=waterfallViews.get(canvas.id);if(!view)view=resetWaterfallView(canvas);
@@ -228,6 +264,7 @@
     const bctx=view.buffer.getContext('2d');bctx.putImageData(data,0,view.cursor);
     view.cursor=(view.cursor+1)%view.buffer.height;view.count=Math.min(view.buffer.height,view.count+1);
     renderWaterfallGrid(canvas,view,cfg);
+    drawConstellationData($(canvas.id==='rx-spectrum'?'rx-constellation':'tx-constellation'),bins,cfg);
     const levels=bins.reduce((max,b)=>Math.max(max,Number(b.magnitudeDbfs)||-160),-160);
     if(canvas.id==='tx-spectrum'){
       const power=bins.reduce((sum,b)=>sum+Math.pow(10,(Number(b.magnitudeDbfs)||-160)/10),0)/bins.length;
@@ -284,9 +321,27 @@
     button.classList.toggle('transmitting',!!state.txActive);
     button.classList.toggle('idle',!state.txActive);
     $('tx-pill').textContent=state.txActive?tr('tx.active'):tr('tx.idle');
+    const tone=$('tx-tone-test');if(tone){tone.disabled=state.txPreparing||state.txActive||!supported;tone.textContent=state.txToneActive?tr('tx.testToneActive'):tr('tx.testTone');tone.classList.toggle('running',!!state.txToneActive);}
     $('tx-pill').classList.toggle('active',!!state.txActive);
     $('tx-pill').classList.toggle('idle',!state.txActive);
   }
+
+  function syncRepeatIntervalLock(){
+    const repeat=$('repeat-check'),input=$('send-interval');if(!repeat||!input)return;
+    if(repeat.checked){if(state.repeatIntervalBase===null)state.repeatIntervalBase=Math.max(0,Number(input.value)||0);input.disabled=true;}
+    else{input.disabled=false;state.repeatIntervalBase=null;if(state.repeatCountdownTimer){clearInterval(state.repeatCountdownTimer);state.repeatCountdownTimer=null;}}
+  }
+  function setRepeatCountdown(seconds){
+    const input=$('send-interval');if(!input)return;
+    if(!state.repeatIntervalBase)state.repeatIntervalBase=Math.max(0,Number(input.value)||0);
+    input.disabled=true;input.value=String(Math.max(0,Math.ceil(Number(seconds)||0)));
+  }
+  function restoreRepeatInterval(){
+    const input=$('send-interval');if(!input)return;
+    if(state.repeatIntervalBase!==null)input.value=String(state.repeatIntervalBase);
+    input.disabled=!!$('repeat-check')?.checked;
+  }
+
   async function buildCurrentRenderedImage(){
     const canvas=document.createElement('canvas');
     await drawTemplateToCanvas(canvas);
@@ -298,10 +353,22 @@
     if(state.txPreparing)return;
     state.txPreparing=true;renderTXState();
     try{
+      let ax25To='CQ';
+      if(state.settings?.txProfile==='ssdv-ax25'){
+        if(isCQTemplate()){
+          $('tx-his-call').value='';
+          $('tx-his-call').dataset.valueSource='';
+          syncTXFields();
+          await renderTemplatePreview();
+          ax25To='CQ';
+        }else{
+          ax25To=String($('tx-his-call').value||'').trim().toUpperCase()||'CQ';
+        }
+      }
       const image=await buildCurrentRenderedImage();
       const repeat=$('repeat-check').checked;
-      const interval=Number($('send-interval').value)||0;
-      await call('StartTXRendered',image,repeat,interval);
+      const interval=repeat?(state.repeatIntervalBase??(Number($('send-interval').value)||0)):(Number($('send-interval').value)||0);
+      await call('StartTXRendered',image,repeat,interval,ax25To);
       state.txActive=true;
       renderTXState();
     }catch(e){setMessage(e.message,true);$('global-state').textContent=e.message;}
@@ -402,17 +469,55 @@
     }catch(e){state.templateBackgroundAssetId=previous;renderTemplateBackground();throw e;}
   }
   async function loadAlbum(){try{state.album=await call('GetAlbum');renderAlbum();}catch(e){console.error(e);}}
-  async function renderAlbum(){const root=$('album-list');if(!root)return;root.replaceChildren();const filter=$('album-filter')?.value||'all';const records=state.album.filter(x=>filter==='all'||x.type.toLowerCase()===filter);if(!records.length){const empty=document.createElement('div');empty.className='album-empty';empty.textContent=tr('album.empty');root.appendChild(empty);return;}for(const record of records.slice().reverse()){const card=document.createElement('article');card.className='album-card';const thumb=document.createElement('button');thumb.className='album-thumb';thumb.type='button';const img=document.createElement('img');img.alt=`${record.type} ${record.callsign||''}`;try{img.src=await call('GetAlbumImageData',record.id);}catch(_){img.alt='Image unavailable';}thumb.appendChild(img);thumb.onclick=()=>previewAlbum(record,img.src);const info=document.createElement('div');info.className='album-info';const title=document.createElement('b');title.textContent=`${record.type} · ${record.profile||'---'}`;const time=document.createElement('time');time.textContent=record.createdAt?new Date(record.createdAt).toLocaleString(state.locale):'';const meta=document.createElement('small');meta.textContent=`${record.callsign||'---'} · ID ${record.imageId??'--'} · ${record.imageWidth||'--'}×${record.imageHeight||'--'} · ${record.packetsReceived||0}/${record.packetsExpected||0}`;info.append(title,time,meta);const actions=document.createElement('div');actions.className='album-card-actions';const exportButton=document.createElement('button');exportButton.className='secondary-btn';exportButton.textContent=tr('album.export');exportButton.disabled=!img.src.startsWith('data:');exportButton.onclick=()=>{const a=document.createElement('a');a.href=img.src;a.download=`${record.type}_${record.createdAt?new Date(record.createdAt).toISOString().replace(/[:.]/g,'-'):'image'}.png`;a.click();};const remove=document.createElement('button');remove.className='text-btn danger-text';remove.textContent=tr('album.delete');remove.onclick=async()=>{if(!confirmInlineDelete(`album:${record.id}`,remove,`${tr('album.delete')} · ${record.callsign||record.id}`))return;try{await call('DeleteAlbumRecord',record.id);await loadAlbum();}catch(e){setMessage(e.message,true);}};actions.append(exportButton,remove);card.append(thumb,info,actions);root.appendChild(card);}}
+  async function renderAlbum(){
+    const root=$('album-list');if(!root)return;root.replaceChildren();
+    const filter=$('album-filter')?.value||'all';
+    const records=state.album.filter(x=>filter==='all'||x.type.toLowerCase()===filter).slice().sort((a,b)=>new Date(b.createdAt||0)-new Date(a.createdAt||0));
+    if(!records.length){const empty=document.createElement('div');empty.className='album-empty';empty.textContent=tr('album.empty');root.appendChild(empty);return;}
+    for(const record of records){
+      const card=document.createElement('article');card.className='album-card';
+      const thumb=document.createElement('button');thumb.className='album-thumb';thumb.type='button';
+      const img=document.createElement('img');img.alt=`${record.type} ${record.callsign||''}`;
+      let imageData='';try{imageData=await call('GetAlbumImageData',record.id);}catch(_){}
+      if(imageData){img.src=imageData;thumb.appendChild(img);thumb.onclick=()=>previewAlbum(record,img.src);}
+      else{const placeholder=document.createElement('span');placeholder.className='album-thumb-placeholder';placeholder.textContent=tr('album.noPreview');thumb.appendChild(placeholder);thumb.disabled=true;}
+      const info=document.createElement('div');info.className='album-info';
+      const chip=document.createElement('span');chip.className=`album-type-chip ${record.type.toLowerCase()==='tx'?'tx':'rx'}`;chip.textContent=record.type==='TX'?'TX · SENT':'RX · RECEIVED';
+      const title=document.createElement('b');title.textContent=`${record.profile||'---'}`;
+      const time=document.createElement('time');time.textContent=record.createdAt?new Date(record.createdAt).toLocaleString(state.locale):'';
+      const meta=document.createElement('small');meta.textContent=`${record.callsign||'---'} · ID ${record.imageId??'--'} · ${record.imageWidth||'--'}×${record.imageHeight||'--'} · ${record.packetsReceived||0}/${record.packetsExpected||0} · ${record.status||''}`;
+      info.append(chip,title,time,meta);
+      const actions=document.createElement('div');actions.className='album-card-actions';
+      const exportButton=document.createElement('button');exportButton.className='secondary-btn';exportButton.textContent=tr('album.export');exportButton.disabled=!img.src.startsWith('data:')&&!record.packetPath;
+      exportButton.onclick=async()=>{try{const count=await call('ExportAlbumRecord',record.id);if(count>0)setMessage(tr('album.exported',{count}));}catch(e){setMessage(tr('action.failed',{error:e.message}),true);}};
+      const remove=document.createElement('button');remove.className='text-btn danger-text';remove.textContent=tr('album.delete');remove.onclick=async()=>{if(!confirmInlineDelete(`album:${record.id}`,remove,`${tr('album.delete')} · ${record.callsign||record.id}`))return;try{await call('DeleteAlbumRecord',record.id);await loadAlbum();}catch(e){setMessage(e.message,true);}};
+      actions.append(exportButton,remove);card.append(thumb,info,actions);root.appendChild(card);
+    }
+  }
+  async function importTemplatePack(){
+    const count=await call('ImportTemplatePack');if(!count)return;
+    state.imageDataCache.clear();state.imageElementCache.clear();
+    state.gallery=await call('GetGallery');state.settings=await call('GetSettings');state.templateBackgroundAssetId=state.settings.templateBackgroundAssetId||'';
+    await loadTemplates();renderTemplateAssetOptions();renderImageLibrary();await renderTemplatePreview();
+    setMessage(tr('template.packImported',{count}));
+  }
+  async function exportTemplatePack(){
+    const path=await call('ExportTemplatePack');if(!path)return;
+    setMessage(tr('template.packExported'));
+  }
+  async function exportAlbumToDirectory(){
+    const count=await call('ExportAlbumToDirectory');if(count>0)setMessage(tr('album.exported',{count}));
+  }
   function previewAlbum(record,dataURL){if(!dataURL||!dataURL.startsWith('data:'))return;$('album-preview-image').src=dataURL;$('album-preview-caption').textContent=`${record.type} · ${record.profile} · ${record.callsign||'---'} · ${record.createdAt?new Date(record.createdAt).toLocaleString(state.locale):''}`;$('album-preview-dialog').showModal();}
   function selectedTemplate(){return state.templates[state.selectedTemplate]||null;}
   function selectedComponent(){const template=selectedTemplate();return template?.components?.find(c=>c.id===state.selectedComponent)||null;}
   function componentLabel(c){if(c.type==='text')return `T · ${(c.text||'Text').slice(0,24)}`;if(c.type==='last-rx-image')return 'IMG · Last RX image';return `IMG · ${state.gallery.find(a=>a.id===c.assetId)?.name||'Template image'}`;}
   function defaultTemplatePresets(){
-    const text=(id,value,y)=>({id,type:'text',text:value,x:5,y,width:90,height:16,fontSize:32,color:'#ffffff',visible:true,outline:true,outlineWidth:2,outlineColor:'#000000'});
+    const text=(id,value,y,fontSize,color='#ffffff')=>({id,type:'text',text:value,x:5,y,width:90,height:16,fontSize,bold:true,color,visible:true,outline:true,outlineWidth:2,outlineColor:'#101820'});
     return [
-      {id:'1',name:'CQ',components:[text('cq','CQ {MYCALL}',8)]},
-      {id:'2',name:'RST',components:[text('rst','{HISCALL}  RST {REPORT}',72)]},
-      {id:'3',name:'73',components:[text('73','73 {MYCALL}',78)]},
+      {id:'1',name:'CQ',components:[text('cq-kicker','SATELLITE QSO · CALLING',8,15,'#58d4e8'),text('cq-title','CQ CQ CQ',31,46),text('cq-call','{MYCALL}',58,30),text('cq-locator','{LOCATOR}  ·  {DATE}',84,14,'#c7e8ef')]},
+      {id:'2',name:'RST',components:[text('rst-kicker','SIGNAL REPORT',12,16,'#58d4e8'),text('rst-call','{HISCALL}',36,28),text('rst-value','RST {REPORT}',61,40),text('rst-footer','FROM {MYCALL}  ·  {LOCATOR}',86,13,'#c7e8ef')]},
+      {id:'3',name:'73',components:[text('73-kicker','THANK YOU FOR THE CONTACT',10,15,'#58d4e8'),text('73-main','73',33,78),text('73-call','{MYCALL}',72,29),text('73-locator','{LOCATOR}  ·  {TIME}',88,13,'#c7e8ef')]},
       {id:'4',name:'Blank',components:[]}
     ];
   }
@@ -471,10 +576,22 @@
     $('template-delete').disabled=state.templates.length<=1;
     $('template-duplicate').disabled=state.templates.length>=32;
   }
+  function isCQTemplate(template=selectedTemplate()){
+    const name=String(template?.name||'').trim().replace(/^\d+[\s.、_-]*/, '').toUpperCase();
+    return name==='CQ';
+  }
+  function clearHisCallForCQTemplate(){
+    if(state.settings?.txProfile!=='ssdv-ax25'||!isCQTemplate())return;
+    $('tx-his-call').value='';
+    $('tx-his-call').dataset.valueSource='';
+    syncTXFields();
+    renderTemplatePreview();
+  }
   function selectTemplate(index){
     const next=Number(index);if(!Number.isInteger(next)||!state.templates[next])return;
     state.selectedTemplate=next;const tpl=selectedTemplate();state.selectedComponent=tpl.components?.[0]?.id||'';
     $('template-name').value=tpl.name||'';renderTemplateSelect();renderTemplateComponents();renderTemplateProperties();renderTemplateBackground();renderTemplatePreview();
+    clearHisCallForCQTemplate();
   }
   function fillAssetSelect(select,selected=''){
     if(!select)return;select.replaceChildren();const blank=document.createElement('option');blank.value='';blank.textContent=state.gallery.length?tr('template.unselected'):tr('template.noImage');select.appendChild(blank);
@@ -577,7 +694,7 @@
     state.selectedTemplate=0;state.selectedComponent=state.templates[0]?.components?.[0]?.id||'';
     $('template-name').value=state.templates[0]?.name||'';renderTemplateSelect();renderTemplateComponents();renderTemplateProperties();renderTemplateBackground();
   }
-  function resolveTemplateText(text){const now=new Date();const vars={MYCALL:state.txFields.myCall||state.settings?.callsign||'N0CALL',CALLSIGN:state.txFields.myCall||state.settings?.callsign||'N0CALL',LOCATOR:state.txFields.locator||state.settings?.locator||'JJ00',REPORT:state.txFields.report||'595',HISCALL:state.txFields.hisCall||'',QTH:state.txFields.qth||'',MESSAGE:state.txFields.message||'',DATE:now.toISOString().slice(0,10),TIME:now.toISOString().slice(11,19)+' UTC'};return String(text||'').replace(/\{([A-Z]+)\}/g,(_,key)=>vars[key]??`{${key}}`);}
+  function resolveTemplateText(text){const now=new Date();const vars={MYCALL:state.txFields.myCall||state.settings?.callsign||'N0CALL',CALLSIGN:state.txFields.myCall||state.settings?.callsign||'N0CALL',LOCATOR:state.txFields.locator||state.settings?.locator||'JJ00',REPORT:state.txFields.report||'595',HISCALL:state.txFields.hisCall||'TOCALL',QTH:state.txFields.qth||'',MESSAGE:state.txFields.message||'',DATE:now.toISOString().slice(0,10),TIME:now.toISOString().slice(11,19)+' UTC'};return String(text||'').replace(/\{([A-Z]+)\}/g,(_,key)=>vars[key]??`{${key}}`);}
   function imageFromDataURL(data,key=''){
     const cacheKey=key||data;
     if(state.imageElementCache.has(cacheKey))return state.imageElementCache.get(cacheKey);
@@ -774,6 +891,7 @@
   function applyDecodedCallsign(value){
     const callsign=String(value||'').trim().toUpperCase();
     if(!callsign)return false;
+    if(state.settings?.txProfile==='ssdv-ax25'&&isCQTemplate())return false;
     const field=$('tx-his-call');
     if(field.dataset.valueSource==='manual')return false;
     field.value=callsign;
@@ -791,7 +909,7 @@
     $('language-select').addEventListener('change',async e=>{await applyLocale(e.target.value);state.settings.language=e.target.value;try{await call('SaveSettings',state.settings);}catch(err){console.error(err);}});
     document.querySelectorAll('.nav-btn').forEach(b=>b.addEventListener('click',()=>showPage(b.dataset.page)));
     $('rx-toggle').onclick=toggleRX;$('audio-refresh').onclick=refreshAudioDevices;$('settings-open').onclick=openSettings;$('settings-close').onclick=closeSettings;$('settings-cancel').onclick=closeSettings;$('settings-save').onclick=saveSettings;document.querySelectorAll('.settings-tab').forEach(b=>b.addEventListener('click',()=>showSettingsTab(b.dataset.settingsTab)));['waterfall-min-frequency','waterfall-max-frequency','waterfall-min-db','waterfall-max-db','waterfall-rows','waterfall-history','waterfall-background-color','waterfall-low-color','waterfall-mid-color','waterfall-high-color','waterfall-peak-color'].forEach(id=>$(id).addEventListener('input',previewWaterfallForm));$('waterfall-reset').onclick=()=>{populateWaterfallForm(DEFAULT_WATERFALL_SETTINGS);previewWaterfallForm();};$('ptt-mode').onchange=updatePTTFields;$('serial-refresh').onclick=refreshPorts;$('hamlib-test-btn').onclick=togglePTTTest;$('serial-test-btn').onclick=togglePTTTest;
-$('template-add-text').onclick=()=>runAction(()=>addTemplateComponent('text'));$('template-add-rx').onclick=()=>runAction(()=>addTemplateComponent('last-rx-image'));$('template-add-image').onclick=()=>runAction(openImageLibrary);$('gallery-close').onclick=()=>$('image-library-dialog').close();$('gallery-import').onclick=()=>runAction(importGallery);$('template-clear-background').onclick=()=>runAction(clearTemplateBackground);$('template-save').onclick=()=>runAction(saveTemplates);$('template-add').onclick=()=>runAction(()=>createTemplatePreset(false));$('template-duplicate').onclick=()=>runAction(()=>createTemplatePreset(true));$('template-delete').onclick=()=>runAction(deleteTemplatePreset);$('template-select').onchange=e=>selectTemplate(e.target.value);$('template-name').oninput=()=>{const tpl=selectedTemplate();if(tpl){tpl.name=$('template-name').value;renderTemplateSelect();$('template-select').value=String(state.selectedTemplate);}};$('component-delete').onclick=()=>{const tpl=selectedTemplate();if(!tpl)return;tpl.components=(tpl.components||[]).filter(c=>c.id!==state.selectedComponent);state.selectedComponent=tpl.components[0]?.id||'';renderTemplateComponents();renderTemplateProperties();renderTemplatePreview();setMessage(tr('template.componentDeleted'));};['component-text','component-image-scale','component-font-size','component-outline-width','component-color','component-outline-color','component-asset','component-bold','component-visible','component-outline'].forEach(id=>{const el=$(id);el.addEventListener('input',updateTemplateComponent);el.addEventListener('change',updateTemplateComponent);});$('component-asset').onchange=updateTemplateComponent;['tx-my-call','tx-his-call','tx-qth','tx-locator','tx-report','tx-message'].forEach(id=>$(id).addEventListener('input',()=>{if(id==='tx-his-call')$('tx-his-call').dataset.valueSource=$('tx-his-call').value.trim()?'manual':'';syncTXFields();renderTemplatePreview();}));bindTemplateCanvas();$('tx-toggle').onclick=toggleTX;$('quality-select').onchange=e=>{state.settings.quality=e.target.value;call('SaveSettings',state.settings).catch(console.error);renderTemplatePreview();};$('album-filter').onchange=renderAlbum;$('album-preview-close').onclick=()=>$('album-preview-dialog').close();
+$('template-add-text').onclick=()=>runAction(()=>addTemplateComponent('text'));$('template-add-rx').onclick=()=>runAction(()=>addTemplateComponent('last-rx-image'));$('template-add-image').onclick=()=>runAction(openImageLibrary);$('gallery-close').onclick=()=>$('image-library-dialog').close();$('gallery-import').onclick=()=>runAction(importGallery);$('template-clear-background').onclick=()=>runAction(clearTemplateBackground);$('template-save').onclick=()=>runAction(saveTemplates);$('template-import-pack').onclick=()=>runAction(importTemplatePack);$('template-export-pack').onclick=()=>runAction(exportTemplatePack);$('template-add').onclick=()=>runAction(()=>createTemplatePreset(false));$('template-duplicate').onclick=()=>runAction(()=>createTemplatePreset(true));$('template-delete').onclick=()=>runAction(deleteTemplatePreset);$('template-select').onchange=e=>selectTemplate(e.target.value);$('template-name').oninput=()=>{const tpl=selectedTemplate();if(tpl){tpl.name=$('template-name').value;renderTemplateSelect();$('template-select').value=String(state.selectedTemplate);}};$('component-delete').onclick=()=>{const tpl=selectedTemplate();if(!tpl)return;tpl.components=(tpl.components||[]).filter(c=>c.id!==state.selectedComponent);state.selectedComponent=tpl.components[0]?.id||'';renderTemplateComponents();renderTemplateProperties();renderTemplatePreview();setMessage(tr('template.componentDeleted'));};['component-text','component-image-scale','component-font-size','component-outline-width','component-color','component-outline-color','component-asset','component-bold','component-visible','component-outline'].forEach(id=>{const el=$(id);el.addEventListener('input',updateTemplateComponent);el.addEventListener('change',updateTemplateComponent);});$('component-asset').onchange=updateTemplateComponent;['tx-my-call','tx-his-call','tx-qth','tx-locator','tx-report','tx-message'].forEach(id=>$(id).addEventListener('input',()=>{if(id==='tx-his-call')$('tx-his-call').dataset.valueSource=$('tx-his-call').value.trim()?'manual':'';syncTXFields();renderTemplatePreview();}));bindTemplateCanvas();$('tx-toggle').onclick=toggleTX;$('tx-tone-test').onclick=()=>runAction(()=>call('Start1500HzTestTone'));$('repeat-check').addEventListener('change',syncRepeatIntervalLock);$('send-interval').addEventListener('input',()=>{if(!$('repeat-check').checked)state.repeatIntervalBase=null;});syncRepeatIntervalLock();$('tx-ax25-ssid').addEventListener('change',async()=>{const value=Number($('tx-ax25-ssid').value);if(!Number.isInteger(value)||value<0||value>15){$('tx-ax25-ssid').value=String(state.settings?.ax25Ssid??0);setMessage('AX.25 SSID must be 0–15',true);return;}state.settings.ax25Ssid=value;try{await call('SaveSettings',state.settings);}catch(e){setMessage(e.message,true);}});$('quality-select').onchange=e=>{state.settings.quality=e.target.value;call('SaveSettings',state.settings).catch(console.error);renderTemplatePreview();};$('album-filter').onchange=renderAlbum;$('album-export-all').onclick=()=>runAction(exportAlbumToDirectory);$('album-preview-close').onclick=()=>$('album-preview-dialog').close();
     ['rx-spectrum','tx-spectrum'].forEach(id=>drawIdleWaterfall($(id)));drawWaterfallDemo();
   }
 
@@ -799,6 +917,7 @@ $('template-add-text').onclick=()=>runAction(()=>addTemplateComponent('text'));$
       // Load the small template index first; device enumeration can be slow on some hosts.
       await loadTemplates();
       state.settings=await call('GetSettings');
+      state.settings.ax25Ssid=Number.isInteger(Number(state.settings.ax25Ssid))?Number(state.settings.ax25Ssid):0;
       state.settings.waterfall=normalizeWaterfallSettings(state.settings.waterfall||DEFAULT_WATERFALL_SETTINGS);state.waterfallPreview=state.settings.waterfall;populateWaterfallForm(state.waterfallPreview);resetWaterfallViews();
       state.profiles=await call('GetProfiles');
       state.ports=await call('GetSerialPorts');
@@ -809,11 +928,11 @@ $('template-add-text').onclick=()=>runAction(()=>addTemplateComponent('text'));$
       await applyLocale(state.settings.language||'zh-CN');$('quality-select').value=state.settings.quality||'medium';
       renderProfiles();renderPorts();renderTXState();renderImageLibrary();renderTemplatePreview();
     }catch(e){
-      console.warn(e);state.settings={language:'zh-CN',ptt:{mode:'vox',activeHigh:true},rxProfile:'ssdv-ax25',txProfile:'ssdv-ax25',quality:'medium',callsign:'N0CALL',locator:'JJ00',templateBackgroundAssetId:'',waterfall:{...DEFAULT_WATERFALL_SETTINGS}};state.waterfallPreview=state.settings.waterfall;populateWaterfallForm(state.waterfallPreview);resetWaterfallViews();state.templateBackgroundAssetId='';
+      console.warn(e);state.settings={language:'zh-CN',ptt:{mode:'vox',activeHigh:true},rxProfile:'ssdv-ax25',txProfile:'ssdv-ax25',ax25Ssid:0,quality:'medium',callsign:'N0CALL',locator:'JJ00',templateBackgroundAssetId:'',waterfall:{...DEFAULT_WATERFALL_SETTINGS}};state.waterfallPreview=state.settings.waterfall;populateWaterfallForm(state.waterfallPreview);resetWaterfallViews();state.templateBackgroundAssetId='';
       state.profiles=[{id:'ssdv-ax25',name:'SSDV AX.25'},{id:'ssdv-ccsds-1200',name:'SSDV CCSDS 1200'},{id:'ssdv-ccsds-2400',name:'SSDV CCSDS 2400'},{id:'pcsi-ccsds-1200',name:'PCSI CCSDS 1200'},{id:'pcsi-ccsds-2400',name:'PCSI CCSDS 2400'}];
       renderProfiles();renderTXState();await loadTemplates();renderImageLibrary();renderTemplatePreview();await applyLocale('zh-CN');
     }
-    if(window.runtime?.EventsOn){window.runtime.EventsOn('ptt:test-state',s=>{state.ptt=s;renderPTTState();});window.runtime.EventsOn('ptt:error',m=>setMessage(m,true));window.runtime.EventsOn('audio:error',m=>{$('global-state').textContent=m;});window.runtime.EventsOn('rx:spectrum',bins=>drawWaterfallData($('rx-spectrum'),bins));window.runtime.EventsOn('tx:spectrum',bins=>drawWaterfallData($('tx-spectrum'),bins));window.runtime.EventsOn('rx:level',v=>{$('rx-level').textContent=`${Number(v.rmsDbfs).toFixed(1)} dBFS`;$('rx-peak').textContent=Number(v.peak).toFixed(3);});window.runtime.EventsOn('tx:progress',v=>{$('tx-progress').style.width=`${Math.max(0,Math.min(1,Number(v)))*100}%`;});window.runtime.EventsOn('rx:image',u=>{if(u.error){$('global-state').textContent=u.error;return;}$('rx-callsign').textContent=u.callsign||'---';if(u.callsign)applyDecodedCallsign(u.callsign);$('rx-image-id').textContent=u.imageId??'--';$('rx-packets').textContent=u.packetsExpected?`${u.packetsReceived||0} / ${u.packetsExpected}`:`${u.packetsReceived||0} / --`;$('rx-mode').textContent=u.profile||'---';if(u.pngBase64){state.latestRXData='';state.latestRXLoaded=false;}if(u.pngBase64){const view=document.querySelector('.image-view');view.replaceChildren();const img=document.createElement('img');img.src=`data:image/png;base64,${u.pngBase64}`;img.alt=`${u.codec||'Digital'} received image preview`;view.appendChild(img);}if(u.complete){$('global-state').textContent=u.codec==='SSDV'?tr('rx.ssdvPending'):tr('rx.complete');state.latestRXData='';state.latestRXLoaded=false;renderTemplatePreview();if(document.querySelector('#page-album').classList.contains('active'))loadAlbum();}else if(u.packetsExpected){$('global-state').textContent=tr('rx.packetCount',{received:u.packetsReceived||0,expected:u.packetsExpected});}});window.runtime.EventsOn('tx:state',v=>{state.txActive=!!v.active;renderTXState();if(!state.txActive)$('tx-progress').style.width='0%';});window.runtime.EventsOn('tx:status',v=>{if(v.phase==='completed')$('global-state').textContent=tr('tx.done');});window.runtime.EventsOn('tx:error',m=>{setMessage(m,true);$('global-state').textContent=m;});}
+    if(window.runtime?.EventsOn){window.runtime.EventsOn('ptt:test-state',s=>{state.ptt=s;renderPTTState();});window.runtime.EventsOn('ptt:error',m=>setMessage(m,true));window.runtime.EventsOn('audio:error',m=>{$('global-state').textContent=m;});window.runtime.EventsOn('rx:spectrum',bins=>drawWaterfallData($('rx-spectrum'),bins));window.runtime.EventsOn('tx:spectrum',bins=>drawWaterfallData($('tx-spectrum'),bins));window.runtime.EventsOn('rx:level',v=>{$('rx-level').textContent=`${Number(v.rmsDbfs).toFixed(1)} dBFS`;$('rx-peak').textContent=Number(v.peak).toFixed(3);});window.runtime.EventsOn('tx:progress',v=>{$('tx-progress').style.width=`${Math.max(0,Math.min(1,Number(v)))*100}%`;});window.runtime.EventsOn('rx:image',u=>{if(u.error){$('global-state').textContent=u.error;return;}if(u.started){const view=document.querySelector('.image-view');view.replaceChildren();state.latestRXData='';state.latestRXLoaded=false;}$('rx-callsign').textContent=u.callsign||'---';if(u.callsign)applyDecodedCallsign(u.callsign);if(u.hasAX25SSID){$('rx-ssid').textContent=String(u.ax25SourceSSID??0);$('rx-ssid-wrap').hidden=false;}else if(u.profile!=='ssdv-ax25')$('rx-ssid-wrap').hidden=true;$('rx-image-id').textContent=u.imageId??'--';$('rx-packets').textContent=u.packetsExpected?`${u.packetsReceived||0} / ${u.packetsExpected}`:`${u.packetsReceived||0} / --`;$('rx-mode').textContent=u.profile||'---';if(u.pngBase64){state.latestRXData='';state.latestRXLoaded=false;}if(u.pngBase64){const view=document.querySelector('.image-view');view.replaceChildren();const img=document.createElement('img');img.src=`data:image/png;base64,${u.pngBase64}`;img.alt=`${u.codec||'Digital'} received image preview`;img.style.width='100%';img.style.height='100%';img.style.maxWidth='100%';img.style.maxHeight='100%';img.style.objectFit='contain';img.style.objectPosition='center';img.draggable=false;view.appendChild(img);}if((u.pngBase64||u.packetPath)&&document.querySelector('#page-album').classList.contains('active'))loadAlbum();if(u.complete){$('global-state').textContent=u.codec==='SSDV'?tr('rx.ssdvPending'):tr('rx.complete');state.latestRXData='';state.latestRXLoaded=false;renderTemplatePreview();}else if(u.packetsExpected){$('global-state').textContent=tr('rx.packetCount',{received:u.packetsReceived||0,expected:u.packetsExpected});}});window.runtime.EventsOn('tx:tone-state',v=>{state.txToneActive=!!v.active;renderTXState();});window.runtime.EventsOn('tx:state',v=>{state.txActive=!!v.active;renderTXState();if(!state.txActive)$('tx-progress').style.width='0%';});window.runtime.EventsOn('tx:status',v=>{if(v.phase==='completed'){$('global-state').textContent=tr('tx.done');restoreRepeatInterval();}else if(v.phase==='countdown'){setRepeatCountdown(Number(v.error)||0);$('global-state').textContent=`下一次发射：${Math.max(0,Number(v.error)||0)} s`;}else if(v.phase==='sending'){restoreRepeatInterval();}});window.runtime.EventsOn('tx:error',m=>{setMessage(m,true);$('global-state').textContent=m;});}
     await refreshPTTState();await refreshAudioDevices();await refreshAudioState();
   }
 

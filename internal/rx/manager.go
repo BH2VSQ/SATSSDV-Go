@@ -7,8 +7,12 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
 	"image/jpeg"
 	"image/png"
+	"sort"
 	"sync"
 	"time"
 
@@ -18,10 +22,13 @@ import (
 )
 
 const (
-	queueCapacity       = 128
-	pcsiPreviewInterval = 8
-	maxImageSessions    = 24
-	maxSSDVPackets      = 8192
+	queueCapacity         = 2048
+	pcsiPreviewInterval   = 6
+	pcsiPreviewIterations = 48
+	pcsiFinalIterations   = 96
+	ssdvArchiveInterval   = 8
+	maxImageSessions      = 24
+	maxSSDVPackets        = 8192
 )
 
 type Update struct {
@@ -33,6 +40,7 @@ type Update struct {
 	PacketsExpected  int     `json:"packetsExpected"`
 	Coverage         float64 `json:"coverage"`
 	Complete         bool    `json:"complete"`
+	ArchivePreview   bool    `json:"archivePreview,omitempty"`
 	PNGBase64        string  `json:"pngBase64,omitempty"`
 	PacketDataBase64 string  `json:"packetDataBase64,omitempty"`
 	PacketPath       string  `json:"packetPath,omitempty"`
@@ -42,19 +50,28 @@ type Update struct {
 	FEC              bool    `json:"fec"`
 	Subsampling      uint8   `json:"subsampling,omitempty"`
 	Error            string  `json:"error,omitempty"`
+	Started          bool    `json:"started,omitempty"`
+	SessionID        string  `json:"sessionId,omitempty"`
+	HasAX25SSID      bool    `json:"hasAX25SSID,omitempty"`
+	AX25SourceSSID   uint8   `json:"ax25SourceSSID,omitempty"`
 }
 
 type imageSession struct {
-	mu         sync.Mutex
-	decoder    *pcsi.DecoderState
-	lastUpdate time.Time
-	queued     bool
-	running    bool
-	dirty      bool
-	complete   bool
-	profile    string
-	callsign   string
-	imageID    uint8
+	mu          sync.Mutex
+	decoder     *pcsi.DecoderState
+	lastUpdate  time.Time
+	queued      bool
+	running     bool
+	dirty       bool
+	complete    bool
+	profile     string
+	callsign    string
+	imageID     uint8
+	ax25SSID    uint8
+	hasAX25SSID bool
+	packetZero  []byte
+	key         string
+	sessionID   string
 }
 
 type reconstructionResult struct {
@@ -64,14 +81,22 @@ type reconstructionResult struct {
 }
 
 type ssdvSession struct {
-	packets     map[uint16][256]byte
-	expected    int
-	width       int
-	height      int
-	quality     uint8
-	fec         bool
-	subsampling uint8
-	lastUpdate  time.Time
+	packets            map[uint16][256]byte
+	expected           int
+	width              int
+	height             int
+	quality            uint8
+	fec                bool
+	subsampling        uint8
+	sessionID          string
+	lastUpdate         time.Time
+	packetZero         []byte
+	complete           bool
+	lastPreviewPackets int
+	lastArchivePackets int
+	lastPreviewImage   *image.RGBA
+	highestPacketID    uint16
+	hasHighestPacketID bool
 }
 
 type Manager struct {
@@ -104,8 +129,9 @@ func NewManager(onUpdate func(Update)) *Manager {
 	return m
 }
 
-// Submit copies a decoded packet into a bounded worker queue. It never runs
-// image reconstruction on the caller's audio or demodulation goroutine.
+// Submit copies a decoded packet into a bounded worker queue. When the queue is
+// full it applies backpressure instead of silently dropping a valid RF packet.
+// It never runs image reconstruction on the caller's audio callback goroutine.
 func (m *Manager) Submit(packet transport.ReceivedPacket) bool {
 	if m == nil {
 		return false
@@ -121,8 +147,6 @@ func (m *Manager) Submit(packet transport.ReceivedPacket) bool {
 	case m.queue <- packet:
 		return true
 	case <-m.ctx.Done():
-		return false
-	default:
 		return false
 	}
 }
@@ -159,18 +183,25 @@ func (m *Manager) runReconstruction() {
 			session.dirty = false
 			decoder := session.decoder.Clone()
 			profile, callsign, imageID := session.profile, session.callsign, session.imageID
+			ax25SSID, hasAX25SSID := session.ax25SSID, session.hasAX25SSID
+			sessionID := session.sessionID
 			complete := session.complete
 			session.mu.Unlock()
 
-			iterations := 2
+			iterations := pcsiPreviewIterations
 			if complete {
-				iterations = 24
+				// The reference PCSI OWL-QN solver runs until convergence. The Go
+				// implementation uses a bounded budget, and 96 iterations provides
+				// enough room for the corrected optimizer to converge on real images
+				// while retaining a hard upper bound for CPU use.
+				iterations = pcsiFinalIterations
 			}
 			img, stats, err := decoder.ReconstructContext(m.ctx, iterations)
 			update := Update{
 				Profile: profile, Codec: "PCSI-MMT", Callsign: callsign, ImageID: imageID,
 				PacketsReceived: stats.PacketsReceived, PacketsExpected: stats.PacketsExpected,
-				Coverage: stats.Coverage, Complete: complete,
+				Coverage: stats.Coverage, Complete: complete, ArchivePreview: true, SessionID: sessionID,
+				HasAX25SSID: hasAX25SSID, AX25SourceSSID: ax25SSID,
 			}
 			if err != nil {
 				update.Error = err.Error()
@@ -194,6 +225,13 @@ func (m *Manager) runReconstruction() {
 
 func (m *Manager) finishReconstruction(result reconstructionResult) {
 	if result.session == nil {
+		return
+	}
+	m.mu.Lock()
+	active := m.sessions[result.session.key] == result.session
+	m.mu.Unlock()
+	if !active {
+		m.retryPendingReconstructions()
 		return
 	}
 	result.session.mu.Lock()
@@ -275,6 +313,22 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 		key := imageKey(packet.Profile, packet.Callsign, packet.ImageID)
 		m.mu.Lock()
 		ss := m.ssdv[key]
+		started := false
+		if ss != nil && packet.PacketID == 0 {
+			hasPacketZero := len(ss.packetZero) > 0
+			samePacketZero := hasPacketZero && bytes.Equal(ss.packetZero, packet.Raw)
+			idleFor := time.Since(ss.lastUpdate)
+			// Packet 0 can arrive last in an out-of-order burst. Do not reset on
+			// packet number order alone; use its payload fingerprint, completion
+			// state, or a long inter-image pause to distinguish a new image.
+			newSession := (hasPacketZero && !samePacketZero && len(ss.packets) >= 1) ||
+				(hasPacketZero && ss.complete) ||
+				(idleFor > 5*time.Second && (hasPacketZero || len(ss.packets) >= 10))
+			if newSession {
+				ss = nil
+				started = true
+			}
+		}
 		if ss == nil {
 			if len(m.ssdv) >= maxImageSessions*4 {
 				var oldestKey string
@@ -286,7 +340,8 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 				}
 				delete(m.ssdv, oldestKey)
 			}
-			ss = &ssdvSession{packets: make(map[uint16][256]byte), width: packet.ImageWidth, height: packet.ImageHeight, quality: packet.Quality, fec: packet.FEC, subsampling: packet.Subsampling}
+			ss = &ssdvSession{packets: make(map[uint16][256]byte), width: packet.ImageWidth, height: packet.ImageHeight, quality: packet.Quality, fec: packet.FEC, subsampling: packet.Subsampling, sessionID: fmt.Sprintf("%d", time.Now().UnixNano())}
+			started = true
 			m.ssdv[key] = ss
 		}
 		ss.lastUpdate = time.Now()
@@ -308,6 +363,12 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 		var raw [256]byte
 		copy(raw[:], packet.Raw)
 		ss.packets[packet.PacketID] = raw
+		if !ss.hasHighestPacketID || packet.PacketID > ss.highestPacketID {
+			ss.highestPacketID, ss.hasHighestPacketID = packet.PacketID, true
+		}
+		if packet.PacketID == 0 {
+			ss.packetZero = append(ss.packetZero[:0], packet.Raw...)
+		}
 		if packet.EOI && int(packet.PacketID)+1 > ss.expected {
 			ss.expected = int(packet.PacketID) + 1
 		}
@@ -324,25 +385,53 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 		if expected > 0 {
 			coverage = float64(covered) / float64(expected)
 		}
+		ss.complete = complete
+		archivePreview := complete || count >= ss.lastArchivePackets+ssdvArchiveInterval
 		update := Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign, ImageID: packet.ImageID,
 			PacketsReceived: count, PacketsExpected: expected, Coverage: coverage, Complete: complete,
-			ImageWidth: ss.width, ImageHeight: ss.height, Quality: ss.quality, FEC: ss.fec, Subsampling: ss.subsampling}
-		var ordered [][]byte
-		if complete {
-			stream := make([]byte, 0, expected*256)
-			ordered = make([][]byte, 0, expected)
-			for id := 0; id < expected; id++ {
-				part := ss.packets[uint16(id)]
-				stream = append(stream, part[:]...)
-				ordered = append(ordered, append([]byte(nil), part[:]...))
+			ImageWidth: ss.width, ImageHeight: ss.height, Quality: ss.quality, FEC: ss.fec, Subsampling: ss.subsampling,
+			Started: started, SessionID: ss.sessionID, ArchivePreview: archivePreview,
+			HasAX25SSID: packet.HasAX25SSID, AX25SourceSSID: packet.AX25SourceSSID}
+		var ordered, prefix [][]byte
+		var packetArchive []byte
+		for id := 0; id < maxSSDVPackets; id++ {
+			part, ok := ss.packets[uint16(id)]
+			if !ok {
+				break
 			}
-			update.PacketDataBase64 = base64.StdEncoding.EncodeToString(stream)
+			prefix = append(prefix, append([]byte(nil), part[:]...))
+		}
+		// Keep the whole accepted set in packet-ID order. SSDV MCU restart
+		// metadata makes every received packet independently decodable, even
+		// when earlier packet IDs are missing or arrive later.
+		ids := make([]int, 0, len(ss.packets))
+		for id := range ss.packets {
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		ordered = make([][]byte, 0, len(ids))
+		for _, id := range ids {
+			part := ss.packets[uint16(id)]
+			ordered = append(ordered, append([]byte(nil), part[:]...))
+		}
+		shouldPreview := !complete
+		if archivePreview {
+			packetArchive = make([]byte, 0, len(ids)*256)
+			for _, id := range ids {
+				part := ss.packets[uint16(id)]
+				packetArchive = append(packetArchive, part[:]...)
+			}
+			ss.lastArchivePackets = count
 		}
 		m.mu.Unlock()
+		if len(packetArchive) > 0 {
+			update.PacketDataBase64 = base64.StdEncoding.EncodeToString(packetArchive)
+		}
 
-		// Do the final JPEG/PNG work after releasing the manager lock. Submit()
-		// and image-session maintenance can continue while a large image is
-		// reconstructed and archived.
+		// Decode outside the manager lock so packet ingestion remains responsive.
+		// New transmitters put a byte-aligned MCU restart point in every SSDV
+		// packet, so each accepted packet can update its own 16x16 block region
+		// immediately without waiting for preceding packet IDs.
 		if complete {
 			jpegData, metadata, decodeErr := ssdv.DecodePacketsToJPEG(ordered)
 			if decodeErr != nil {
@@ -358,7 +447,45 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 					} else {
 						update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
 						update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
+						ss.lastPreviewImage = cloneRGBA(decodedToRGBA(decoded))
 					}
+				}
+			}
+		} else if shouldPreview {
+			preview, metadata, _, decodeErr := ssdv.DecodePacketsToPreview(ordered)
+			if decodeErr == nil {
+				ss.lastPreviewImage = preview
+				var pngBuffer bytes.Buffer
+				if imageErr := png.Encode(&pngBuffer, preview); imageErr == nil {
+					update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
+					update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
+				}
+			} else if len(prefix) > 0 {
+				// Backward-compatible row-prefix fallback for old SSDV transmitters
+				// whose packets use the 0xff/0xffff MCU sentinel.
+				if jpegData, _, _, legacyErr := ssdv.DecodePacketPrefixToJPEG(prefix); legacyErr == nil {
+					if decoded, imageErr := jpeg.Decode(bytes.NewReader(jpegData)); imageErr == nil {
+						canvas := image.NewRGBA(image.Rect(0, 0, ss.width, ss.height))
+						draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{R: 10, G: 16, B: 24, A: 255}}, image.Point{}, draw.Src)
+						draw.Draw(canvas, image.Rect(0, 0, decoded.Bounds().Dx(), decoded.Bounds().Dy()), decoded, decoded.Bounds().Min, draw.Src)
+						ss.lastPreviewImage = canvas
+					}
+				}
+				if ss.lastPreviewImage != nil {
+					canvas := cloneRGBA(ss.lastPreviewImage)
+					drawSSDVDamageRegions(canvas, ss.packets, ss.highestPacketID, ss.hasHighestPacketID, ss.expected)
+					var pngBuffer bytes.Buffer
+					if imageErr := png.Encode(&pngBuffer, canvas); imageErr == nil {
+						update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
+						update.ImageWidth, update.ImageHeight = ss.width, ss.height
+					}
+				}
+			} else if ss.lastPreviewImage != nil {
+				canvas := cloneRGBA(ss.lastPreviewImage)
+				var pngBuffer bytes.Buffer
+				if imageErr := png.Encode(&pngBuffer, canvas); imageErr == nil {
+					update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
+					update.ImageWidth, update.ImageHeight = ss.width, ss.height
 				}
 			}
 		}
@@ -378,6 +505,26 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 	}
 	m.mu.Lock()
 	session := m.sessions[key]
+	started := false
+	if session != nil && info.PacketNumber == 0 {
+		session.mu.Lock()
+		seenCount := len(session.decoder.Seen)
+		hasPacketZero := len(session.packetZero) > 0
+		samePacketZero := hasPacketZero && bytes.Equal(session.packetZero, corrected)
+		previousComplete := session.complete
+		session.mu.Unlock()
+		idleFor := time.Since(session.lastUpdate)
+		// Image-ID reuse is ambiguous at the transport layer. A changed packet
+		// 0 or completed prior image is strong boundary evidence; sequence
+		// ordering alone is not, since packet 0 may be delayed.
+		newSession := (hasPacketZero && !samePacketZero && seenCount >= 1) ||
+			(hasPacketZero && previousComplete) ||
+			(idleFor > 5*time.Second && (hasPacketZero || seenCount >= 10))
+		if newSession {
+			session = nil
+			started = true
+		}
+	}
 	if session == nil {
 		if len(m.sessions) >= maxImageSessions {
 			var oldestKey string
@@ -389,7 +536,10 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 			}
 			delete(m.sessions, oldestKey)
 		}
-		session = &imageSession{decoder: pcsi.NewDecoderState(info), profile: packet.Profile, callsign: info.Callsign, imageID: info.ImageID}
+		session = &imageSession{decoder: pcsi.NewDecoderState(info), profile: packet.Profile, callsign: info.Callsign, imageID: info.ImageID,
+			ax25SSID: packet.AX25SourceSSID, hasAX25SSID: packet.HasAX25SSID,
+			key: key, sessionID: fmt.Sprintf("%d", time.Now().UnixNano())}
+		started = true
 		m.sessions[key] = session
 	}
 	session.lastUpdate = time.Now()
@@ -405,6 +555,9 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 		session.mu.Unlock()
 		return Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: info.Callsign, ImageID: info.ImageID, Error: err.Error()}, true
 	}
+	if info.PacketNumber == 0 {
+		session.packetZero = append(session.packetZero[:0], corrected...)
+	}
 	stats := session.decoder.Stats()
 	complete := stats.PacketsExpected > 0 && stats.PacketsReceived >= stats.PacketsExpected
 	if complete {
@@ -413,6 +566,7 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 	update := Update{
 		Profile: packet.Profile, Codec: packet.Codec, Callsign: info.Callsign, ImageID: info.ImageID,
 		PacketsReceived: stats.PacketsReceived, PacketsExpected: stats.PacketsExpected, Coverage: stats.Coverage,
+		Started: started, SessionID: session.sessionID, HasAX25SSID: packet.HasAX25SSID, AX25SourceSSID: packet.AX25SourceSSID,
 		// The transport may be complete while the numerical image reconstruction
 		// is still running. Only the reconstruction result sets Complete=true.
 		Complete: false,
@@ -420,10 +574,65 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 	shouldReconstruct := stats.PacketsReceived%pcsiPreviewInterval == 0 || complete
 	session.mu.Unlock()
 	if !shouldReconstruct {
+		if started {
+			return update, true
+		}
 		return Update{}, false
 	}
 	m.scheduleReconstruction(session)
 	return update, true
+}
+
+func cloneRGBA(src *image.RGBA) *image.RGBA {
+	if src == nil {
+		return nil
+	}
+	out := image.NewRGBA(src.Bounds())
+	draw.Draw(out, out.Bounds(), src, src.Bounds().Min, draw.Src)
+	return out
+}
+
+// drawSSDVDamageRegions marks known packet gaps over the last valid preview.
+// SSDV streams without MCU-resynchronization metadata cannot place a damaged
+// packet exactly; proportional bands make loss visible without fabricating
+// recovered pixels. When a missing packet arrives the band disappears.
+func drawSSDVDamageRegions(dst *image.RGBA, packets map[uint16][256]byte, highest uint16, hasHighest bool, expected int) {
+	if dst == nil || len(packets) == 0 || !hasHighest {
+		return
+	}
+	limit := expected
+	if limit <= 0 || limit < int(highest)+1 {
+		limit = int(highest) + 1
+	}
+	if limit <= 0 {
+		return
+	}
+	width, height := dst.Bounds().Dx(), dst.Bounds().Dy()
+	for id := 0; id <= int(highest); id++ {
+		if _, ok := packets[uint16(id)]; ok {
+			continue
+		}
+		y0 := id * height / limit
+		y1 := (id + 1) * height / limit
+		if y1 <= y0 {
+			y1 = y0 + 1
+		}
+		if y0 >= height {
+			continue
+		}
+		if y1 > height {
+			y1 = height
+		}
+		for y := y0; y < y1; y++ {
+			for x := 0; x < width; x++ {
+				if ((x+y)/7)%2 == 0 {
+					dst.SetRGBA(x, y, color.RGBA{R: 155, G: 35, B: 48, A: 255})
+				} else {
+					dst.SetRGBA(x, y, color.RGBA{R: 65, G: 23, B: 34, A: 255})
+				}
+			}
+		}
+	}
 }
 
 func imageKey(profile, callsign string, imageID uint8) string {
@@ -444,4 +653,10 @@ func (m *Manager) Close() {
 	m.cancel()
 	<-m.done
 	<-m.reconDone
+}
+
+func decodedToRGBA(src image.Image) *image.RGBA {
+	out := image.NewRGBA(src.Bounds())
+	draw.Draw(out, out.Bounds(), src, src.Bounds().Min, draw.Src)
+	return out
 }

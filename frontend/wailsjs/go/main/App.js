@@ -14,6 +14,18 @@ export function DeleteGalleryImage(arg1) {
   return window['go']['main']['App']['DeleteGalleryImage'](arg1);
 }
 
+export function ExportAlbumRecord(arg1) {
+  return window['go']['main']['App']['ExportAlbumRecord'](arg1);
+}
+
+export function ExportAlbumToDirectory() {
+  return window['go']['main']['App']['ExportAlbumToDirectory']();
+}
+
+export function ExportTemplatePack() {
+  return window['go']['main']['App']['ExportTemplatePack']();
+}
+
 export function GetAlbum() {
   return window['go']['main']['App']['GetAlbum']();
 }
@@ -78,6 +90,10 @@ export function ImportGalleryImage(arg1) {
   return window['go']['main']['App']['ImportGalleryImage'](arg1);
 }
 
+export function ImportTemplatePack() {
+  return window['go']['main']['App']['ImportTemplatePack']();
+}
+
 export function RefreshSerialPorts() {
   return window['go']['main']['App']['RefreshSerialPorts']();
 }
@@ -90,6 +106,10 @@ export function SaveTemplates(arg1) {
   return window['go']['main']['App']['SaveTemplates'](arg1);
 }
 
+export function Start1500HzTestTone() {
+  return window['go']['main']['App']['Start1500HzTestTone']();
+}
+
 export function StartPTTTest() {
   return window['go']['main']['App']['StartPTTTest']();
 }
@@ -98,8 +118,8 @@ export function StartRX() {
   return window['go']['main']['App']['StartRX']();
 }
 
-export function StartTXRendered(arg1, arg2, arg3) {
-  return window['go']['main']['App']['StartTXRendered'](arg1, arg2, arg3);
+export function StartTXRendered(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['StartTXRendered'](arg1, arg2, arg3, arg4);
 }
 
 export function StopPTTTest() {

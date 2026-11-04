@@ -12,6 +12,7 @@ export namespace album {
 	    profile: string;
 	    callsign?: string;
 	    imageId?: number;
+	    sessionId?: string;
 	    packetsReceived?: number;
 	    packetsExpected?: number;
 	    quality?: string;
@@ -33,6 +34,7 @@ export namespace album {
 	        this.profile = source["profile"];
 	        this.callsign = source["callsign"];
 	        this.imageId = source["imageId"];
+	        this.sessionId = source["sessionId"];
 	        this.packetsReceived = source["packetsReceived"];
 	        this.packetsExpected = source["packetsExpected"];
 	        this.quality = source["quality"];
@@ -268,6 +270,7 @@ export namespace main {
 	    txProfile: string;
 	    quality: string;
 	    callsign: string;
+	    ax25Ssid: number;
 	    locator: string;
 	    audioSampleRate: number;
 	    rxInputDevice: string;
@@ -289,6 +292,7 @@ export namespace main {
 	        this.txProfile = source["txProfile"];
 	        this.quality = source["quality"];
 	        this.callsign = source["callsign"];
+	        this.ax25Ssid = source["ax25Ssid"];
 	        this.locator = source["locator"];
 	        this.audioSampleRate = source["audioSampleRate"];
 	        this.rxInputDevice = source["rxInputDevice"];

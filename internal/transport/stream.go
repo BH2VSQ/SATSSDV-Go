@@ -1,7 +1,9 @@
 package transport
 
 import (
+	"bytes"
 	"fmt"
+	"time"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
@@ -13,8 +15,17 @@ import (
 
 const (
 	streamCCSDSFrameBits = 32 + ccsds.PayloadLength*8
-	streamMaxSeenPackets = 16384
+	streamMaxImageStates = 64
 )
+
+type packetDedupState struct {
+	seen        map[uint16]struct{}
+	packetZero  []byte
+	eoiPacketID uint16
+	hasEOI      bool
+	complete    bool
+	lastUpdate  time.Time
+}
 
 // StreamDecoder keeps modem, resampler and frame-search state across audio
 // callback blocks. Feed returns only newly accepted image packets. A nil block
@@ -28,8 +39,10 @@ type StreamDecoder struct {
 	gmsk2400  *ccsds.ARCSSD2400Demodulator
 	ax25      *ax25.StreamDecoder
 	ccsdsBits []bool
-	seen      map[string]struct{}
-	seenOrder []string
+	// Packet de-duplication is scoped to an image session, not the lifetime
+	// of the audio stream. A new packet 0 starts a fresh session when an
+	// image ID is reused by a transmitter or after its 8-bit ID wraps.
+	imageStates map[string]*packetDedupState
 }
 
 func NewStreamDecoder(profileID domain.TransportMode, inputSampleRate int) (*StreamDecoder, error) {
@@ -46,7 +59,7 @@ func NewStreamDecoder(profileID domain.TransportMode, inputSampleRate int) (*Str
 	}
 	decoder := &StreamDecoder{
 		profile: profile, inputRate: inputSampleRate, resampler: resampler,
-		seen: make(map[string]struct{}),
+		imageStates: make(map[string]*packetDedupState),
 	}
 	if profile.LinkLayer == "CCSDS" && profile.BitRate == 2400 {
 		decoder.gmsk2400 = &ccsds.ARCSSD2400Demodulator{}
@@ -111,6 +124,9 @@ func (d *StreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 				if parseErr != nil {
 					continue
 				}
+				packet.HasAX25SSID = true
+				packet.AX25SourceSSID = frame.Source.SSID
+				packet.AX25Destination = frame.Destination.Callsign
 				if d.markNew(packet) {
 					packets = append(packets, packet)
 				}
@@ -191,16 +207,68 @@ func parseImagePacket(profile domain.Profile, raw []byte) (ReceivedPacket, error
 }
 
 func (d *StreamDecoder) markNew(packet ReceivedPacket) bool {
-	key := fmt.Sprintf("%s|%s|%03d|%05d", packet.Profile, packet.Callsign, packet.ImageID, packet.PacketID)
-	if _, exists := d.seen[key]; exists {
+	if d.imageStates == nil {
+		d.imageStates = make(map[string]*packetDedupState)
+	}
+	key := fmt.Sprintf("%s|%s|%03d", packet.Profile, packet.Callsign, packet.ImageID)
+	state := d.imageStates[key]
+	if state != nil && packet.PacketID == 0 {
+		hasPacketZero := len(state.packetZero) > 0
+		samePacketZero := hasPacketZero && bytes.Equal(state.packetZero, packet.Raw)
+		idleFor := time.Since(state.lastUpdate)
+		// Packet 0 may arrive last in an out-of-order burst. A high packet ID
+		// alone is not evidence of a new image. Prefer a changed packet-0
+		// fingerprint, an already-complete image, or a long inter-image pause.
+		newSession := (hasPacketZero && !samePacketZero && len(state.seen) >= 1) ||
+			(hasPacketZero && state.complete) ||
+			(idleFor > 5*time.Second && (hasPacketZero || len(state.seen) >= 10))
+		if newSession {
+			state = nil
+		}
+	}
+	if state == nil {
+		state = &packetDedupState{seen: make(map[uint16]struct{})}
+		d.imageStates[key] = state
+	}
+	if _, exists := state.seen[packet.PacketID]; exists {
+		state.lastUpdate = time.Now()
 		return false
 	}
-	d.seen[key] = struct{}{}
-	d.seenOrder = append(d.seenOrder, key)
-	if len(d.seenOrder) > streamMaxSeenPackets {
-		delete(d.seen, d.seenOrder[0])
-		copy(d.seenOrder, d.seenOrder[1:])
-		d.seenOrder = d.seenOrder[:len(d.seenOrder)-1]
+	state.seen[packet.PacketID] = struct{}{}
+	if packet.PacketID == 0 {
+		state.packetZero = append(state.packetZero[:0], packet.Raw...)
+	}
+	if packet.EOI {
+		state.eoiPacketID = packet.PacketID
+		state.hasEOI = true
+	}
+	if state.hasEOI {
+		state.complete = true
+		for id := uint16(0); id <= state.eoiPacketID; id++ {
+			if _, exists := state.seen[id]; !exists {
+				state.complete = false
+				break
+			}
+		}
+	}
+	state.lastUpdate = time.Now()
+
+	// Bound retained image sessions. A normal image has at most a few hundred
+	// packet IDs; evict the least recently touched session when the map grows.
+	if len(d.imageStates) > streamMaxImageStates {
+		oldestKey := ""
+		var oldest time.Time
+		for candidateKey, candidate := range d.imageStates {
+			if candidateKey == key {
+				continue
+			}
+			if oldestKey == "" || candidate.lastUpdate.Before(oldest) {
+				oldestKey, oldest = candidateKey, candidate.lastUpdate
+			}
+		}
+		if oldestKey != "" {
+			delete(d.imageStates, oldestKey)
+		}
 	}
 	return true
 }

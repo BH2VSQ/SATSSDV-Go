@@ -1,10 +1,13 @@
-name: Go CI
+name: Test and package
 
 on:
   push:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -30,3 +33,170 @@ jobs:
         run: node --check frontend/app.js
       - name: Frontend structure
         run: node frontend/ui_structure.test.cjs
+
+  package-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+      - name: Install Wails CLI
+        shell: pwsh
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+          "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build Windows application
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+          $env:CGO_ENABLED = "1"
+          $env:CC = "gcc"
+          wails build -clean -tags "wails malgo" -platform windows/amd64
+          if (!(Test-Path "build/bin/SATSSDV-Go.exe")) { throw "Windows executable was not produced" }
+          Compress-Archive -Path "build/bin/SATSSDV-Go.exe", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md" -DestinationPath "SATSSDV-Go-windows-amd64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-windows-amd64
+          path: SATSSDV-Go-windows-amd64.zip
+          if-no-files-found: error
+
+  package-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Install native build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev libasound2-dev \
+            libgirepository1.0-dev librsvg2-dev patchelf dpkg-dev file desktop-file-utils
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build Linux application
+        run: |
+          CGO_ENABLED=1 wails build -clean -tags "wails malgo" -platform linux/amd64
+          test -x build/bin/SATSSDV-Go
+      - name: Create tar.gz and Debian package
+        env:
+          PACKAGE_VERSION: 0.0.${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/bin/SATSSDV-Go dist/satssdv-go
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/
+          tar -C dist -czf SATSSDV-Go-linux-amd64.tar.gz satssdv-go README.md LICENSE THIRD_PARTY_NOTICES.md
+
+          PKGROOT="$RUNNER_TEMP/satssdv-deb"
+          install -Dm755 build/bin/SATSSDV-Go "$PKGROOT/usr/bin/satssdv-go"
+          install -Dm644 build/appicon.png "$PKGROOT/usr/share/icons/hicolor/256x256/apps/satssdv-go.png"
+          install -Dm644 /dev/stdin "$PKGROOT/usr/share/applications/satssdv-go.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=SATSSDV-Go
+          Comment=Amateur satellite SSDV and PCSI image workbench
+          Exec=satssdv-go
+          Icon=satssdv-go
+          Terminal=false
+          Categories=HamRadio;Communication;Utility;
+          DESKTOP
+          install -d "$PKGROOT/DEBIAN"
+          cat > "$PKGROOT/DEBIAN/control" <<CONTROL
+          Package: satssdv-go
+          Version: ${PACKAGE_VERSION}
+          Section: hamradio
+          Priority: optional
+          Architecture: amd64
+          Maintainer: VSQ Studio
+          Homepage: https://github.com/BH2VSQ/SATSSDV-Go
+          Depends: libc6, libgtk-3-0, libwebkit2gtk-4.1-0, libasound2 | libasound2t64
+          Description: Amateur satellite SSDV and PCSI image workbench
+           Wails desktop application for receiving and transmitting SSDV/PCSI images.
+          CONTROL
+          dpkg-deb --build --root-owner-group "$PKGROOT" "SATSSDV-Go-linux-amd64.deb"
+      - name: Create AppImage
+        run: |
+          set -euo pipefail
+          APPDIR="$RUNNER_TEMP/SATSSDV-Go.AppDir"
+          install -Dm755 build/bin/SATSSDV-Go "$APPDIR/usr/bin/satssdv-go"
+          install -Dm644 build/appicon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/satssdv-go.png"
+          install -Dm644 build/appicon.png "$APPDIR/satssdv-go.png"
+          install -Dm644 /dev/stdin "$APPDIR/usr/share/applications/satssdv-go.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=SATSSDV-Go
+          Comment=Amateur satellite SSDV and PCSI image workbench
+          Exec=satssdv-go
+          Icon=satssdv-go
+          Terminal=false
+          Categories=HamRadio;Communication;Utility;
+          DESKTOP
+          install -Dm644 "$APPDIR/usr/share/applications/satssdv-go.desktop" "$APPDIR/satssdv-go.desktop"
+          cat > "$APPDIR/AppRun" <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/satssdv-go" "$@"
+          APPRUN
+          chmod +x "$APPDIR/AppRun"
+          curl -fsSL -o "$RUNNER_TEMP/linuxdeploy-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o "$RUNNER_TEMP/linuxdeploy-plugin-gtk.sh" \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          chmod +x "$RUNNER_TEMP/linuxdeploy-x86_64.AppImage" "$RUNNER_TEMP/linuxdeploy-plugin-gtk.sh"
+          export PATH="$RUNNER_TEMP:$PATH"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export NO_STRIP=1
+          "$RUNNER_TEMP/linuxdeploy-x86_64.AppImage" --appdir "$APPDIR" --plugin gtk --output appimage \
+            --desktop-file "$APPDIR/usr/share/applications/satssdv-go.desktop" \
+            --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/satssdv-go.png"
+          mv ./*.AppImage SATSSDV-Go-linux-amd64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-linux-amd64
+          path: |
+            SATSSDV-Go-linux-amd64.tar.gz
+            SATSSDV-Go-linux-amd64.deb
+            SATSSDV-Go-linux-amd64.AppImage
+          if-no-files-found: error
+
+  package-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Install Wails CLI
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build macOS application
+        run: |
+          CGO_ENABLED=1 wails build -clean -tags "wails malgo" -platform darwin/${{ matrix.arch }}
+          test -d build/bin/SATSSDV-Go.app
+          ditto -c -k --sequesterRsrc --keepParent build/bin/SATSSDV-Go.app SATSSDV-Go-macos-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-macos-${{ matrix.arch }}
+          path: SATSSDV-Go-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error

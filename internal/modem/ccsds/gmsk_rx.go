@@ -24,6 +24,13 @@ type ARCSSD2400Demodulator struct {
 	filterQ     [61]float64
 	delayI      [8]float64
 	delayQ      [8]float64
+	sampleCount int
+	cfoSum      float64
+	cfoCount    int
+	cfoPhase    float64
+	cfoLocked   bool
+	trackSum    float64
+	trackCount  int
 }
 
 var arcssd2400ReceiverLPF = [...]float64{
@@ -50,6 +57,16 @@ func (d *ARCSSD2400Demodulator) Reset() {
 	*d = ARCSSD2400Demodulator{}
 }
 
+// CarrierOffsetHz reports the most recent common audio carrier correction.
+// It is zero until the PN preamble has supplied enough samples for AFC lock.
+func (d *ARCSSD2400Demodulator) CarrierOffsetHz() float64 {
+	if d == nil || !d.cfoLocked {
+		return 0
+	}
+	const phaseLagSamples = 7.0
+	return d.cfoPhase * float64(19200) / (2 * math.Pi * phaseLagSamples)
+}
+
 // Feed returns recovered MSB-first channel bits. The returned bits may be
 // passed to FindDataUnitsInBits after enough samples have accumulated.
 func (d *ARCSSD2400Demodulator) Feed(samples []float32, sampleRate int) ([]bool, error) {
@@ -73,12 +90,44 @@ func (d *ARCSSD2400Demodulator) Feed(samples []float32, sampleRate int) ([]bool,
 			fq += d.filterQ[k] * tap
 		}
 		demod := fi*d.delayQ[0] - fq*d.delayI[0]
+		dot := fi*d.delayI[0] + fq*d.delayQ[0]
 		copy(d.delayI[:], d.delayI[1:])
 		copy(d.delayQ[:], d.delayQ[1:])
 		d.delayI[7], d.delayQ[7] = fi, fq
+		d.sampleCount++
 
+		// The 150-byte CCSDS guard sequence is PN-balanced. Averaging the
+		// 7-sample complex phase difference over its first ~300 ms estimates
+		// a common audio carrier offset without confusing it with GMSK data.
+		// Subtracting that phase bias before the hard decision is the AFC.
+		phaseDiff := math.Atan2(demod, dot)
+		if !d.cfoLocked {
+			if d.sampleCount > 128 {
+				d.cfoSum += phaseDiff
+				d.cfoCount++
+			}
+			if d.cfoCount >= 6000 {
+				d.cfoPhase = d.cfoSum / float64(d.cfoCount)
+				d.cfoLocked = true
+			}
+		} else {
+			// Very slow tracking follows Doppler drift over long satellite
+			// passes while averaging out the balanced GMSK modulation.
+			d.trackSum += phaseDiff - d.cfoPhase
+			d.trackCount++
+			if d.trackCount >= 4096 {
+				d.cfoPhase += 0.05 * d.trackSum / float64(d.trackCount)
+				d.trackSum = 0
+				d.trackCount = 0
+			}
+		}
+
+		decisionPhase := phaseDiff
+		if d.cfoLocked {
+			decisionPhase -= d.cfoPhase
+		}
 		d.sampledBits <<= 1
-		if demod <= 0 {
+		if math.Sin(decisionPhase) <= 0 {
 			d.sampledBits |= 1
 		}
 		if ((d.sampledBits ^ (d.sampledBits >> 1)) & 1) != 0 {

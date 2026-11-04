@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"math"
 	"testing"
 )
 
@@ -60,8 +61,11 @@ func TestEncodeImageProducesValidFECSSDVPackets(t *testing.T) {
 		if p.EOI != (i == len(packets)-1) {
 			t.Fatalf("packet %d EOI=%v", i, p.EOI)
 		}
-		if p.MCUOffset != 0xff || p.MCUIndex != 0xffff {
-			t.Fatalf("packet %d did not use contiguous-stream sentinel", i)
+		if p.MCUOffset == 0xff || p.MCUIndex == 0xffff {
+			t.Fatalf("packet %d is missing independent MCU restart metadata", i)
+		}
+		if int(p.MCUOffset) >= FECDataLength {
+			t.Fatalf("packet %d MCU offset %d exceeds payload", i, p.MCUOffset)
 		}
 	}
 }
@@ -283,5 +287,193 @@ func TestEncodeDecodePreservesImageContent(t *testing.T) {
 	mae := float64(absoluteError) / float64(width*height*3)
 	if mae > 16 {
 		t.Fatalf("mean absolute RGB error %.2f exceeds quality-4 limit 16", mae)
+	}
+}
+
+func TestDecodePacketPrefixToJPEGProducesBlockPreview(t *testing.T) {
+	source := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	for y := 0; y < 240; y++ {
+		for x := 0; x < 320; x++ {
+			source.SetRGBA(x, y, color.RGBA{R: uint8(x), G: uint8(y), B: uint8(x ^ y), A: 255})
+		}
+	}
+	packets, err := EncodeImage(source, EncodeConfig{Callsign: "N0CALL", ImageID: 8, Quality: 4, FEC: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jpegData []byte
+	var height int
+	for count := 1; count < len(packets); count++ {
+		jpegData, _, height, err = DecodePacketPrefixToJPEG(packets[:count])
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("could not create an incremental block preview: %v", err)
+	}
+	if height != 240 {
+		t.Fatalf("block preview height = %d, want fixed canvas height 240", height)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(jpegData))
+	if err != nil {
+		t.Fatalf("decode block preview JPEG: %v", err)
+	}
+	if decoded.Bounds().Dx() != 320 || decoded.Bounds().Dy() != height {
+		t.Fatalf("unexpected preview bounds: %v (reported height %d)", decoded.Bounds(), height)
+	}
+}
+
+func TestDecodePacketsToPreviewFillsIndependentMCUBlocksAndMarksGaps(t *testing.T) {
+	source := fixtureImage(320, 240)
+	packets, err := EncodeImage(source, EncodeConfig{Callsign: "N0CALL", ImageID: 44, Quality: 4, FEC: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packets) < 4 {
+		t.Fatalf("expected several SSDV packets, got %d", len(packets))
+	}
+	// Decode packet 0 and a later packet while omitting packet 1. Independent
+	// MCU markers must place the later packet at its own block index.
+	selected := [][]byte{packets[0], packets[2]}
+	preview, metadata, blocks, err := DecodePacketsToPreview(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Bounds().Dx() != 320 || preview.Bounds().Dy() != 240 {
+		t.Fatalf("preview bounds = %v", preview.Bounds())
+	}
+	if blocks == 0 || blocks >= int(metadata.MCUCount) {
+		t.Fatalf("unexpected covered MCU count %d of %d", blocks, metadata.MCUCount)
+	}
+	first, err := ParsePacket(packets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	later, err := ParsePacket(packets[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.MCUIndex != 0 || later.MCUIndex <= first.MCUIndex {
+		t.Fatalf("packet MCU indices do not advance: first=%d later=%d", first.MCUIndex, later.MCUIndex)
+	}
+	missing, err := ParsePacket(packets[1])
+	if err != nil { t.Fatal(err) }
+	missingIndex := int(missing.MCUIndex)
+	missingX, missingY := (missingIndex%(320/16))*16+8, (missingIndex/(320/16))*16+8
+	r, g, b, _ := preview.At(missingX, missingY).RGBA()
+	if uint8(r>>8) != 218 || uint8(g>>8) != 220 || uint8(b>>8) != 222 {
+		t.Fatalf("missing MCU pixel = #%02x%02x%02x, want uniform light grey #dadcde", uint8(r>>8), uint8(g>>8), uint8(b>>8))
+	}
+	fullPreview, fullMetadata, fullBlocks, err := DecodePacketsToPreview(packets)
+	if err != nil {
+		t.Fatalf("decode complete block preview: %v", err)
+	}
+	wantBlocks := int(fullMetadata.MCUCount)
+	if fullPreview.Bounds().Dx() != 320 || fullPreview.Bounds().Dy() != 240 || fullBlocks != wantBlocks {
+		t.Fatalf("complete block preview = %v, %d MCUs; want 320x240, %d MCUs", fullPreview.Bounds(), fullBlocks, wantBlocks)
+	}
+}
+
+func TestDefaultSSDVCompressionPrefilterReducesAirtime(t *testing.T) {
+	source := fixtureImage(320, 240)
+	var baselineJPEG bytes.Buffer
+	if err := jpeg.Encode(&baselineJPEG, source, &jpeg.Options{Quality: 100}); err != nil {
+		t.Fatal(err)
+	}
+	baselineFrame, err := parseBaselineJPEG(baselineJPEG.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineEntropy, err := transcodeJPEGScan(baselineFrame, DefaultJPEGQuality)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselinePackets := (len(baselineEntropy) + FECDataLength - 1) / FECDataLength
+
+	packets, err := EncodeImage(source, EncodeConfig{Callsign: "N0CALL", ImageID: 100, Quality: DefaultJPEGQuality, FEC: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packets)*100 > baselinePackets*95 {
+		t.Fatalf("adaptive SSDV source prefilter did not reduce packet count by at least 5%%: got %d, baseline %d", len(packets), baselinePackets)
+	}
+	jpegData, _, err := DecodePacketsToJPEG(packets)
+	if err != nil {
+		t.Fatalf("decode compressed SSDV image: %v", err)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(jpegData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var squaredError float64
+	var samples float64
+	for y := 0; y < source.Bounds().Dy(); y += 2 {
+		for x := 0; x < source.Bounds().Dx(); x += 2 {
+			r1, g1, b1, _ := source.At(x, y).RGBA()
+			r2, g2, b2, _ := decoded.At(x, y).RGBA()
+			for _, delta := range []float64{float64(r1>>8) - float64(r2>>8), float64(g1>>8) - float64(g2>>8), float64(b1>>8) - float64(b2>>8)} {
+				squaredError += delta * delta
+				samples++
+			}
+		}
+	}
+	mse := squaredError / samples
+	psnr := 10 * math.Log10(255*255/mse)
+	if psnr < 21.6 {
+		t.Fatalf("adaptive SSDV compression PSNR %.2f dB fell below the 21.6 dB fixture guardrail", psnr)
+	}
+	t.Logf("SSDV source prefilter: %d -> %d packets (%.1f%% fewer), sampled PSNR %.2f dB", baselinePackets, len(packets), 100*(1-float64(len(packets))/float64(baselinePackets)), psnr)
+}
+
+func TestPacketizedSSDVEncodingEfficiency(t *testing.T) {
+	source := fixtureImage(320, 240)
+	var baseline bytes.Buffer
+	if err := jpeg.Encode(&baseline, source, &jpeg.Options{Quality: 100}); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := parseBaselineJPEG(baseline.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	continuous, err := transcodeJPEGScan(frame, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartStream, _, err := transcodeJPEGScanPacketized(frame, 4, FECDataLength)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCount := (len(continuous) + FECDataLength - 1) / FECDataLength
+	restartCount := (len(restartStream) + FECDataLength - 1) / FECDataLength
+	overhead := float64(restartCount-legacyCount) / float64(legacyCount)
+	t.Logf("continuous stream: %d bytes / %d packets; MCU restart stream: %d bytes / %d packets; packet overhead %.1f%%", len(continuous), legacyCount, len(restartStream), restartCount, overhead*100)
+	if overhead > 0.02 {
+		t.Fatalf("MCU restart packetization overhead %.1f%% exceeds the 2%% guardrail", overhead*100)
+	}
+}
+
+func BenchmarkEncodeImage320x240(b *testing.B) {
+	source := fixtureImage(320, 240)
+	cfg := EncodeConfig{Callsign: "N0CALL", ImageID: 1, Quality: 4, FEC: true}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := EncodeImage(source, cfg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodePacketsToPreview320x240(b *testing.B) {
+	packets, err := EncodeImage(fixtureImage(320, 240), EncodeConfig{Callsign: "N0CALL", ImageID: 1, Quality: DefaultJPEGQuality, FEC: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, _, err := DecodePacketsToPreview(packets); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

@@ -41,6 +41,9 @@ type Encoder struct {
 	img         *image.RGBA
 	cfg         Config
 	pixels      []int
+	y           []uint8
+	cb          []uint8
+	cr          []uint8
 	ycbcrCount  int
 	yCount      int
 	packetCount int
@@ -100,7 +103,22 @@ func NewEncoder(src image.Image, cfg Config) (*Encoder, error) {
 	if count > 65536 {
 		return nil, errors.New("PCSI image requires more than 65536 packets")
 	}
-	return &Encoder{img: img, cfg: cfg, pixels: shufflePixels(w * h), ycbcrCount: numYCbCr, yCount: numY, packetCount: count, channelBits: bits}, nil
+	// Convert the source to the reference BGR/YCrCb channel convention once.
+	// The previous encoder repeated RGB->YCbCr conversion for every transmitted
+	// packet, revisiting the same pixels during packet serialization. PCSI's
+	// deterministic permutation lets us cache compact byte planes without
+	// changing packet order or any on-wire bits.
+	yPlane, cbPlane, crPlane := make([]uint8, w*h), make([]uint8, w*h), make([]uint8, w*h)
+	for py := 0; py < h; py++ {
+		for px := 0; px < w; px++ {
+			c := color.RGBAModel.Convert(img.At(px, py)).(color.RGBA)
+			Y, Cb, Cr := color.RGBToYCbCr(c.B, c.G, c.R)
+			offset := py*w + px
+			yPlane[offset], cbPlane[offset], crPlane[offset] = Y, Cb, Cr
+		}
+	}
+	return &Encoder{img: img, cfg: cfg, pixels: shufflePixels(w * h), y: yPlane, cb: cbPlane, cr: crPlane,
+		ycbcrCount: numYCbCr, yCount: numY, packetCount: count, channelBits: bits}, nil
 }
 func (e *Encoder) PacketCount() int {
 	if e == nil {
@@ -139,22 +157,18 @@ func (e *Encoder) EncodePacket(packetNumber int) ([]byte, error) {
 		idx := e.pixels[start+i]
 		x := idx / h
 		y := idx % h
-		c := color.RGBAModel.Convert(e.img.At(x, y)).(color.RGBA)
-		Y, Cb, Cr := color.RGBToYCbCr(c.B, c.G, c.R)
-		writer.put(scale(Y, maxValue), e.channelBits)
-		// Preserve the reference MMT stream order: Y, Cr, Cb. The legacy
-		// Python path labels these two chroma values inconsistently with
-		// OpenCV channel names, so keep its wire layout exactly.
-		writer.put(scale(Cr, maxValue), e.channelBits)
-		writer.put(scale(Cb, maxValue), e.channelBits)
+		offset := y*w + x
+		writer.put(scale(e.y[offset], maxValue), e.channelBits)
+		// Preserve the reference MMT stream order: Y, Cr, Cb.
+		writer.put(scale(e.cr[offset], maxValue), e.channelBits)
+		writer.put(scale(e.cb[offset], maxValue), e.channelBits)
 	}
 	for i := 0; i < e.yCount; i++ {
 		idx := e.pixels[start+e.ycbcrCount+i]
 		x := idx / h
 		y := idx % h
-		c := color.RGBAModel.Convert(e.img.At(x, y)).(color.RGBA)
-		Y, _, _ := color.RGBToYCbCr(c.B, c.G, c.R)
-		writer.put(scale(Y, maxValue), e.channelBits)
+		offset := y*w + x
+		writer.put(scale(e.y[offset], maxValue), e.channelBits)
 	}
 	parity, err := fec.RS8Parity(packet[1:224])
 	if err != nil {

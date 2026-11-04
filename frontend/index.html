@@ -23,9 +23,9 @@
         <section class="pane rx-pane">
           <div class="pane-title"><div><span class="eyebrow">RECEIVE</span><h2 data-i18n="rx.title">接收 RX</h2></div><div class="pane-actions"><button class="secondary-btn compact" id="rx-toggle">停止 RX</button><span class="state-pill idle" id="rx-pill">RX IDLE</span></div></div>
           <div class="image-view"><div class="empty-image"><div class="image-glyph">▧</div><b data-i18n="rx.wait">等待接收音频</b><small>SSDV / PCSI progressive reconstruction</small></div></div>
-          <div class="image-metadata"><span>CALL <b id="rx-callsign">---</b></span><span>IMAGE ID <b id="rx-image-id">--</b></span><span>PACKETS <b id="rx-packets">0 / 0</b></span><span>MODE <b id="rx-mode">---</b></span></div>
+          <div class="image-metadata"><span>CALL <b id="rx-callsign">---</b></span><span id="rx-ssid-wrap" hidden>SSID <b id="rx-ssid">--</b></span><span>IMAGE ID <b id="rx-image-id">--</b></span><span>PACKETS <b id="rx-packets">0 / 0</b></span><span>MODE <b id="rx-mode">---</b></span></div>
           <div class="spectrum-header"><b data-i18n="rx.spectrum">RX 瀑布图</b><span data-i18n="waterfall.rxInput">INPUT · AUDIO WATERFALL</span></div>
-          <div class="spectrum waterfall"><canvas id="rx-spectrum" aria-label="RX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.rxWaiting">等待 RX 音频</div></div>
+          <div class="spectrum waterfall spectrum-split"><div class="waterfall-main"><canvas id="rx-spectrum" aria-label="RX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.rxWaiting">等待 RX 音频</div></div><div class="constellation-panel"><canvas id="rx-constellation" aria-label="RX constellation diagram"></canvas><small>RX FFT I/Q</small></div></div>
           <div class="spectrum-footer"><span>LEVEL <b id="rx-level">-∞ dBFS</b></span><span>PEAK <b id="rx-peak">---</b></span><span data-i18n="waterfall.frequencyAxis">横轴：频率 · 纵轴：时间</span></div>
         </section>
 
@@ -35,11 +35,13 @@
             <div class="pane-actions tx-pane-actions">
               <div class="tx-transmission" role="group" aria-label="TX transmission settings">
                 <b class="tx-transmission-title" data-i18n="tx.transmission">发射设置</b>
+                  <label id="tx-ax25-ssid-field" hidden><span data-i18n="template.ax25SSID">AX.25 SSID（本站）</span><input id="tx-ax25-ssid" type="number" min="0" max="15" step="1" value="0" disabled/></label>
                 <label class="transmission-quality"><span class="tx-control-label" data-i18n="quality">图片质量</span><select id="quality-select"><option value="low" data-i18n="quality.low">低质量 320×240</option><option value="medium" selected data-i18n="quality.medium">中质量 448×336</option><option value="high" data-i18n="quality.high">高质量 640×480</option></select></label>
                 <label class="check-row transmission-repeat"><input id="repeat-check" type="checkbox"/><span data-i18n="tx.repeat">循环发送</span></label>
                 <label class="transmission-interval"><span class="tx-control-label" data-i18n="tx.interval">发送间隔（秒）</span><input id="send-interval" type="number" value="120" min="0" max="86400"/></label>
               </div>
               <button class="tx-toggle idle" id="tx-toggle" type="button" disabled data-i18n="tx.start">开始发射</button>
+              <button class="secondary-btn compact tx-tone-test" id="tx-tone-test" type="button" disabled data-i18n="tx.testTone">1500 Hz 测试音</button>
               <span class="state-pill idle" id="tx-pill" data-i18n="tx.idle">TX IDLE</span>
             </div>
           </div>
@@ -51,6 +53,8 @@
               </label>
               <button class="secondary-btn compact" id="template-add" type="button" data-i18n="template.addPreset">＋ 新建预设</button>
               <button class="secondary-btn compact" id="template-duplicate" type="button" data-i18n="template.duplicatePreset">复制当前</button>
+              <button class="secondary-btn compact" id="template-import-pack" type="button" data-i18n="template.packImport">导入模板包</button>
+              <button class="secondary-btn compact" id="template-export-pack" type="button" data-i18n="template.packExport">导出模板包</button>
               <button class="text-btn danger-text" id="template-delete" type="button" data-i18n="template.deletePreset">删除当前</button>
             </div>
             <div class="template-name-row">
@@ -69,6 +73,7 @@
               <div class="section-heading"><b data-i18n="template.qsoFields">本次 QSO 信息</b><span class="mini-label">PER TRANSMISSION</span></div>
               <label><span data-i18n="template.myCall">本台呼号</span><input id="tx-my-call" type="text" maxlength="24" placeholder="N0CALL"/></label>
               <label><span data-i18n="template.hisCall">对方呼号</span><input id="tx-his-call" type="text" maxlength="24" placeholder="N0TEST"/></label>
+              
               <label><span data-i18n="template.qth">QTH</span><input id="tx-qth" type="text" maxlength="64" placeholder="EXAMPLE QTH"/></label>
               <label><span data-i18n="template.locator">网格定位</span><input id="tx-locator" type="text" maxlength="12" placeholder="JJ00"/></label>
               <label><span data-i18n="template.report">RST / 报告</span><input id="tx-report" type="text" maxlength="16" value="595"/></label>
@@ -111,7 +116,7 @@
           </div>
 
           <div class="spectrum-header"><b data-i18n="tx.spectrum">TX 瀑布图</b><span data-i18n="waterfall.txOutput">OUTPUT · AUDIO WATERFALL</span></div>
-          <div class="spectrum tx-spectrum waterfall"><canvas id="tx-spectrum" aria-label="TX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.txWaiting">等待 TX 音频</div></div>
+          <div class="spectrum tx-spectrum waterfall spectrum-split"><div class="waterfall-main"><canvas id="tx-spectrum" aria-label="TX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.txWaiting">等待 TX 音频</div></div><div class="constellation-panel"><canvas id="tx-constellation" aria-label="TX constellation diagram"></canvas><small>TX FFT I/Q</small></div></div>
           <div class="spectrum-footer"><span>OUTPUT <b id="tx-level">-∞ dBFS</b></span><span>PEAK <b id="tx-peak">---</b></span><span>MODE <b id="tx-mode-label">SSDV AX.25</b></span></div>
         </section>
       </div>
@@ -121,7 +126,7 @@
     <main id="page-album" class="page simple-page album-page">
       <div class="album-toolbar">
         <div><span class="eyebrow">RX / TX HISTORY</span><h2 data-i18n="album.title">图像相册</h2><small data-i18n="album.subtitle">历史接收与发送图像，自动记录时间戳</small></div>
-        <div class="album-actions"><select id="album-filter"><option value="all" data-i18n="album.all">全部图像</option><option value="rx" data-i18n="album.rx">仅接收 RX</option><option value="tx" data-i18n="album.tx">仅发送 TX</option></select></div>
+        <div class="album-actions"><button class="secondary-btn" id="album-export-all" type="button" data-i18n="album.exportAll">导出相册到文件夹</button><select id="album-filter"><option value="all" data-i18n="album.all">全部图像</option><option value="rx" data-i18n="album.rx">仅接收 RX</option><option value="tx" data-i18n="album.tx">仅发送 TX</option></select></div>
       </div>
       <div class="album-grid" id="album-list"><div class="album-empty" data-i18n="album.empty">相册暂无图像。</div></div>
       <div class="album-footnote" data-i18n="album.footnote">点击缩略图查看大图，右键可导出或删除记录。</div>

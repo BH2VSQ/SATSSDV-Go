@@ -71,6 +71,13 @@ if (!/\.tx-side \.template-editor\s*\{[^}]*flex:\s*1 1 0[^}]*overflow-y:\s*auto/
 }
 const txSettingsHeader = html.slice(html.indexOf('class="pane tx-pane"'), html.indexOf('class="template-strip"'));
 const txSettings = txSettingsHeader.slice(txSettingsHeader.indexOf('class="tx-transmission"'), txSettingsHeader.indexOf('id="tx-toggle"'));
+if (!txSettings.includes('id="tx-ax25-ssid-field"') || txSettings.indexOf('id="tx-ax25-ssid-field"') > txSettings.indexOf('id="quality-select"')) {
+  throw new Error('AX.25 SSID must be in TX settings immediately before image quality');
+}
+if (html.indexOf('id="tx-ax25-ssid-field"') !== html.lastIndexOf('id="tx-ax25-ssid-field"')) throw new Error('AX.25 SSID field must appear exactly once');
+if (!html.includes('id="rx-ssid-wrap"') || html.indexOf('id="rx-ssid-wrap"') < html.indexOf('id="rx-callsign"')) throw new Error('RX must display the decoded AX.25 SSID after CALL');
+if (!html.includes('id="tx-tone-test"') || html.indexOf('id="tx-tone-test"') < html.indexOf('id="tx-toggle"')) throw new Error('1500 Hz test tone must be positioned to the right of Start TX');
+if (!app.includes('Start1500HzTestTone') || !app.includes('tx:tone-state')) throw new Error('1500 Hz test tone action is not wired');
 if (!txSettings || !txSettings.includes('id="quality-select"') || !txSettings.includes('id="repeat-check"') || !txSettings.includes('id="send-interval"')) {
   throw new Error('Image quality, repeat and interval controls must be grouped in the TX header before Start TX');
 }
@@ -161,6 +168,15 @@ if (!/function applyDecodedCallsign/.test(app) || !/applyDecodedCallsign\(u\.cal
 }
 if (!/StartTXRendered',image/.test(app)) {
   throw new Error('TX must submit only the current template image, without a UI queue');
+}
+if (!html.includes('id="tx-ax25-ssid-field" hidden') || !html.includes('id="tx-ax25-ssid" type="number" min="0" max="15"')) {
+  throw new Error('AX.25 local SSID must be an integer control bounded to 0..15 and hidden by default');
+}
+if (!/renderAX25AddressFields/.test(app) || !/state\.settings\?\.txProfile==='ssdv-ax25'/.test(app) || !/ax25To=String\(\$\('tx-his-call'\)\.value\|\|''\)\.trim\(\)\.toUpperCase\(\)\|\|'CQ'/.test(app)) {
+  throw new Error('AX.25 SSID visibility and destination callsign rules are missing');
+}
+if (!/function isCQTemplate/.test(app) || !/clearHisCallForCQTemplate/.test(app) || !/ax25To='CQ'/.test(app) || !/StartTXRendered',image,repeat,interval,ax25To/.test(app)) {
+  throw new Error('CQ template must clear HisCall and use AX.25 destination CQ; other templates use HisCall');
 }
 if (/StartTXQueueRendered|StartTXQueue\(/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8'))) {
   throw new Error('Wails must not expose a multi-image TX queue API');
@@ -373,3 +389,67 @@ if (/for\(let r=1;r<=radius;r\+\+\)/.test(extractFunction('drawAlphaContourOutli
   throw new Error('Image outlines must not repeatedly blit the full source bitmap for every contour sample');
 }
 console.log('Component regression OK: free off-canvas layer movement, visible canvas clipping, proportional image scaling, Last RX placeholder, and bounded alpha dilation.');
+
+if (!html.includes('id="rx-constellation"') || !html.includes('id="tx-constellation"') || !/\.spectrum-split\s*\{[^}]*display:\s*flex/s.test(css)) throw new Error('RX/TX spectrum must reserve a side region for constellation displays');
+if (!/\.image-view>img\s*\{[^}]*object-fit:\s*contain/s.test(css) || !/\.rx-pane > \.image-view\s*\{[^}]*flex:\s*1 1 0/s.test(css)) throw new Error('RX image preview must use a flexible fixed pane area and contain scaling');
+if (!app.includes("HISCALL:state.txFields.hisCall||'TOCALL'")) throw new Error('Empty HISCALL template variable must resolve to TOCALL');
+if (!app.includes("$('repeat-check').addEventListener('change',syncRepeatIntervalLock)")) throw new Error('Repeat mode must lock the interval input');
+
+if (!/\.rx-pane > \.image-view\s*\{[^}]*flex:\s*1 1 0[^}]*overflow:\s*hidden/s.test(css) || !/object-fit:\s*contain/.test(css)) {
+  throw new Error('RX preview must fit the full image inside its flexible viewport without cropping');
+}
+if (!/\.constellation-panel\s*\{[^}]*aspect-ratio:\s*1\s*\/\s*1/s.test(css) || !/width:\s*132px/.test(css) || !/height:\s*132px/.test(css)) {
+  throw new Error('Constellation view must retain a square, non-stretched viewport');
+}
+if (!/function drawConstellationData\(/.test(app) || !/Number\(b\.real\)/.test(app) || !/Number\(b\.imag\)/.test(app)) {
+  throw new Error('RX/TX constellation plots must be generated from complex FFT audio-spectrum data');
+}
+if (!/hz\+=500/.test(app) || !/String\(hz\)/.test(app) || /toFixed\(hz%1000\?1:0\)/.test(app)) {
+  throw new Error('Waterfall frequency ticks must use exact 500 Hz labels, not shifted kHz abbreviations');
+}
+if (!/album\.NewestRXImages\(items\)/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8'))) {
+  throw new Error('Last RX must choose the newest archived RX image independently of output resolution');
+}
+if (!/rxGapPending/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8')) || /for \{\s*select\s*\{\s*case <-queue:/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8')) || !/cap\(queue\)-len\(queue\) < 2/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8'))) {
+  throw new Error('RX queue overflow must not flush all queued audio; it must preserve ordered audio and mark a discontinuity');
+}
+
+// Functional canvas checks for 500 Hz axis ticks and square FFT I/Q plotting.
+const fakeContext = () => ({
+  fillTextCalls: [], arcCalls: 0, pointFills: 0,
+  fillRect(){}, clearRect(){}, drawImage(){}, save(){}, restore(){},
+  beginPath(){}, moveTo(){}, lineTo(){}, stroke(){},
+  arc(){this.arcCalls++;}, fill(){this.pointFills++;},
+  fillText(text){this.fillTextCalls.push(String(text));},
+  createImageData(width,height){return {data:new Uint8ClampedArray(width*height*4)};},
+  putImageData(){},
+});
+const gridContext = fakeContext();
+const gridCanvas = {
+  width: 0, height: 0,
+  getBoundingClientRect(){return {width:132,height:132};},
+  getContext(){return gridContext;},
+  parentElement:{querySelector(){return {hidden:false};}}
+};
+const drawConstellationGridForTest = new Function('window',`${extractFunction('drawConstellationGrid')}; return drawConstellationGrid;`)({devicePixelRatio:1});
+const drawConstellationForTest = new Function('window','drawConstellationGrid',`${extractFunction('drawConstellationData')}; return drawConstellationData;`)({devicePixelRatio:1},drawConstellationGridForTest);
+drawConstellationForTest(gridCanvas,[
+  {frequencyHz:1500,magnitudeDbfs:-8,real:.7,imag:.4},
+  {frequencyHz:1600,magnitudeDbfs:-18,real:-.4,imag:.2}
+],{minFrequencyHz:0,maxFrequencyHz:5000,minDbfs:-100,maxDbfs:0});
+if(gridCanvas.width!==gridCanvas.height||gridCanvas.width!==132||gridContext.arcCalls<5||gridContext.pointFills<1) {
+  throw new Error('FFT I/Q constellation must draw complex spectral points into a square 132x132 canvas');
+}
+const waterfallContext = fakeContext();
+const waterfallCanvas = {
+  width:300,height:80,
+  getContext(){return waterfallContext;},
+  parentElement:{querySelector(){return {hidden:false};}}
+};
+const waterfallBuffer={height:1,width:300};
+const waterfallView={buffer:waterfallBuffer,count:0,cursor:0,frequencyStart:0,frequencyEnd:2000};
+const renderWaterfallForTest=new Function('window','clamp',`${extractFunction('renderWaterfallGrid')}; return renderWaterfallGrid;`)({devicePixelRatio:1},(v,min,max)=>Math.max(min,Math.min(max,v)));
+renderWaterfallForTest(waterfallCanvas,waterfallView,{backgroundColor:'#07111b',minFrequencyHz:0,maxFrequencyHz:2000});
+for(const tick of ['0','500','1000','1500','2000'])if(!waterfallContext.fillTextCalls.includes(tick))throw new Error(`Missing exact ${tick} Hz waterfall tick`);
+if(waterfallContext.fillTextCalls.some(label=>label.includes('k')))throw new Error('Waterfall labels must use integer Hz, not kHz abbreviation');
+console.log('FFT I/Q and waterfall-axis regression OK: square complex-spectrum plot and exact 500 Hz integer tick labels.');
