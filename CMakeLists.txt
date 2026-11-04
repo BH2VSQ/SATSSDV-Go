@@ -11,7 +11,16 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 option(SATSSDV_WITH_MALGO "Build Go backend with the native miniaudio runtime" ON)
 option(SATSSDV_BUILD_BACKEND_ONLY "Build only the Go backend, without Qt desktop client" OFF)
 
-find_program(GO_EXECUTABLE NAMES go REQUIRED)
+# Allow CI and developers to provide an absolute Go executable path. This is
+# important for Windows builds where setup-go's PATH may not propagate into
+# an MSYS2 shell used to run MinGW CMake.
+if(NOT DEFINED GO_EXECUTABLE OR GO_EXECUTABLE STREQUAL "")
+    find_program(GO_EXECUTABLE NAMES go go.exe REQUIRED)
+endif()
+if(NOT EXISTS "${GO_EXECUTABLE}")
+    message(FATAL_ERROR "GO_EXECUTABLE does not exist: ${GO_EXECUTABLE}")
+endif()
+message(STATUS "Go executable: ${GO_EXECUTABLE}")
 
 if(WIN32)
     set(BACKEND_NAME satssdv-backend.exe)
@@ -84,13 +93,15 @@ if(NOT SATSSDV_BUILD_BACKEND_ONLY)
     )
 
     if(WIN32)
-        find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "${Qt6_DIR}/../../../bin")
-        if(WINDEPLOYQT_EXECUTABLE)
-            add_custom_command(TARGET SATSSDV-Go POST_BUILD
-                COMMAND "${WINDEPLOYQT_EXECUTABLE}" --no-translations --compiler-runtime "$<TARGET_FILE:SATSSDV-Go>"
-                VERBATIM
-            )
-        endif()
+        find_program(WINDEPLOYQT_EXECUTABLE
+            NAMES windeployqt windeployqt6
+            HINTS "${Qt6_DIR}/../../../bin"
+            REQUIRED
+        )
+        add_custom_command(TARGET SATSSDV-Go POST_BUILD
+            COMMAND "${WINDEPLOYQT_EXECUTABLE}" --no-translations --compiler-runtime "$<TARGET_FILE:SATSSDV-Go>"
+            VERBATIM
+        )
         if(MINGW)
             # Go's cgo audio backend may also depend on MinGW runtime DLLs.
             get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -106,13 +117,15 @@ if(NOT SATSSDV_BUILD_BACKEND_ONLY)
             endforeach()
         endif()
     elseif(APPLE)
-        find_program(MACDEPLOYQT_EXECUTABLE macdeployqt HINTS "${Qt6_DIR}/../../../bin")
-        if(MACDEPLOYQT_EXECUTABLE)
-            add_custom_command(TARGET SATSSDV-Go POST_BUILD
-                COMMAND "${MACDEPLOYQT_EXECUTABLE}" "$<TARGET_BUNDLE_DIR:SATSSDV-Go>"
-                VERBATIM
-            )
-        endif()
+        find_program(MACDEPLOYQT_EXECUTABLE
+            NAMES macdeployqt macdeployqt6
+            HINTS "${Qt6_DIR}/../../../bin"
+            REQUIRED
+        )
+        add_custom_command(TARGET SATSSDV-Go POST_BUILD
+            COMMAND "${MACDEPLOYQT_EXECUTABLE}" "$<TARGET_BUNDLE_DIR:SATSSDV-Go>"
+            VERBATIM
+        )
     endif()
 
     install(TARGETS SATSSDV-Go RUNTIME DESTINATION . BUNDLE DESTINATION .)

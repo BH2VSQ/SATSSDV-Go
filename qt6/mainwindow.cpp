@@ -747,7 +747,7 @@ void MainWindow::exportAlbum() {
 }
 void MainWindow::exportTemplatePack() {
     const QString path=QFileDialog::getSaveFileName(this,QStringLiteral("导出模板包"),QStringLiteral("satssdv-templates.zip"),QStringLiteral("Template packs (*.zip)"));if(path.isEmpty())return;
-    m_backend->call(QStringLiteral("ExportTemplatePackTo"),QJsonArray{path},[this](bool ok,const QJsonValue&,const QString &error){if(ok)appendLog(QStringLiteral("模板包已导出：")+path);else showError(error);});
+    m_backend->call(QStringLiteral("ExportTemplatePackTo"),QJsonArray{path},[this, path](bool ok,const QJsonValue&,const QString &error){if(ok)appendLog(QStringLiteral("模板包已导出：")+path);else showError(error);});
 }
 void MainWindow::importTemplatePack() {
     const QString path=QFileDialog::getOpenFileName(this,QStringLiteral("导入模板包"),QString(),QStringLiteral("Template packs (*.zip)"));if(path.isEmpty())return;

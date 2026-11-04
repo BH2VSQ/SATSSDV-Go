@@ -64,21 +64,46 @@ jobs:
       - name: Install Qt and audio build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build qt6-base-dev libasound2-dev pkg-config
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build qt6-base-dev \
+            libasound2-dev libasound2t64 pkg-config
+      - name: Verify native build tools
+        run: |
+          go version
+          cmake --version
+          pkg-config --modversion alsa
+          test -f /usr/lib/$(gcc -dumpmachine)/cmake/Qt6/Qt6Config.cmake || \
+            find /usr -path '*/cmake/Qt6/Qt6Config.cmake' -print -quit | grep -q .
       - name: Configure native Qt application
-        run: cmake -S . -B build-qt6 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSATSSDV_WITH_MALGO=ON
+        run: >-
+          cmake -S . -B build-qt6 -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DSATSSDV_WITH_MALGO=ON
+          -DGO_EXECUTABLE="$(command -v go)"
       - name: Build native Qt application
-        run: cmake --build build-qt6 --parallel 2
+        run: cmake --build build-qt6 --parallel 2 --verbose
       - name: Verify desktop and backend binaries
         run: |
           test -x build-qt6/bin/SATSSDV-Go
           test -x build-qt6/bin/satssdv-backend
+          ! ldd build-qt6/bin/SATSSDV-Go | grep -q 'not found'
+          ! ldd build-qt6/bin/satssdv-backend | grep -q 'not found'
+      - name: Stage Linux build
+        run: |
+          cmake --install build-qt6 --prefix dist
+          tar -czf SATSSDV-Go-linux-x86_64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-linux-x86_64
+          path: SATSSDV-Go-linux-x86_64.tar.gz
+          if-no-files-found: error
 
   qt-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
+        id: setup-go
         with:
           go-version: "1.26.x"
           cache: true
@@ -92,29 +117,105 @@ jobs:
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-pkgconf
+      # setup-go modifies the Windows PATH. Do not rely on that PATH being
+      # translated by MSYS2: pass the absolute go.exe path to CMake explicitly.
+      - name: Resolve Go executable for MSYS2/CMake
+        shell: pwsh
+        run: |
+          $goExe = (Get-Command go.exe -ErrorAction Stop).Source
+          if (-not (Test-Path -LiteralPath $goExe)) {
+            throw "setup-go returned a missing executable: $goExe"
+          }
+          $goExe = $goExe -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "GO_EXECUTABLE=$goExe"
+          & $goExe version
       - name: Build native Qt application
         shell: msys2 {0}
         run: |
           export PATH="/mingw64/bin:$PATH"
-          cmake -S . -B build-qt6 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSATSSDV_WITH_MALGO=ON
-          cmake --build build-qt6 --parallel 2
+          if [[ -z "${GO_EXECUTABLE:-}" ]]; then
+            echo "GO_EXECUTABLE was not exported by the PowerShell setup-go step" >&2
+            exit 1
+          fi
+          GO_UNIX_PATH="$(cygpath -u "$GO_EXECUTABLE")"
+          if [[ ! -x "$GO_UNIX_PATH" ]]; then
+            echo "Go executable is not accessible from MSYS2: $GO_EXECUTABLE" >&2
+            exit 1
+          fi
+          "$GO_UNIX_PATH" version
+          cmake -S . -B build-qt6 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSATSSDV_WITH_MALGO=ON \
+            -DGO_EXECUTABLE="$GO_EXECUTABLE"
+          cmake --build build-qt6 --parallel 2 --verbose
           test -f build-qt6/bin/SATSSDV-Go.exe
           test -f build-qt6/bin/satssdv-backend.exe
+          test -f build-qt6/bin/Qt6Core.dll
+          test -f build-qt6/bin/Qt6Widgets.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-windows-x86_64
+          path: build-qt6/bin/
+          if-no-files-found: error
 
   qt-macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            arch: arm64
+            uname_arch: arm64
+            cmake_arch: arm64
+          - runner: macos-26-intel
+            arch: amd64
+            uname_arch: x86_64
+            cmake_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      GOOS: darwin
+      GOARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
           cache: true
-      - name: Install Qt
-        run: brew install qt
-      - name: Build native Qt application
+      - name: Verify native runner architecture
         run: |
-          export Qt6_DIR="$(brew --prefix qt)/lib/cmake/Qt6"
-          cmake -S . -B build-qt6 -DCMAKE_BUILD_TYPE=Release -DSATSSDV_WITH_MALGO=ON
-          cmake --build build-qt6 --parallel 2
-          test -d build-qt6/bin/SATSSDV-Go.app
-          test -f build-qt6/bin/SATSSDV-Go.app/Contents/MacOS/satssdv-backend
+          echo "Runner: $(uname -m)"
+          echo "Go target: $(go env GOOS)/$(go env GOARCH)"
+          test "$(uname -m)" = "${{ matrix.uname_arch }}"
+          test "$(go env GOARCH)" = "${{ matrix.arch }}"
+      - name: Install Qt
+        run: brew install qt pkg-config
+      - name: Configure native Qt application
+        run: |
+          QT_PREFIX="$(brew --prefix qt)"
+          cmake -S . -B build-qt6 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.cmake_arch }}" \
+            -DQt6_DIR="$QT_PREFIX/lib/cmake/Qt6" \
+            -DSATSSDV_WITH_MALGO=ON \
+            -DGO_EXECUTABLE="$(command -v go)"
+      - name: Build native Qt application
+        run: cmake --build build-qt6 --parallel 2 --verbose
+      - name: Verify app bundle and backend architecture
+        run: |
+          APP="build-qt6/bin/SATSSDV-Go.app"
+          test -d "$APP"
+          BACKEND="$APP/Contents/MacOS/satssdv-backend"
+          test -x "$BACKEND"
+          file "$BACKEND"
+          lipo -verify_arch "${{ matrix.cmake_arch }}" "$BACKEND"
+          lipo -verify_arch "${{ matrix.cmake_arch }}" "$APP/Contents/MacOS/SATSSDV-Go"
+      - name: Archive macOS app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            build-qt6/bin/SATSSDV-Go.app \
+            "SATSSDV-Go-macos-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-macos-${{ matrix.arch }}
+          path: SATSSDV-Go-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
