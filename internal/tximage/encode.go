@@ -3,6 +3,7 @@
 package tximage
 
 import (
+	"errors"
 	"image"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
@@ -49,6 +50,9 @@ func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, i
 	profile, err := domain.ParseProfile(profileID)
 	if err != nil {
 		return result, err
+	}
+	if profile.LinkLayer == "CCSDS-MARY" && outputSampleRate > 0 && outputSampleRate < 44100 {
+		return result, errors.New("QPSK/8PSK/16QAM 1600 baud requires TX audio sample rate >= 44100 Hz")
 	}
 	resized, err := imagequality.ResizeCover(src, imagequality.Preset(quality))
 	if err != nil {

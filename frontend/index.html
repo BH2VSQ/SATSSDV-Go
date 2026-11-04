@@ -16,16 +16,16 @@
 
     <main id="page-workbench" class="page active">
       <div class="profile-rows">
-        <div class="profile-row"><div class="profile-label"><b>RX PROFILE</b><small data-i18n="rx.title">接收 RX</small></div><div id="rx-profile-list" class="profile-list"></div><span class="profile-meta" id="rx-meta">RX 待机</span></div>
-        <div class="profile-row"><div class="profile-label"><b>TX PROFILE</b><small data-i18n="tx.title">发送 TX</small></div><div id="tx-profile-list" class="profile-list"></div><span class="profile-meta" id="tx-meta">TX 就绪</span></div>
+        <div class="profile-row"><div class="profile-label"><b>RX PROFILE</b><small data-i18n="rx.title">接收 RX</small></div><div id="rx-profile-list" class="profile-list"></div></div>
+        <div class="profile-row"><div class="profile-label"><b>TX PROFILE</b><small data-i18n="tx.title">发送 TX</small></div><div id="tx-profile-list" class="profile-list"></div></div>
       </div>
       <div class="workbench">
         <section class="pane rx-pane">
-          <div class="pane-title"><div><span class="eyebrow">RECEIVE</span><h2 data-i18n="rx.title">接收 RX</h2></div><div class="pane-actions"><button class="secondary-btn compact" id="rx-toggle">停止 RX</button><span class="state-pill idle" id="rx-pill">RX IDLE</span></div></div>
+          <div class="pane-title"><div><span class="eyebrow">RECEIVE</span><h2 data-i18n="rx.title">接收 RX</h2></div><div class="pane-actions"><button class="secondary-btn compact" id="rx-toggle">停止 RX</button></div></div>
           <div class="image-view"><div class="empty-image"><div class="image-glyph">▧</div><b data-i18n="rx.wait">等待接收音频</b><small>SSDV / PCSI progressive reconstruction</small></div></div>
           <div class="image-metadata"><span>CALL <b id="rx-callsign">---</b></span><span id="rx-ssid-wrap" hidden>SSID <b id="rx-ssid">--</b></span><span>IMAGE ID <b id="rx-image-id">--</b></span><span>PACKETS <b id="rx-packets">0 / 0</b></span><span>MODE <b id="rx-mode">---</b></span></div>
           <div class="spectrum-header"><b data-i18n="rx.spectrum">RX 瀑布图</b><span data-i18n="waterfall.rxInput">INPUT · AUDIO WATERFALL</span></div>
-          <div class="spectrum waterfall"><div class="waterfall-main"><canvas id="rx-spectrum" aria-label="RX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.rxWaiting">等待 RX 音频</div></div></div>
+          <div class="spectrum waterfall"><div class="waterfall-main"><canvas id="rx-spectrum" aria-label="RX audio waterfall"></canvas></div></div>
           <div class="spectrum-footer"><span>LEVEL <b id="rx-level">-∞ dBFS</b></span><span>PEAK <b id="rx-peak">---</b></span><span data-i18n="waterfall.frequencyAxis">横轴：频率 · 纵轴：时间</span></div>
         </section>
 
@@ -42,7 +42,7 @@
               </div>
               <button class="tx-toggle idle" id="tx-toggle" type="button" disabled data-i18n="tx.start">开始发射</button>
               <button class="secondary-btn compact tx-tone-test" id="tx-tone-test" type="button" disabled data-i18n="tx.testTone">1500 Hz 测试音</button>
-              <span class="state-pill idle" id="tx-pill" data-i18n="tx.idle">TX IDLE</span>
+              
             </div>
           </div>
 
@@ -116,7 +116,7 @@
           </div>
 
           <div class="spectrum-header"><b data-i18n="tx.spectrum">TX 瀑布图</b><span data-i18n="waterfall.txOutput">OUTPUT · AUDIO WATERFALL</span></div>
-          <div class="spectrum tx-spectrum waterfall"><div class="waterfall-main"><canvas id="tx-spectrum" aria-label="TX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.txWaiting">等待 TX 音频</div></div></div>
+          <div class="spectrum tx-spectrum waterfall"><div class="waterfall-main"><canvas id="tx-spectrum" aria-label="TX audio waterfall"></canvas></div></div>
           <div class="spectrum-footer"><span>OUTPUT <b id="tx-level">-∞ dBFS</b></span><span>PEAK <b id="tx-peak">---</b></span><span>MODE <b id="tx-mode-label">SSDV AX.25</b></span></div>
         </section>
       </div>

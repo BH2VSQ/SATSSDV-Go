@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"testing"
 )
 
@@ -98,5 +99,12 @@ func TestNormalizeSettingsClampsAX25SSID(t *testing.T) {
 	}
 	if got := normalizeSettings(Settings{AX25SSID: -1}).AX25SSID; got != 0 {
 		t.Fatalf("negative AX.25 SSID should fall back to zero, got %d", got)
+	}
+}
+
+func TestNormalizeSettingsKeepsAutoReceiveMode(t *testing.T) {
+	s := normalizeSettings(Settings{RXProfile: domain.AutoReceiveProfile, TXProfile: string(domain.SSDVAX25)})
+	if s.RXProfile != domain.AutoReceiveProfile {
+		t.Fatalf("RX profile=%q, want auto", s.RXProfile)
 	}
 }

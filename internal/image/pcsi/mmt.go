@@ -38,7 +38,9 @@ type Config struct {
 	ChromaCompression int
 }
 type Encoder struct {
-	img         *image.RGBA
+	width       int
+	height      int
+	initialized bool
 	cfg         Config
 	pixels      []int
 	y           []uint8
@@ -83,12 +85,6 @@ func NewEncoder(src image.Image, cfg Config) (*Encoder, error) {
 	if w%16 != 0 || h%16 != 0 {
 		return nil, errors.New("PCSI MMT image dimensions must be multiples of 16")
 	}
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			img.Set(x, y, color.RGBAModel.Convert(src.At(b.Min.X+x, b.Min.Y+y)))
-		}
-	}
 	bits := cfg.BitDepth / 3
 	numYCbCr := int(math.RoundToEven(float64(PCSIInfoBits) / (2 + float64(cfg.ChromaCompression)) * 3 / float64(cfg.BitDepth)))
 	numY := int(3 * (float64(PCSIInfoBits)/float64(cfg.BitDepth) - float64(numYCbCr)))
@@ -109,15 +105,23 @@ func NewEncoder(src image.Image, cfg Config) (*Encoder, error) {
 	// deterministic permutation lets us cache compact byte planes without
 	// changing packet order or any on-wire bits.
 	yPlane, cbPlane, crPlane := make([]uint8, w*h), make([]uint8, w*h), make([]uint8, w*h)
+	rgba, rgbaOK := src.(*image.RGBA)
 	for py := 0; py < h; py++ {
 		for px := 0; px < w; px++ {
-			c := color.RGBAModel.Convert(img.At(px, py)).(color.RGBA)
+			var c color.RGBA
+			if rgbaOK {
+				p := rgba.Pix[(py+b.Min.Y-rgba.Rect.Min.Y)*rgba.Stride+(px+b.Min.X-rgba.Rect.Min.X)*4:]
+				c = color.RGBA{R: p[0], G: p[1], B: p[2], A: p[3]}
+			} else {
+				c = color.RGBAModel.Convert(src.At(b.Min.X+px, b.Min.Y+py)).(color.RGBA)
+			}
+			// Keep the reference's BGR->YCrCb input ordering byte-for-byte.
 			Y, Cb, Cr := color.RGBToYCbCr(c.B, c.G, c.R)
 			offset := py*w + px
 			yPlane[offset], cbPlane[offset], crPlane[offset] = Y, Cb, Cr
 		}
 	}
-	return &Encoder{img: img, cfg: cfg, pixels: shufflePixels(w * h), y: yPlane, cb: cbPlane, cr: crPlane,
+	return &Encoder{width: w, height: h, initialized: true, cfg: cfg, pixels: shufflePixels(w * h), y: yPlane, cb: cbPlane, cr: crPlane,
 		ycbcrCount: numYCbCr, yCount: numY, packetCount: count, channelBits: bits}, nil
 }
 func (e *Encoder) PacketCount() int {
@@ -127,7 +131,7 @@ func (e *Encoder) PacketCount() int {
 	return e.packetCount
 }
 func (e *Encoder) EncodePacket(packetNumber int) ([]byte, error) {
-	if e == nil || e.img == nil {
+	if e == nil || !e.initialized {
 		return nil, errors.New("PCSI encoder is not initialized")
 	}
 	if packetNumber < 0 || packetNumber >= e.packetCount {
@@ -137,7 +141,7 @@ func (e *Encoder) EncodePacket(packetNumber int) ([]byte, error) {
 	if e2 != nil {
 		return nil, e2
 	}
-	w, h := e.img.Bounds().Dx(), e.img.Bounds().Dy()
+	w, h := e.width, e.height
 	numPix := e.ycbcrCount + e.yCount
 	start := packetNumber * numPix
 	packet := make([]byte, WirePacketSize)

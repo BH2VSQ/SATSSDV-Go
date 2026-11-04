@@ -95,6 +95,9 @@ export namespace domain {
 	    modulation: string;
 	    markFrequency: number;
 	    spaceFrequency: number;
+	    symbolRate?: number;
+	    bitsPerSymbol?: number;
+	    carrierHz?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Profile(source);
@@ -111,6 +114,9 @@ export namespace domain {
 	        this.modulation = source["modulation"];
 	        this.markFrequency = source["markFrequency"];
 	        this.spaceFrequency = source["spaceFrequency"];
+	        this.symbolRate = source["symbolRate"];
+	        this.bitsPerSymbol = source["bitsPerSymbol"];
+	        this.carrierHz = source["carrierHz"];
 	    }
 	}
 

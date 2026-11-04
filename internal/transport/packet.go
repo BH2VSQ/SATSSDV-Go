@@ -13,6 +13,7 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ccsds"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/mary"
 )
 
 const (
@@ -107,16 +108,17 @@ func (e *Encoder) EncodePackets(packets [][]byte) ([]float32, error) {
 		if err != nil {
 			return nil, err
 		}
-	} else if profile.LinkLayer == "CCSDS" {
-		stream := make([]byte, 0, len(packets)*(4+ccsds.PayloadLength))
-		for i, packet := range packets {
-			unit, err := ccsds.BuildDataUnit(packet)
-			if err != nil {
-				return nil, fmt.Errorf("build CCSDS frame %d: %w", i, err)
-			}
-			stream = append(stream, unit...)
+	} else if profile.LinkLayer == "CCSDS-MARY" {
+		guarded, err := ccsds.BuildGuardedDataUnits(packets, e.cfg.PreambleSize, e.cfg.TrailerSize)
+		if err != nil {
+			return nil, err
 		}
-		guarded, err := ccsds.AddGuardSequences(stream, e.cfg.PreambleSize, e.cfg.TrailerSize)
+		waveform, err = mary.ModulateBytes(guarded, mary.Config{SampleRate: profile.SampleRate, SymbolRate: profile.SymbolRate, BitsPerSymbol: profile.BitsPerSymbol, CarrierHz: profile.CarrierHz})
+		if err != nil {
+			return nil, err
+		}
+	} else if profile.LinkLayer == "CCSDS" {
+		guarded, err := ccsds.BuildGuardedDataUnits(packets, e.cfg.PreambleSize, e.cfg.TrailerSize)
 		if err != nil {
 			return nil, err
 		}

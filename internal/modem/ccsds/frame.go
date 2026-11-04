@@ -123,6 +123,46 @@ func AddGuardSequences(data []byte, preambleBytes, trailerBytes int) ([]byte, er
 	return out, nil
 }
 
+// BuildGuardedDataUnits creates the complete CCSDS burst byte stream directly
+// in its final backing array. It avoids allocating one temporary byte slice per
+// 256-byte frame and then copying the complete stream again to add guards.
+// The resulting bytes are identical to BuildDataUnit for every payload followed
+// by AddGuardSequences around the concatenated units.
+func BuildGuardedDataUnits(payloads [][]byte, preambleBytes, trailerBytes int) ([]byte, error) {
+	if len(payloads) == 0 {
+		return nil, errors.New("CCSDS payload batch is empty")
+	}
+	if preambleBytes < 0 || trailerBytes < 0 || preambleBytes > 4096 || trailerBytes > 4096 {
+		return nil, errors.New("CCSDS guard sequence length must be 0..4096")
+	}
+	for i, payload := range payloads {
+		if len(payload) != PayloadLength {
+			return nil, fmt.Errorf("CCSDS payload %d must be exactly %d bytes, got %d", i, PayloadLength, len(payload))
+		}
+	}
+	unitSize := 4 + PayloadLength
+	total := preambleBytes + len(payloads)*unitSize + trailerBytes
+	out := make([]byte, total)
+	pos := 0
+	for i := 0; i < preambleBytes; i++ {
+		out[pos] = randomizer[i%len(randomizer)]
+		pos++
+	}
+	for _, payload := range payloads {
+		out[pos], out[pos+1], out[pos+2], out[pos+3] = byte((ASM>>24)&0xff), byte((ASM>>16)&0xff), byte((ASM>>8)&0xff), byte(ASM&0xff)
+		pos += 4
+		for i, value := range payload {
+			out[pos+i] = value ^ randomizer[i%len(randomizer)]
+		}
+		pos += PayloadLength
+	}
+	for i := 0; i < trailerBytes; i++ {
+		out[pos] = randomizer[i%len(randomizer)]
+		pos++
+	}
+	return out, nil
+}
+
 // FindDataUnits scans an aligned byte stream for ASM and returns complete,
 // de-randomized 256-byte user frames. It tolerates arbitrary bytes before ASM.
 func FindDataUnits(stream []byte) ([][]byte, error) {

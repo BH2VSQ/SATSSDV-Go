@@ -211,3 +211,32 @@ func TestFindDataUnitsInBitsCorrectsOneBitASMError(t *testing.T) {
 		t.Fatalf("two-bit ASM error should be rejected: frames=%d err=%v", len(frames), err)
 	}
 }
+
+func TestBuildGuardedDataUnitsMatchesLegacyComposition(t *testing.T) {
+	payloads := make([][]byte, 4)
+	for i := range payloads {
+		payloads[i] = make([]byte, PayloadLength)
+		for j := range payloads[i] {
+			payloads[i][j] = byte(i*31 + j*7)
+		}
+	}
+	legacy := make([]byte, 0, len(payloads)*(4+PayloadLength))
+	for _, payload := range payloads {
+		unit, err := BuildDataUnit(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacy = append(legacy, unit...)
+	}
+	legacy, err := AddGuardSequences(legacy, 150, 150)
+	if err != nil {
+		t.Fatal(err)
+	}
+	optimized, err := BuildGuardedDataUnits(payloads, 150, 150)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(optimized, legacy) {
+		t.Fatal("direct guarded data-unit builder changed the legacy wire stream")
+	}
+}

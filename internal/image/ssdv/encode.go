@@ -190,7 +190,7 @@ func sourceJPEGQualityCandidates(quality uint8) []int {
 		preferred = 96
 	}
 	candidates := make([]int, 0, (preferred-60)/4+1)
-	for q := preferred; q >= 60; q -= 4 {
+	for q := preferred; q >= 60; q -= 8 {
 		candidates = append(candidates, q)
 	}
 	if candidates[len(candidates)-1] != 60 {
@@ -994,7 +994,9 @@ func DecodePacketsToPreview(rawPackets [][]byte) (*image.RGBA, Packet, int, erro
 	// This keeps the preview neutral and makes block loss obvious without
 	// drawing hatch patterns that can be mistaken for decoded image content.
 	for index, ok := range covered {
-		if ok { continue }
+		if ok {
+			continue
+		}
 		x := (index % widthMCUs) * 16
 		y := (index / widthMCUs) * 16
 		draw.Draw(canvas, image.Rect(x, y, x+16, y+16), &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}, image.Point{}, draw.Src)

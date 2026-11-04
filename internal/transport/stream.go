@@ -11,6 +11,7 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ccsds"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/mary"
 )
 
 const (
@@ -37,6 +38,7 @@ type StreamDecoder struct {
 	resampler *dsp.StreamResampler
 	fsk       *dsp.FSKStreamDemodulator
 	gmsk2400  *ccsds.ARCSSD2400Demodulator
+	mary      *mary.StreamDemodulator
 	ax25      *ax25.StreamDecoder
 	ccsdsBits []bool
 	// Packet de-duplication is scoped to an image session, not the lifetime
@@ -61,7 +63,12 @@ func NewStreamDecoder(profileID domain.TransportMode, inputSampleRate int) (*Str
 		profile: profile, inputRate: inputSampleRate, resampler: resampler,
 		imageStates: make(map[string]*packetDedupState),
 	}
-	if profile.LinkLayer == "CCSDS" && profile.BitRate == 2400 {
+	if profile.LinkLayer == "CCSDS-MARY" {
+		decoder.mary, err = mary.NewStreamDemodulator(mary.Config{SampleRate: profile.SampleRate, SymbolRate: profile.SymbolRate, BitsPerSymbol: profile.BitsPerSymbol, CarrierHz: profile.CarrierHz})
+		if err != nil {
+			return nil, err
+		}
+	} else if profile.LinkLayer == "CCSDS" && profile.BitRate == 2400 {
 		decoder.gmsk2400 = &ccsds.ARCSSD2400Demodulator{}
 	} else {
 		decoder.fsk, err = dsp.NewFSKStreamDemodulator(profile.SampleRate, profile.BitRate, profile.MarkFrequency, profile.SpaceFrequency)
@@ -89,6 +96,9 @@ func (d *StreamDecoder) Reset() {
 	if d.gmsk2400 != nil {
 		d.gmsk2400.Reset()
 	}
+	if d.mary != nil {
+		d.mary.Reset()
+	}
 	if d.ax25 != nil {
 		d.ax25.Reset()
 	}
@@ -112,7 +122,9 @@ func (d *StreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 	}
 	var bits []bool
 	var err error
-	if d.gmsk2400 != nil {
+	if d.mary != nil {
+		bits = d.mary.Feed(native)
+	} else if d.gmsk2400 != nil {
 		bits, err = d.gmsk2400.Feed(native, d.profile.SampleRate)
 	} else {
 		levels := d.fsk.Feed(native)

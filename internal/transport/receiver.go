@@ -9,6 +9,7 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ccsds"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/mary"
 )
 
 type ReceivedPacket struct {
@@ -55,7 +56,13 @@ func DecodeAudioAtRate(profileID domain.TransportMode, samples []float32, captur
 		}
 	}
 	var bits []bool
-	if profile.BitRate == 2400 && profile.SampleRate == 19200 && profile.LinkLayer == "CCSDS" {
+	if profile.LinkLayer == "CCSDS-MARY" {
+		demod, createErr := mary.NewStreamDemodulator(mary.Config{SampleRate: profile.SampleRate, SymbolRate: profile.SymbolRate, BitsPerSymbol: profile.BitsPerSymbol, CarrierHz: profile.CarrierHz})
+		if createErr != nil {
+			return nil, createErr
+		}
+		bits = demod.Feed(samples)
+	} else if profile.BitRate == 2400 && profile.SampleRate == 19200 && profile.LinkLayer == "CCSDS" {
 		demod := &ccsds.ARCSSD2400Demodulator{}
 		bits, err = demod.Feed(samples, profile.SampleRate)
 	} else {

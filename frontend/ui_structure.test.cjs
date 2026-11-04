@@ -130,8 +130,11 @@ if (!/id="tx-toggle"/.test(html) || /id="tx-start"|id="tx-stop"/.test(html)) {
   throw new Error('TX must use one combined start/stop control in its title bar');
 }
 const txHeader = html.slice(html.indexOf('class="pane tx-pane"'), html.indexOf('class="template-strip"'));
-if (!(txHeader.indexOf('id="tx-toggle"') >= 0 && txHeader.indexOf('id="tx-toggle"') < txHeader.indexOf('id="tx-pill"'))) {
-  throw new Error('The combined TX button must appear immediately before the TX IDLE/ACTIVE status');
+if (/id="(?:rx|tx)-pill"|RX IDLE|TX IDLE|RX 待机|TX 待机/.test(txHeader + html.slice(html.indexOf('class="pane rx-pane"'), html.indexOf('class="pane tx-pane"')))) {
+  throw new Error('RX/TX standby status pills must not occupy the right-side pane header');
+}
+if (!(txHeader.indexOf('id="tx-toggle"') >= 0 && txHeader.indexOf('id="tx-toggle"') < txHeader.indexOf('id="tx-tone-test"'))) {
+  throw new Error('The combined TX button must remain immediately before the test-tone action');
 }
 if (!(html.indexOf('class="template-strip"') < html.indexOf('class="tx-main"'))) {
   throw new Error('Template selection must remain above the preview and component editor');
@@ -390,6 +393,15 @@ if (/for\(let r=1;r<=radius;r\+\+\)/.test(extractFunction('drawAlphaContourOutli
 }
 console.log('Component regression OK: free off-canvas layer movement, visible canvas clipping, proportional image scaling, Last RX placeholder, and bounded alpha dilation.');
 
+if (/spectrum-watermark|等待 RX 音频|等待 TX 音频|RX IDLE|TX IDLE|RX 待机|TX 待机/i.test(html + css)) {
+  throw new Error('RX/TX waterfall must not reserve a standby/waiting text region');
+}
+const profileListMatch=app.match(/state\.profiles=\[(.*?)\];/s);
+if(!profileListMatch||/QPSK[^\]]*2000|8PSK[^\]]*2000|16QAM[^\]]*2000/.test(profileListMatch[1]))throw new Error('Only the three supported 1600 M-ary profiles may remain');
+if(!/choices=pane==='rx'\?\[\{id:'auto',name:tr\('rx\.auto'\)\},\.\.\.state\.profiles\]/.test(app))throw new Error('RX profile list must expose Auto Detect without adding it to TX profiles');
+const txDecayFn=extractFunction('startTXWaterfallDecay');
+const txStateEvents=app.slice(app.indexOf("EventsOn('tx:state'"));
+if(!/drawWaterfallData\(canvas,bins\)/.test(txDecayFn)||! /startTXWaterfallDecay\(\)/.test(txStateEvents))throw new Error('TX waterfall must continue aging and scrolling after TX stops');
 if (/constellation|星座图|SYMBOL SPACE/i.test(html)) {
   throw new Error('RX/TX constellation UI must be removed completely');
 }

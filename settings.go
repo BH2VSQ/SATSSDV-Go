@@ -108,7 +108,9 @@ func normalizeSettings(s Settings) Settings {
 	if s.Language != "" {
 		d.Language = string(i18n.Normalize(s.Language))
 	}
-	if s.RXProfile != "" {
+	if s.RXProfile == domain.AutoReceiveProfile {
+		d.RXProfile = domain.AutoReceiveProfile
+	} else if s.RXProfile != "" {
 		if _, e := domain.ParseProfile(s.RXProfile); e == nil {
 			d.RXProfile = s.RXProfile
 		}

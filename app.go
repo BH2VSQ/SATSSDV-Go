@@ -38,32 +38,35 @@ import (
 )
 
 type App struct {
-	mu               sync.Mutex
-	txGate           sync.Mutex
-	txReserved       bool
-	runtimeChanging  bool
-	ctx              context.Context
-	dataDir          string
-	settings         Settings
-	ports            []string
-	keyer            ptt.Controller
-	pttTest          *ptt.TestController
-	pttError         string
-	audioRuntime     audio.Runtime
-	audioDuplex      *audio.Duplex
-	audioError       string
-	rxSpectrumMu     sync.Mutex
-	rxSpectrumWindow []float32
-	rxQueue          chan []float32
-	rxQueueMu        sync.Mutex
-	rxGapPending     bool
-	rxCancel         context.CancelFunc
-	rxDone           chan struct{}
-	rxManager        *rxengine.Manager
-	albumMu          sync.Mutex
-	txCancel         context.CancelFunc
-	txDone           chan struct{}
-	txImageID        uint8
+	mu                 sync.Mutex
+	txGate             sync.Mutex
+	txReserved         bool
+	runtimeChanging    bool
+	ctx                context.Context
+	dataDir            string
+	settings           Settings
+	ports              []string
+	keyer              ptt.Controller
+	pttTest            *ptt.TestController
+	pttError           string
+	audioRuntime       audio.Runtime
+	audioDuplex        *audio.Duplex
+	audioError         string
+	rxSpectrumMu       sync.Mutex
+	rxSpectrumWindow   []float32
+	rxSpectrumLastEmit time.Time
+	txSpectrumMu       sync.Mutex
+	txSpectrumLastEmit time.Time
+	rxQueue            chan []float32
+	rxQueueMu          sync.Mutex
+	rxGapPending       bool
+	rxCancel           context.CancelFunc
+	rxDone             chan struct{}
+	rxManager          *rxengine.Manager
+	albumMu            sync.Mutex
+	txCancel           context.CancelFunc
+	txDone             chan struct{}
+	txImageID          uint8
 }
 
 func NewApp() *App {
@@ -381,9 +384,16 @@ func (a *App) GetAudioDevices() (AudioDeviceLists, error) {
 func (a *App) StartRX() error {
 	a.mu.Lock()
 	d, ctx := a.audioDuplex, a.ctx
+	profileID, rate := a.settings.RXProfile, a.settings.AudioSampleRate
 	a.mu.Unlock()
 	if d == nil {
 		return audio.ErrRuntimeUnavailable
+	}
+	if profileID == domain.AutoReceiveProfile && rate < 44100 {
+		return errors.New("automatic RX detection requires an audio sample rate of at least 44100 Hz; use 48000 Hz")
+	}
+	if profile, err := domain.ParseProfile(profileID); err == nil && profile.LinkLayer == "CCSDS-MARY" && rate < 44100 {
+		return errors.New("QPSK/8PSK/16QAM 1600-symbol RX requires an audio sample rate of at least 44100 Hz; use 48000 Hz or higher")
 	}
 	if err := d.StartRX(ctx, a.handleRXAudio); err != nil {
 		a.setAudioError(err)
@@ -526,14 +536,18 @@ func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSecond
 		return errors.New("rendered TX template is not a PNG")
 	}
 	a.mu.Lock()
-	profile, quality, ax25SSID := a.settings.TXProfile, a.settings.Quality, a.settings.AX25SSID
+	profile, quality, ax25SSID, audioRate := a.settings.TXProfile, a.settings.Quality, a.settings.AX25SSID, a.settings.AudioSampleRate
 	a.mu.Unlock()
 	ax25To = strings.ToUpper(strings.TrimSpace(ax25To))
 	if ax25To == "" {
 		ax25To = "CQ"
 	}
-	if _, err := domain.ParseProfile(profile); err != nil {
+	parsedProfile, err := domain.ParseProfile(profile)
+	if err != nil {
 		return err
+	}
+	if parsedProfile.LinkLayer == "CCSDS-MARY" && audioRate < 44100 {
+		return errors.New("QPSK/8PSK/16QAM 1600-symbol TX requires an audio sample rate of at least 44100 Hz; use 48000 Hz or higher")
 	}
 	job := txqueue.Job{ID: image.ID, ImageName: image.Name, ImageDataBase64: image.PNGBase64, Profile: profile, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
 	return a.startTransmission(job, repeat, intervalSeconds)
@@ -713,6 +727,17 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 	if len(samples) < 1024 {
 		return
 	}
+	// Audio playback callbacks can arrive much faster than the display row
+	// rate. Limit FFT work and Wails event traffic to 15 Hz; the waterfall
+	// renderer cannot display more rows than this anyway.
+	now := time.Now()
+	a.txSpectrumMu.Lock()
+	if now.Sub(a.txSpectrumLastEmit) < time.Second/15 {
+		a.txSpectrumMu.Unlock()
+		return
+	}
+	a.txSpectrumLastEmit = now
+	a.txSpectrumMu.Unlock()
 	end := int(progress * float64(len(samples)-1))
 	start := end - 1024
 	if start < 0 {
@@ -727,7 +752,6 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 			runtime.EventsEmit(appCtx, "tx:spectrum", bins)
 		}
 	}
-
 }
 
 // TransmitPCM accepts mono float32 samples from the Go image/modem pipeline.
@@ -762,6 +786,7 @@ func (a *App) handleRXAudio(samples []float32) {
 	if samples == nil {
 		a.rxSpectrumMu.Lock()
 		a.rxSpectrumWindow = nil
+		a.rxSpectrumLastEmit = time.Time{}
 		a.rxSpectrumMu.Unlock()
 		a.enqueueRXSamples(nil)
 		return
@@ -772,36 +797,41 @@ func (a *App) handleRXAudio(samples []float32) {
 	a.mu.Lock()
 	ctx, rate := a.ctx, a.settings.AudioSampleRate
 	a.mu.Unlock()
+	now := time.Now()
 	a.rxSpectrumMu.Lock()
 	a.rxSpectrumWindow = append(a.rxSpectrumWindow, samples...)
 	if len(a.rxSpectrumWindow) > 4096 {
 		a.rxSpectrumWindow = append([]float32(nil), a.rxSpectrumWindow[len(a.rxSpectrumWindow)-4096:]...)
 	}
-	if len(a.rxSpectrumWindow) < 1024 {
-		a.rxSpectrumMu.Unlock()
-		a.enqueueRXSamples(samples)
-		return
+	shouldEmit := len(a.rxSpectrumWindow) >= 1024 && now.Sub(a.rxSpectrumLastEmit) >= time.Second/15
+	var window []float32
+	if shouldEmit {
+		window = append([]float32(nil), a.rxSpectrumWindow[len(a.rxSpectrumWindow)-1024:]...)
+		a.rxSpectrumLastEmit = now
 	}
-	window := append([]float32(nil), a.rxSpectrumWindow[len(a.rxSpectrumWindow)-1024:]...)
 	a.rxSpectrumMu.Unlock()
-	bins, err := dsp.Spectrum(window, rate)
-	if err == nil && ctx != nil {
-		runtime.EventsEmit(ctx, "rx:spectrum", bins)
-	}
-	var sum float64
-	peak := float32(0)
-	for _, v := range window {
-		x := float64(v)
-		sum += x * x
-		if float32(math.Abs(x)) > peak {
-			peak = float32(math.Abs(x))
+	if shouldEmit {
+		bins, err := dsp.Spectrum(window, rate)
+		if err == nil && ctx != nil {
+			runtime.EventsEmit(ctx, "rx:spectrum", bins)
+		}
+		var sum float64
+		peak := float32(0)
+		for _, v := range window {
+			x := float64(v)
+			sum += x * x
+			if float32(math.Abs(x)) > peak {
+				peak = float32(math.Abs(x))
+			}
+		}
+		rms := math.Sqrt(sum / float64(len(window)))
+		db := 20 * math.Log10(math.Max(rms, 1e-12))
+		if ctx != nil {
+			runtime.EventsEmit(ctx, "rx:level", map[string]float64{"rmsDbfs": db, "peak": float64(peak)})
 		}
 	}
-	rms := math.Sqrt(sum / float64(len(window)))
-	db := 20 * math.Log10(math.Max(rms, 1e-12))
-	if ctx != nil {
-		runtime.EventsEmit(ctx, "rx:level", map[string]float64{"rmsDbfs": db, "peak": float64(peak)})
-	}
+	// Always forward every capture block to the ordered decoder queue. Only
+	// display telemetry is throttled; demodulation input is never rate-limited.
 	a.enqueueRXSamples(samples)
 }
 
@@ -847,7 +877,9 @@ func (a *App) enqueueRXSamples(samples []float32) {
 }
 
 func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
-	var decoder *transport.StreamDecoder
+	var decoder interface {
+		Feed([]float32) ([]transport.ReceivedPacket, error)
+	}
 	activeProfile := ""
 	activeRate := 0
 	for {
@@ -864,7 +896,11 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 			if profileID != activeProfile || rate != activeRate {
 				activeProfile, activeRate = profileID, rate
 				var err error
-				decoder, err = transport.NewStreamDecoder(domain.TransportMode(profileID), rate)
+				if profileID == domain.AutoReceiveProfile {
+					decoder, err = transport.NewAutoStreamDecoder(rate)
+				} else {
+					decoder, err = transport.NewStreamDecoder(domain.TransportMode(profileID), rate)
+				}
 				if err != nil {
 					a.setAudioError(fmt.Errorf("initialize %s streaming decoder: %w", profileID, err))
 					decoder = nil
