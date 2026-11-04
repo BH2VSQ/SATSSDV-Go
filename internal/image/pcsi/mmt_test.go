@@ -381,11 +381,15 @@ func TestPCSIReconstructionConvergesWithoutGreenChromaArtifacts(t *testing.T) {
 	}
 	quickCenter := quick.RGBAAt(32, 32)
 	finalCenter := converged.RGBAAt(32, 32)
-	if finalCenter.R < quickCenter.R+40 {
-		t.Fatalf("OWL-QN did not improve the recovered red channel: quick=%v final=%v", quickCenter, finalCenter)
+	// A measurement-mean DC warm start already restores the dominant red
+	// channel in the quick pass. More OWL-QN iterations must not regress it;
+	// unlike the old zero-vector initialization, the quick pass need not wait
+	// dozens of iterations before its chroma becomes usable.
+	if finalCenter.R+5 < quickCenter.R {
+		t.Fatalf("additional OWL-QN iterations regressed the red channel: quick=%v final=%v", quickCenter, finalCenter)
 	}
-	if finalCenter.R < finalCenter.G+60 || finalCenter.R < finalCenter.B+60 {
-		t.Fatalf("red reference image has a chroma/green artifact: center=%v", finalCenter)
+	if quickCenter.R < quickCenter.G+60 || quickCenter.R < quickCenter.B+60 || finalCenter.R < finalCenter.G+60 || finalCenter.R < finalCenter.B+60 {
+		t.Fatalf("red reference image has a chroma/green artifact: quick=%v final=%v", quickCenter, finalCenter)
 	}
 }
 

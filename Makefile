@@ -1,4 +1,4 @@
-.PHONY: test vet check gui
+.PHONY: test vet check backend qt6 native-check backend-rpc-check
 
 test:
 	go test ./...
@@ -6,7 +6,18 @@ test:
 vet:
 	go vet ./...
 
-check: test vet
+native-check:
+	python3 scripts/check_native_ui.py
 
-gui:
-	CGO_ENABLED=1 wails build -tags "wails malgo"
+backend-rpc-check:
+	python3 scripts/test_backend_rpc.py
+
+check: test vet native-check backend-rpc-check
+
+backend:
+	cmake -S . -B build -DSATSSDV_BUILD_BACKEND_ONLY=ON
+	cmake --build build --parallel
+
+qt6:
+	cmake -S . -B build-qt6 -DCMAKE_BUILD_TYPE=Release -DSATSSDV_WITH_MALGO=ON
+	cmake --build build-qt6 --parallel

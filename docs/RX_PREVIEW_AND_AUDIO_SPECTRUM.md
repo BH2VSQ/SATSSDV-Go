@@ -28,5 +28,5 @@ Waterfall vertical frequency ticks are generated at 500 Hz intervals. Labels are
 - `go vet ./...` passed under the same temporary local-toolchain workaround.
 - `go test -race ./internal/dsp ./internal/album` passed.
 - Frontend JavaScript syntax and UI regression tests passed, including functional canvas checks for square 2-FSK/GMSK symbol-space plots and exact 500 Hz labels.
-- The Wails-tagged desktop entry could not be compiled because Wails v2.17.1 is not cached and external Go module downloads are unavailable in this environment.
+- The former Wails desktop entry has been replaced by the Qt 6 Widgets client. The Qt target still requires a Qt-enabled build environment; see PORT_QT6_WIDGETS.md for the current build status.
 - No real radio capture was available, so improved packet retention under queue overload is code-path tested/static-reviewed but not an over-the-air measurement.

@@ -21,20 +21,21 @@ type Config struct {
 }
 
 type StreamDemodulator struct {
-	cfg           Config
-	sps           int
-	baseband      []complex64
-	sampleCount   int64
-	searchPos     int
-	locked        bool
-	cursor        int
-	phase         float64
-	phaseStep     float64
-	symbolIndex   int64
-	phaseRotation complex128
-	stepRotation  complex128
-	cosLUT        []float64
-	sinLUT        []float64
+	cfg            Config
+	sps            int
+	baseband       []complex64
+	sampleCount    int64
+	searchPos      int
+	locked         bool
+	cursor         int
+	phase          float64
+	phaseStep      float64
+	symbolIndex    int64
+	phaseRotation  complex128
+	stepRotation   complex128
+	amplitudeScale float64
+	cosLUT         []float64
+	sinLUT         []float64
 }
 
 func NewStreamDemodulator(cfg Config) (*StreamDemodulator, error) {
@@ -72,6 +73,7 @@ func (d *StreamDemodulator) Reset() {
 	d.symbolIndex = 0
 	d.phaseRotation = 1
 	d.stepRotation = 1
+	d.amplitudeScale = 1
 }
 
 // ModulateBytes prepends a known 96-symbol BPSK training sequence, then
@@ -155,6 +157,7 @@ func (d *StreamDemodulator) Feed(samples []float32) []bool {
 type trainingCandidate struct {
 	phase     float64
 	phaseStep float64
+	amplitude float64
 	score     float64
 }
 
@@ -230,7 +233,7 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 		}
 	}
 	score := cmplx.Abs(correlation) / (magnitude + 1e-15)
-	return trainingCandidate{phase: cmplx.Phase(correlation), phaseStep: stepPhase, score: score}, true
+	return trainingCandidate{phase: cmplx.Phase(correlation), phaseStep: stepPhase, amplitude: energy / trainingSymbols, score: score}, true
 }
 
 func (d *StreamDemodulator) tryAcquire() {
@@ -274,6 +277,14 @@ func (d *StreamDemodulator) tryAcquire() {
 		}
 		d.phase = best.phase
 		d.phaseStep = best.phaseStep
+		// The BPSK training word has unit constellation amplitude. Use it as an
+		// AGC reference so all payload constellations (especially 16-QAM outer
+		// points) are sliced independently of sound-card gain and TX filtering.
+		if best.amplitude > 1e-6 {
+			d.amplitudeScale = 1 / best.amplitude
+		} else {
+			d.amplitudeScale = 1
+		}
 		// The full-sample training correlation references carrier phase at
 		// the first sample of the preamble. Advance through all 96 training
 		// symbols and to the center of the first payload symbol before making
@@ -298,6 +309,7 @@ func (d *StreamDemodulator) decodeAvailable() []bool {
 		base := d.cursor + n*d.sps
 		z := symbolMean(d.baseband, base, d.sps)
 		z *= d.phaseRotation
+		z *= complex(d.amplitudeScale, 0)
 		decision := nearestConstellationPoint(z, d.cfg.BitsPerSymbol)
 		phaseError := cmplx.Phase(z * cmplx.Conj(decision))
 		// Decision-directed carrier tracking removes the small residual CFO

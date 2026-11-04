@@ -56,10 +56,18 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 		cycle++
 		for i, j := range jobs {
 			if err := ctx.Err(); err != nil {
+				emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
 				return err
 			}
 			emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "sending"})
 			if err := send(ctx, j); err != nil {
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return err
+				}
 				emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "error", Error: err.Error()})
 				return fmt.Errorf("send queue item %q: %w", j.ID, err)
 			}
@@ -68,6 +76,9 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 				if err := sleepWithCountdown(ctx, cfg.Interval, func(remaining time.Duration) {
 					emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "countdown", Error: fmt.Sprintf("%d", int(remaining.Seconds()))})
 				}); err != nil {
+					if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
+					}
 					return err
 				}
 			}

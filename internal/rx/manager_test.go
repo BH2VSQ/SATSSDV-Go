@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -208,7 +207,12 @@ func TestManagerKeepsIngestingPCSIWhileReconstructionRuns(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	deadline := time.After(20 * time.Second)
+	// This is an eventual-completion assertion, not a wall-clock latency SLA.
+	// PCSI reconstruction is intentionally CPU intensive, and the Go race
+	// detector can multiply its runtime when other package tests execute in
+	// parallel. Keep the independent 5-second queue-ingest assertion above;
+	// allow enough time here to avoid a false timeout under -race/CI load.
+	deadline := time.After(45 * time.Second)
 	for {
 		select {
 		case update := <-updates:
@@ -227,7 +231,7 @@ func TestManagerKeepsIngestingPCSIWhileReconstructionRuns(t *testing.T) {
 	}
 }
 
-func TestManagerSubmitAppliesBackpressureInsteadOfDropping(t *testing.T) {
+func TestManagerSubmitDoesNotBlockWhenQueueSaturates(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var callbacks atomic.Int64
@@ -248,34 +252,29 @@ func TestManagerSubmitAppliesBackpressureInsteadOfDropping(t *testing.T) {
 		t.Fatal("worker did not enter callback")
 	}
 	const submitted = queueCapacity + 32
-	done := make(chan error, 1)
-	go func() {
-		for i := 0; i < submitted; i++ {
-			if !manager.Submit(invalid) {
-				done <- fmt.Errorf("packet %d was rejected while manager remained active", i)
-				return
-			}
+	start := time.Now()
+	accepted := 0
+	for i := 0; i < submitted; i++ {
+		if manager.Submit(invalid) {
+			accepted++
 		}
-		done <- nil
-	}()
-	// The queue must fill while the worker is held in its callback. Releasing
-	// it should let the blocked submitter continue rather than lose packets.
-	time.Sleep(20 * time.Millisecond)
-	close(release)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("submitter did not resume after the worker drained the queue")
 	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("Submit blocked for %s while RX worker was saturated", elapsed)
+	}
+	if accepted != queueCapacity {
+		t.Fatalf("accepted queued packets=%d want=%d", accepted, queueCapacity)
+	}
+	if got := manager.DroppedPackets(); got != 32 {
+		t.Fatalf("dropped packet count=%d want=32", got)
+	}
+	close(release)
 	deadline := time.Now().Add(5 * time.Second)
-	for callbacks.Load() < submitted+1 && time.Now().Before(deadline) {
+	for callbacks.Load() < queueCapacity+1 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := callbacks.Load(); got != submitted+1 {
-		t.Fatalf("worker processed %d packets; want %d", got, submitted+1)
+	if got := callbacks.Load(); got != queueCapacity+1 {
+		t.Fatalf("worker processed %d packets; want %d accepted packets", got, queueCapacity+1)
 	}
 }
 

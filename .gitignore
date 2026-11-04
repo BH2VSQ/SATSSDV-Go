@@ -7,3 +7,8 @@
 *.exe
 .DS_Store
 Thumbs.db
+/build-qt6*/
+/CMakeFiles/
+/CMakeCache.txt
+/Testing/
+/build*/

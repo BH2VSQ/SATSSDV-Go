@@ -1,5 +1,3 @@
-//go:build wails
-
 package main
 
 import (
@@ -12,16 +10,11 @@ import (
 	"time"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/album"
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// ExportAlbumRecord opens a native directory picker and exports one record's
-// reconstructed PNG and, when present, its corrected raw SSDV packet stream.
-func (a *App) ExportAlbumRecord(id string) (int, error) {
-	ctx := a.getContext()
-	if ctx == nil {
-		return 0, errors.New("application window is not ready")
-	}
+// ExportAlbumRecordToDirectory exports one record into a directory selected
+// by the native Qt file dialog.
+func (a *App) ExportAlbumRecordToDirectory(id, destination string) (int, error) {
 	records, err := a.GetAlbum()
 	if err != nil {
 		return 0, err
@@ -37,37 +30,25 @@ func (a *App) ExportAlbumRecord(id string) (int, error) {
 	if selected == nil {
 		return 0, errors.New("album record not found")
 	}
-	defaultDir, _ := os.UserHomeDir()
-	destination, err := runtime.OpenDirectoryDialog(ctx, runtime.OpenDialogOptions{
-		Title:            "Choose a folder to export this album record",
-		DefaultDirectory: defaultDir,
-	})
-	if err != nil || strings.TrimSpace(destination) == "" {
-		return 0, err
-	}
 	return a.exportAlbumRecords(destination, []album.Record{*selected})
 }
 
-// ExportAlbumToDirectory exports every available album file into one folder
-// selected by the user through the native OS directory picker.
-func (a *App) ExportAlbumToDirectory() (int, error) {
-	ctx := a.getContext()
-	if ctx == nil {
-		return 0, errors.New("application window is not ready")
-	}
-	defaultDir, _ := os.UserHomeDir()
-	destination, err := runtime.OpenDirectoryDialog(ctx, runtime.OpenDialogOptions{
-		Title:            "Choose a folder to export the SATSSDV-Go album",
-		DefaultDirectory: defaultDir,
-	})
-	if err != nil || strings.TrimSpace(destination) == "" {
-		return 0, err
-	}
+// ExportAlbumToDirectoryPath exports every available album file into a
+// directory selected by the native Qt file dialog.
+func (a *App) ExportAlbumToDirectoryPath(destination string) (int, error) {
 	records, err := a.GetAlbum()
 	if err != nil {
 		return 0, err
 	}
 	return a.exportAlbumRecords(destination, records)
+}
+
+func (a *App) ExportAlbumRecord(id string) (int, error) {
+	return 0, errors.New("use ExportAlbumRecordToDirectory with a path selected by the native directory dialog")
+}
+
+func (a *App) ExportAlbumToDirectory() (int, error) {
+	return 0, errors.New("use ExportAlbumToDirectoryPath with a path selected by the native directory dialog")
 }
 
 func (a *App) exportAlbumRecords(destination string, records []album.Record) (int, error) {

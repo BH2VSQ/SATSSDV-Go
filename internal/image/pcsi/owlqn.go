@@ -167,6 +167,19 @@ func reconstructChannelContext(ctx context.Context, width, height int, columnInd
 	x := make([]float64, n)
 	if len(initial) == n {
 		copy(x, initial)
+	} else {
+		// Seed the orthonormal DCT DC coefficient from the mean of the
+		// received measurements. Starting every progressive preview at an
+		// all-zero coefficient vector produces a strongly tinted/black image
+		// until many expensive OWL-QN iterations have completed. The DC seed
+		// gives missing regions a neutral channel average immediately while
+		// leaving all measured pixels to the normal sparse reconstruction.
+		var sum float64
+		for _, sample := range observations {
+			sum += float64(sample)
+		}
+		mean := sum / float64(len(observations))
+		x[0] = mean * math.Sqrt(float64(n))
 	}
 	loss, gradient, err := objective.evaluate(x, true)
 	if err != nil {

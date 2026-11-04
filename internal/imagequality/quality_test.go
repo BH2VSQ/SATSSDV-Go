@@ -3,6 +3,7 @@ package imagequality
 import (
 	"image"
 	"image/color"
+	"math"
 	"testing"
 )
 
@@ -70,5 +71,24 @@ func TestRGBAFastPathMatchesGenericImageConversion(t *testing.T) {
 				t.Fatalf("%s fast RGBA path differs at byte %d: %d != %d", preset, i, fast.Pix[i], slow.Pix[i])
 			}
 		}
+	}
+}
+
+func TestPSNRAndSSIMIdentityAndDegradation(t *testing.T) {
+	a := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	b := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 16; x++ {
+			c := color.RGBA{R: uint8(x * 13), G: uint8(y * 11), B: uint8((x + y) * 7), A: 255}
+			a.SetRGBA(x, y, c)
+			b.SetRGBA(x, y, c)
+		}
+	}
+	if !math.IsInf(PSNR(a, b), 1) || math.Abs(SSIM(a, b)-1) > 1e-12 {
+		t.Fatal("identity metrics should be infinite PSNR and SSIM=1")
+	}
+	b.SetRGBA(3, 3, color.RGBA{R: 255, G: 0, B: 0, A: 255})
+	if !(PSNR(a, b) < 80) || !(SSIM(a, b) < 1) {
+		t.Fatalf("metrics did not detect a pixel change: PSNR=%.3f SSIM=%.6f", PSNR(a, b), SSIM(a, b))
 	}
 }

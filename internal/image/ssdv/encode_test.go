@@ -375,6 +375,37 @@ func TestDecodePacketsToPreviewFillsIndependentMCUBlocksAndMarksGaps(t *testing.
 	}
 }
 
+
+func TestIncrementalPreviewMatchesCompletePreview(t *testing.T) {
+	packets, err := EncodeImage(fixtureImage(320, 240), EncodeConfig{Callsign: "N0CALL", ImageID: 67, Quality: 4, FEC: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var incremental *image.RGBA
+	for i := range packets {
+		neighbors := make([][]byte, 0, 2)
+		if i > 0 {
+			neighbors = append(neighbors, packets[i-1])
+		}
+		neighbors = append(neighbors, packets[i])
+		if incremental == nil {
+			incremental, _, _, err = DecodePacketsToPreview(neighbors)
+		} else {
+			incremental, _, _, err = UpdatePacketsPreview(incremental, neighbors)
+		}
+		if err != nil {
+			t.Fatalf("incremental packet %d: %v", i, err)
+		}
+	}
+	full, _, _, err := DecodePacketsToPreview(packets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incremental.Bounds() != full.Bounds() || !bytes.Equal(incremental.Pix, full.Pix) {
+		t.Fatal("incremental SSDV preview differs from full packet-set preview")
+	}
+}
+
 func TestDefaultSSDVCompressionPrefilterReducesAirtime(t *testing.T) {
 	source := fixtureImage(320, 240)
 	var baselineJPEG bytes.Buffer

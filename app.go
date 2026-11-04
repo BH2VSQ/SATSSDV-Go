@@ -1,5 +1,3 @@
-//go:build wails
-
 package main
 
 import (
@@ -16,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	runtimedebug "runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +33,6 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/transport"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/tximage"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/txqueue"
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
@@ -53,16 +51,21 @@ type App struct {
 	audioDuplex        *audio.Duplex
 	audioError         string
 	rxSpectrumMu       sync.Mutex
+	rxPreviewMu        sync.RWMutex
+	rxPreviewPNG       []byte
 	rxSpectrumWindow   []float32
 	rxSpectrumLastEmit time.Time
 	txSpectrumMu       sync.Mutex
 	txSpectrumLastEmit time.Time
+	txProgressMu       sync.Mutex
+	txProgressLastEmit time.Time
 	rxQueue            chan []float32
 	rxQueueMu          sync.Mutex
 	rxGapPending       bool
 	rxCancel           context.CancelFunc
 	rxDone             chan struct{}
 	rxManager          *rxengine.Manager
+	events             *EventBroker
 	albumMu            sync.Mutex
 	txCancel           context.CancelFunc
 	txDone             chan struct{}
@@ -70,11 +73,16 @@ type App struct {
 }
 
 func NewApp() *App {
-	a := &App{settings: DefaultSettings()}
+	a := &App{settings: DefaultSettings(), events: NewEventBroker()}
 	a.rxManager = rxengine.NewManager(a.handleRXImageUpdate)
 	return a
 }
 func (a *App) startup(ctx context.Context) {
+	// Keep the Go-managed heap bounded so large image reconstructions and
+	// accumulated sessions do not starve other desktop applications. This is
+	// a soft Go heap limit; it does not cap native Qt or audio allocations.
+	runtimedebug.SetMemoryLimit(640 << 20)
+	runtimedebug.SetGCPercent(80)
 	a.mu.Lock()
 	a.ctx = ctx
 	a.mu.Unlock()
@@ -136,11 +144,8 @@ func (a *App) setPTTError(err error) {
 	}
 	a.mu.Lock()
 	a.pttError = err.Error()
-	ctx := a.ctx
 	a.mu.Unlock()
-	if ctx != nil {
-		runtime.EventsEmit(ctx, "ptt:error", err.Error())
-	}
+	a.emit("ptt:error", err.Error())
 }
 func (a *App) rebuildPTT() error {
 	a.mu.Lock()
@@ -159,12 +164,7 @@ func (a *App) rebuildPTT() error {
 		return err
 	}
 	runner, err := ptt.NewTestController(keyer, func(s ptt.TestState) {
-		a.mu.Lock()
-		ctx := a.ctx
-		a.mu.Unlock()
-		if ctx != nil {
-			runtime.EventsEmit(ctx, "ptt:test-state", s)
-		}
+		a.emit("ptt:test-state", s)
 	})
 	if err != nil {
 		_ = keyer.Close()
@@ -348,11 +348,8 @@ func (a *App) setAudioError(err error) {
 	}
 	a.mu.Lock()
 	a.audioError = err.Error()
-	ctx := a.ctx
 	a.mu.Unlock()
-	if ctx != nil {
-		runtime.EventsEmit(ctx, "audio:error", err.Error())
-	}
+	a.emit("audio:error", err.Error())
 }
 
 func (a *App) GetAudioState() AudioState {
@@ -454,15 +451,10 @@ func (a *App) Start1500HzTestTone() error {
 	a.txReserved = true
 	a.mu.Lock()
 	a.txCancel, a.txDone = cancel, done
-	appCtx := a.ctx
 	a.mu.Unlock()
 	a.txGate.Unlock()
-	if appCtx != nil {
-		runtime.EventsEmit(appCtx, "tx:tone-state", map[string]any{"active": true})
-	}
-	if appCtx != nil {
-		runtime.EventsEmit(appCtx, "tx:state", map[string]any{"active": true})
-	}
+	a.emit("tx:tone-state", map[string]any{"active": true})
+	a.emit("tx:state", map[string]any{"active": true})
 	go func() {
 		defer close(done)
 		defer func() {
@@ -473,13 +465,10 @@ func (a *App) Start1500HzTestTone() error {
 			if a.txDone == done {
 				a.txCancel, a.txDone = nil, nil
 			}
-			currentCtx := a.ctx
 			a.mu.Unlock()
 			a.txGate.Unlock()
-			if currentCtx != nil {
-				runtime.EventsEmit(currentCtx, "tx:tone-state", map[string]any{"active": false})
-				runtime.EventsEmit(currentCtx, "tx:state", map[string]any{"active": false})
-			}
+			a.emit("tx:tone-state", map[string]any{"active": false})
+			a.emit("tx:state", map[string]any{"active": false})
 		}()
 		const duration = 60.0
 		samples := make([]float32, int(float64(rate)*duration))
@@ -499,9 +488,7 @@ func (a *App) Start1500HzTestTone() error {
 			a.emitTXProgress(samples, rate, progress)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
-			if currentCtx := a.getContext(); currentCtx != nil {
-				runtime.EventsEmit(currentCtx, "tx:error", err.Error())
-			}
+			a.emit("tx:error", err.Error())
 		}
 	}()
 	return nil
@@ -584,29 +571,20 @@ func (a *App) startTransmission(job txqueue.Job, repeat bool, intervalSeconds in
 			a.txReserved = false
 			a.mu.Lock()
 			a.txCancel, a.txDone = nil, nil
-			appCtx := a.ctx
 			a.mu.Unlock()
 			a.txGate.Unlock()
-			if appCtx != nil {
-				runtime.EventsEmit(appCtx, "tx:state", map[string]any{"active": false})
-			}
+			a.emit("tx:state", map[string]any{"active": false})
 		}()
 		if ctx.Err() == nil {
-			if appCtx := a.getContext(); appCtx != nil {
-				runtime.EventsEmit(appCtx, "tx:state", map[string]any{"active": true})
-			}
+			a.emit("tx:state", map[string]any{"active": true})
 		}
 		err := txqueue.Run(ctx, []txqueue.Job{job}, txqueue.Config{Repeat: repeat, Interval: time.Duration(intervalSeconds) * time.Second}, func(sendCtx context.Context, job txqueue.Job) error {
 			return a.sendImageJob(sendCtx, job)
 		}, func(event txqueue.Event) {
-			if appCtx := a.getContext(); appCtx != nil {
-				runtime.EventsEmit(appCtx, "tx:status", event)
-			}
+			a.emit("tx:status", event)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
-			if appCtx := a.getContext(); appCtx != nil {
-				runtime.EventsEmit(appCtx, "tx:error", err.Error())
-			}
+			a.emit("tx:error", err.Error())
 		}
 	}()
 	return nil
@@ -660,9 +638,7 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 	if err != nil {
 		return err
 	}
-	if appCtx := a.getContext(); appCtx != nil {
-		runtime.EventsEmit(appCtx, "tx:progress", 0.0)
-	}
+	a.emit("tx:progress", 0.0)
 	transmissionStartedAt := time.Now().UTC()
 	if err := duplex.Transmit(ctx, result.Waveform, func(progress float64) {
 		a.emitTXProgress(result.Waveform, result.SampleRate, progress)
@@ -721,16 +697,23 @@ func (a *App) archiveTXImage(img image.Image, job txqueue.Job, callsign string, 
 }
 
 func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64) {
-	if appCtx := a.getContext(); appCtx != nil {
-		runtime.EventsEmit(appCtx, "tx:progress", progress)
+	now := time.Now()
+	a.txProgressMu.Lock()
+	shouldEmitProgress := now.Sub(a.txProgressLastEmit) >= time.Second/15 || progress >= 1
+	if shouldEmitProgress {
+		a.txProgressLastEmit = now
+	}
+	a.txProgressMu.Unlock()
+	if shouldEmitProgress {
+		a.emit("tx:progress", progress)
 	}
 	if len(samples) < 1024 {
 		return
 	}
 	// Audio playback callbacks can arrive much faster than the display row
-	// rate. Limit FFT work and Wails event traffic to 15 Hz; the waterfall
+	// rate. Limit FFT work and native Qt event traffic to 15 Hz; the waterfall
 	// renderer cannot display more rows than this anyway.
-	now := time.Now()
+	now = time.Now()
 	a.txSpectrumMu.Lock()
 	if now.Sub(a.txSpectrumLastEmit) < time.Second/15 {
 		a.txSpectrumMu.Unlock()
@@ -748,15 +731,13 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 	}
 	bins, err := dsp.Spectrum(samples[start:start+1024], sampleRate)
 	if err == nil {
-		if appCtx := a.getContext(); appCtx != nil {
-			runtime.EventsEmit(appCtx, "tx:spectrum", bins)
-		}
+		a.emit("tx:spectrum", bins)
 	}
 }
 
 // TransmitPCM accepts mono float32 samples from the Go image/modem pipeline.
-// Wails callers should normally invoke a backend image-send method rather than
-// transferring large PCM arrays through JavaScript.
+// Native clients should normally invoke a backend image-send method rather than
+// transferring large PCM arrays through the local IPC channel.
 func (a *App) TransmitPCM(samples []float32, waveformSampleRate int) error {
 	a.txGate.Lock()
 	a.mu.Lock()
@@ -795,7 +776,7 @@ func (a *App) handleRXAudio(samples []float32) {
 		return
 	}
 	a.mu.Lock()
-	ctx, rate := a.ctx, a.settings.AudioSampleRate
+	rate := a.settings.AudioSampleRate
 	a.mu.Unlock()
 	now := time.Now()
 	a.rxSpectrumMu.Lock()
@@ -812,8 +793,8 @@ func (a *App) handleRXAudio(samples []float32) {
 	a.rxSpectrumMu.Unlock()
 	if shouldEmit {
 		bins, err := dsp.Spectrum(window, rate)
-		if err == nil && ctx != nil {
-			runtime.EventsEmit(ctx, "rx:spectrum", bins)
+		if err == nil {
+			a.emit("rx:spectrum", bins)
 		}
 		var sum float64
 		peak := float32(0)
@@ -826,9 +807,7 @@ func (a *App) handleRXAudio(samples []float32) {
 		}
 		rms := math.Sqrt(sum / float64(len(window)))
 		db := 20 * math.Log10(math.Max(rms, 1e-12))
-		if ctx != nil {
-			runtime.EventsEmit(ctx, "rx:level", map[string]float64{"rmsDbfs": db, "peak": float64(peak)})
-		}
+		a.emit("rx:level", map[string]float64{"rmsDbfs": db, "peak": float64(peak)})
 	}
 	// Always forward every capture block to the ordered decoder queue. Only
 	// display telemetry is throttled; demodulation input is never rate-limited.
@@ -926,10 +905,27 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 }
 
 func (a *App) handleRXImageUpdate(update rxengine.Update) {
+	// Keep only the newest preview bytes in memory. The bounded UI event ring
+	// stores metadata, never repeated base64 copies of entire reconstructed
+	// images or SSDV packet payloads. Qt fetches the latest image on demand.
+	var previewPNG []byte
+	if update.PNGBase64 != "" {
+		data, err := decodeRXPreviewPNG(update.PNGBase64)
+		if err != nil {
+			if update.Error == "" {
+				update.Error = err.Error()
+			}
+		} else {
+			previewPNG = data
+			update.HasPreview = true
+			a.setLatestRXPreview(data)
+		}
+	}
+
 	// Archive every decodable preview, not only the final packet-complete image.
 	// The same RX album record is updated as the scan grows and when it completes.
-	if update.PNGBase64 != "" && (update.ArchivePreview || update.Complete) {
-		if err := a.archiveRXImage(update); err != nil {
+	if update.PNGBase64 != "" && (update.ArchivePreview || update.Complete) && previewPNG != nil {
+		if err := a.archiveRXImageData(update, previewPNG); err != nil {
 			update.Error = err.Error()
 		}
 	}
@@ -940,22 +936,53 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 			}
 		} else {
 			update.PacketPath = path
-			update.PacketDataBase64 = ""
 		}
 	}
-	a.mu.Lock()
-	ctx := a.ctx
-	a.mu.Unlock()
-	if ctx != nil {
-		runtime.EventsEmit(ctx, "rx:image", update)
+	// Binary payloads are fetched through GetLatestRXImageData and are never
+	// retained in the event history. This keeps memory bounded under repeated
+	// progressive image updates and avoids large JSON event responses.
+	update.PNGBase64 = ""
+	update.PacketDataBase64 = ""
+	a.emit("rx:image", update)
+}
+
+func decodeRXPreviewPNG(encoded string) ([]byte, error) {
+	const maximumPNGBytes = 16 * 1024 * 1024
+	if len(encoded) == 0 || len(encoded) > (maximumPNGBytes*4/3)+8 {
+		return nil, errors.New("reconstructed PNG is empty or exceeds the 16 MiB preview limit")
 	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decode reconstructed PNG: %w", err)
+	}
+	if len(data) == 0 || len(data) > maximumPNGBytes {
+		return nil, errors.New("reconstructed PNG is empty or exceeds the 16 MiB preview limit")
+	}
+	if _, err := png.DecodeConfig(bytes.NewReader(data)); err != nil {
+		return nil, fmt.Errorf("validate reconstructed PNG: %w", err)
+	}
+	return data, nil
+}
+
+func (a *App) setLatestRXPreview(data []byte) {
+	if a == nil || len(data) == 0 || len(data) > 16*1024*1024 {
+		return
+	}
+	copyOfData := append([]byte(nil), data...)
+	a.rxPreviewMu.Lock()
+	a.rxPreviewPNG = copyOfData
+	a.rxPreviewMu.Unlock()
 }
 
 func (a *App) archiveRXImage(update rxengine.Update) error {
-	data, err := base64.StdEncoding.DecodeString(update.PNGBase64)
+	data, err := decodeRXPreviewPNG(update.PNGBase64)
 	if err != nil {
-		return fmt.Errorf("decode reconstructed PNG: %w", err)
+		return err
 	}
+	return a.archiveRXImageData(update, data)
+}
+
+func (a *App) archiveRXImageData(update rxengine.Update, data []byte) error {
 	if len(data) == 0 || len(data) > 16*1024*1024 {
 		return errors.New("reconstructed PNG is empty or exceeds the 16 MiB album limit")
 	}
@@ -1314,21 +1341,7 @@ func (a *App) GetGallery() ([]gallery.Asset, error) {
 	return idx.Assets, err
 }
 func (a *App) ChooseGalleryImage() (gallery.Asset, error) {
-	ctx := a.getContext()
-	if ctx == nil {
-		return gallery.Asset{}, errors.New("application window is not ready")
-	}
-	path, err := runtime.OpenFileDialog(ctx, runtime.OpenDialogOptions{
-		Title:   "Import image into SATSSDV-Go gallery",
-		Filters: []runtime.FileFilter{{DisplayName: "Supported images", Pattern: "*.png;*.jpg;*.jpeg;*.gif"}},
-	})
-	if err != nil {
-		return gallery.Asset{}, err
-	}
-	if strings.TrimSpace(path) == "" {
-		return gallery.Asset{}, nil
-	}
-	return a.ImportGalleryImage(path)
+	return gallery.Asset{}, errors.New("native UI must select a file and call ImportGalleryImage(path)")
 }
 
 func (a *App) ImportGalleryImage(path string) (gallery.Asset, error) {
@@ -1402,6 +1415,12 @@ func (a *App) GetGalleryImageData(id string) (string, error) {
 
 // GetLatestRXImageData returns the newest archived RX image for template layers.
 func (a *App) GetLatestRXImageData() (string, error) {
+	a.rxPreviewMu.RLock()
+	preview := append([]byte(nil), a.rxPreviewPNG...)
+	a.rxPreviewMu.RUnlock()
+	if len(preview) > 0 {
+		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(preview), nil
+	}
 	items, err := a.GetAlbum()
 	if err != nil {
 		return "", err
@@ -1483,7 +1502,7 @@ func (a *App) DeleteGalleryImage(id string) error {
 }
 
 // GetAlbumImageData returns an archived RX/TX image as a data URL. Only files
-// inside this application's album directory are exposed to the frontend.
+// inside this application's album directory are exposed to the native UI.
 func (a *App) GetAlbumImageData(id string) (string, error) {
 	if strings.TrimSpace(id) == "" {
 		return "", errors.New("album record ID is empty")

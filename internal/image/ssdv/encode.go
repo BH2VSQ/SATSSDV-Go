@@ -859,6 +859,21 @@ func decodeMCUStrip(templateBytes []byte, templateFrame *jpegFrame, headerEnd in
 // of forcing the image to wait for a contiguous top-to-bottom byte stream.
 // Returned block count is the number of complete MCUs decoded into the canvas.
 func DecodePacketsToPreview(rawPackets [][]byte) (*image.RGBA, Packet, int, error) {
+	return decodePacketsToPreviewInto(nil, rawPackets, true)
+}
+
+// UpdatePacketsPreview overlays only the MCU blocks made newly decodable by
+// the supplied packet and its immediate neighbours. It keeps existing pixels
+// from earlier packets, so live RX no longer rebuilds every previously received
+// packet for every new SSDV frame (an O(n^2) decode/allocation pattern).
+func UpdatePacketsPreview(canvas *image.RGBA, rawPackets [][]byte) (*image.RGBA, Packet, int, error) {
+	if canvas == nil {
+		return nil, Packet{}, 0, errors.New("SSDV incremental preview canvas is nil")
+	}
+	return decodePacketsToPreviewInto(canvas, rawPackets, false)
+}
+
+func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMissing bool) (*image.RGBA, Packet, int, error) {
 	if len(rawPackets) == 0 {
 		return nil, Packet{}, 0, errors.New("SSDV packet set is empty")
 	}
@@ -885,8 +900,12 @@ func DecodePacketsToPreview(rawPackets [][]byte) (*image.RGBA, Packet, int, erro
 		}
 		byID[packet.PacketID] = packet
 	}
-	canvas := image.NewRGBA(image.Rect(0, 0, first.Width, first.Height))
-	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}, image.Point{}, draw.Src)
+	if canvas == nil {
+		canvas = image.NewRGBA(image.Rect(0, 0, first.Width, first.Height))
+		draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}, image.Point{}, draw.Src)
+	} else if canvas.Bounds().Dx() != first.Width || canvas.Bounds().Dy() != first.Height {
+		return nil, first, 0, errors.New("SSDV preview canvas dimensions do not match packet image")
+	}
 	widthMCUs := first.Width / 16
 	totalMCUs := widthMCUs * (first.Height / 16)
 	covered := make([]bool, totalMCUs)
@@ -993,13 +1012,15 @@ func DecodePacketsToPreview(rawPackets [][]byte) (*image.RGBA, Packet, int, erro
 	// Missing or not-yet-received MCU regions use a uniform light-grey fill.
 	// This keeps the preview neutral and makes block loss obvious without
 	// drawing hatch patterns that can be mistaken for decoded image content.
-	for index, ok := range covered {
-		if ok {
-			continue
+	if fillMissing {
+		for index, ok := range covered {
+			if ok {
+				continue
+			}
+			x := (index % widthMCUs) * 16
+			y := (index / widthMCUs) * 16
+			draw.Draw(canvas, image.Rect(x, y, x+16, y+16), &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}, image.Point{}, draw.Src)
 		}
-		x := (index % widthMCUs) * 16
-		y := (index / widthMCUs) * 16
-		draw.Draw(canvas, image.Rect(x, y, x+16, y+16), &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}, image.Point{}, draw.Src)
 	}
 	return canvas, first, decodedTotal, nil
 }

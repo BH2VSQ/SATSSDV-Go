@@ -2,6 +2,7 @@ package txqueue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -56,9 +57,52 @@ func TestRepeatIntervalEmitsCountdownAndCompletes(t *testing.T) {
 			countdown = append(countdown, n)
 		}
 	})
-	if err != nil { t.Fatal(err) }
-	if sent != 2 { t.Fatalf("sent %d cycles, want 2", sent) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent != 2 {
+		t.Fatalf("sent %d cycles, want 2", sent)
+	}
 	if len(countdown) < 2 || countdown[0] != 1 || countdown[len(countdown)-1] != 0 {
 		t.Fatalf("countdown values = %v, want start at 1 and end at 0", countdown)
+	}
+}
+
+func TestRunCancellationDuringCountdownEmitsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	countdownSeen := make(chan struct{}, 1)
+	cancelledSeen := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, []Job{{ID: "repeat"}}, Config{Repeat: true, Interval: 5 * time.Second},
+			func(context.Context, Job) error { return nil }, func(event Event) {
+				switch event.Phase {
+				case "countdown":
+					select {
+					case countdownSeen <- struct{}{}:
+					default:
+					}
+				case "cancelled":
+					select {
+					case cancelledSeen <- struct{}{}:
+					default:
+					}
+				}
+			})
+	}()
+	select {
+	case <-countdownSeen:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("countdown did not start")
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-cancelledSeen:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation event was not emitted")
 	}
 }

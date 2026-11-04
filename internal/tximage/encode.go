@@ -4,9 +4,11 @@ package tximage
 
 import (
 	"errors"
+	"fmt"
 	"image"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/imagequality"
@@ -111,6 +113,9 @@ func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, i
 	rate, err := transportEncoder.SampleRate()
 	if err != nil {
 		return result, err
+	}
+	if err := dsp.FilterModulatedAudioInPlace(waveform, rate); err != nil {
+		return result, fmt.Errorf("filter modulated TX audio: %w", err)
 	}
 	return Result{Image: resized, Waveform: waveform, PacketCount: len(packets), SampleRate: rate}, nil
 }

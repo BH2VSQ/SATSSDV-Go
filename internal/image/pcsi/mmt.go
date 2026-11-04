@@ -12,7 +12,6 @@ import (
 	"image/color"
 	"math"
 	"strings"
-	"sync"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 )
@@ -542,26 +541,30 @@ func (d *DecoderState) ReconstructContext(ctx context.Context, iterations int) (
 		return nil, stats, fmt.Errorf("PCSI reconstruction is limited to %d pixels per image", MaxPCSIReconstructionPixels)
 	}
 	indicesY, valuesY := collectSamples(d.Pixels, d.Y, d.YSeen)
-	var y, yc, cb, cbCoefficients, cr, crCoefficients []float64
-	var solveErrors [3]error
-	var workers sync.WaitGroup
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
-		y, yc, solveErrors[0] = reconstructChannelContext(ctx, d.Info.Width, d.Info.Height, indicesY, valuesY, d.yCoefficients, iterations)
-	}()
+	y, yc, err := reconstructChannelContext(ctx, d.Info.Width, d.Info.Height, indicesY, valuesY, d.yCoefficients, iterations)
+	if err != nil {
+		return nil, stats, fmt.Errorf("reconstruct PCSI luma: %w", err)
+	}
+
+	var cb, cr, cbCoefficients, crCoefficients []float64
 	if stats.ChromaSamples > 0 {
 		indicesC, valuesCb := collectSamples(d.Pixels, d.Cb, d.ChromaSeen)
 		_, valuesCr := collectSamples(d.Pixels, d.Cr, d.ChromaSeen)
-		workers.Add(2)
-		go func() {
-			defer workers.Done()
-			cb, cbCoefficients, solveErrors[1] = reconstructChannelContext(ctx, d.Info.Width, d.Info.Height, indicesC, valuesCb, d.cbCoefficients, iterations)
-		}()
-		go func() {
-			defer workers.Done()
-			cr, crCoefficients, solveErrors[2] = reconstructChannelContext(ctx, d.Info.Width, d.Info.Height, indicesC, valuesCr, d.crCoefficients, iterations)
-		}()
+		// Reconstruct chroma sequentially. The previous implementation ran all
+		// three full-resolution OWL-QN solvers concurrently, tripling their DCT
+		// workspaces and line-search buffers. This often pushed desktop memory
+		// above 1 GiB and starved the audio/RX workers when other applications
+		// were active. Sequential channel solving preserves the same objective,
+		// iteration budget and warm-start values while bounding peak memory to
+		// one optimizer workspace.
+		cb, cbCoefficients, err = reconstructChannelContext(ctx, d.Info.Width, d.Info.Height, indicesC, valuesCb, d.cbCoefficients, iterations)
+		if err != nil {
+			return nil, stats, fmt.Errorf("reconstruct PCSI Cb: %w", err)
+		}
+		cr, crCoefficients, err = reconstructChannelContext(ctx, d.Info.Width, d.Info.Height, indicesC, valuesCr, d.crCoefficients, iterations)
+		if err != nil {
+			return nil, stats, fmt.Errorf("reconstruct PCSI Cr: %w", err)
+		}
 	} else {
 		cb = make([]float64, stats.TotalPixels)
 		cr = make([]float64, stats.TotalPixels)
@@ -569,14 +572,8 @@ func (d *DecoderState) ReconstructContext(ctx context.Context, iterations int) (
 			cb[i], cr[i] = 128, 128
 		}
 	}
-	workers.Wait()
 	if err := ctx.Err(); err != nil {
 		return nil, stats, err
-	}
-	for i, name := range []string{"luma", "Cb", "Cr"} {
-		if solveErrors[i] != nil {
-			return nil, stats, fmt.Errorf("reconstruct PCSI %s: %w", name, solveErrors[i])
-		}
 	}
 	d.yCoefficients, d.cbCoefficients, d.crCoefficients = yc, cbCoefficients, crCoefficients
 
@@ -596,8 +593,14 @@ func (d *DecoderState) ReconstructContext(ctx context.Context, iterations int) (
 }
 
 func collectSamples(pixelOrder []int, values []uint8, seen []bool) ([]int, []uint8) {
-	indices := make([]int, 0)
-	measurements := make([]uint8, 0)
+	count := 0
+	for _, pixel := range pixelOrder {
+		if pixel < len(seen) && seen[pixel] {
+			count++
+		}
+	}
+	indices := make([]int, 0, count)
+	measurements := make([]uint8, 0, count)
 	for _, pixel := range pixelOrder {
 		if pixel < len(seen) && seen[pixel] {
 			indices = append(indices, pixel)

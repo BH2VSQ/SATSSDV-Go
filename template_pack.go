@@ -1,5 +1,3 @@
-//go:build wails
-
 package main
 
 import (
@@ -19,7 +17,6 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/gallery"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/storage"
 	templatepkg "github.com/BH2VSQ/SATSSDV-Go/internal/template"
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 const (
@@ -48,13 +45,12 @@ type templatePack struct {
 	Assets            []templatePackAsset    `json:"assets"`
 }
 
-// ExportTemplatePack asks the user where to save a portable preset bundle.
-// Image assets referenced by its templates and the shared TX background are
-// embedded, so the recipient does not need to copy files separately.
-func (a *App) ExportTemplatePack() (string, error) {
-	ctx := a.getContext()
-	if ctx == nil {
-		return "", errors.New("application window is not ready")
+// ExportTemplatePackTo writes a portable preset bundle to a path selected by
+// the native Qt file dialog. Embedded assets keep the bundle self-contained.
+func (a *App) ExportTemplatePackTo(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", errors.New("template pack destination path is empty")
 	}
 	templates, err := a.GetTemplates()
 	if err != nil {
@@ -132,34 +128,19 @@ func (a *App) ExportTemplatePack() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	path, err := runtime.SaveFileDialog(ctx, runtime.SaveDialogOptions{
-		Title:           "Export SATSSDV-Go template pack",
-		DefaultFilename: "SATSSDV-Go-templates.satssdv.json",
-		Filters:         []runtime.FileFilter{{DisplayName: "SATSSDV-Go template pack", Pattern: "*.satssdv.json;*.json"}},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return "", err
-	}
 	if err := os.WriteFile(path, encoded, 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-// ImportTemplatePack prompts for a portable bundle, validates all resources,
-// imports its images into the local gallery, remaps asset IDs and appends the
-// presets without replacing the user's existing templates.
-func (a *App) ImportTemplatePack() (int, error) {
-	ctx := a.getContext()
-	if ctx == nil {
-		return 0, errors.New("application window is not ready")
-	}
-	path, err := runtime.OpenFileDialog(ctx, runtime.OpenDialogOptions{
-		Title:   "Import SATSSDV-Go template pack",
-		Filters: []runtime.FileFilter{{DisplayName: "SATSSDV-Go template pack", Pattern: "*.satssdv.json;*.json"}},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return 0, err
+// ImportTemplatePackFrom validates a bundle selected by a native Qt file
+// dialog, imports its assets, remaps IDs and appends presets without replacing
+// the user's existing templates.
+func (a *App) ImportTemplatePackFrom(path string) (int, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return 0, errors.New("template pack source path is empty")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -336,4 +317,14 @@ func (a *App) ImportTemplatePack() (int, error) {
 		}
 	}
 	return len(newTemplates), nil
+}
+
+// ExportTemplatePack is retained as a migration hint for older clients.
+func (a *App) ExportTemplatePack() (string, error) {
+	return "", errors.New("use ExportTemplatePackTo with a path selected by the native file dialog")
+}
+
+// ImportTemplatePack is retained as a migration hint for older clients.
+func (a *App) ImportTemplatePack() (int, error) {
+	return 0, errors.New("use ImportTemplatePackFrom with a path selected by the native file dialog")
 }

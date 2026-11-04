@@ -7,7 +7,7 @@
 - [x] Windows, Linux and macOS serial-port discovery with a manual refresh API.
 - [x] Backend-enforced 15-second PTT test with early stop and release-on-close.
 - [x] Independent RX capture / TX playback contract and optional Malgo implementation.
-- [x] FFT spectrum generation and Wails RX/TX spectrum event hooks.
+- [x] FFT spectrum generation and native Qt RX/TX spectrum event hooks.
 - [x] Simplified Chinese, English and Japanese dictionaries and UI selector.
 - [x] Initial CQ/RST/73/blank TX presets, dynamic preset management (up to 32), image gallery and RX/TX album persistence models.
 - [x] Top-level navigation restricted to Workbench and Album; gallery is embedded in the TX template editor as a modal resource library.
@@ -54,6 +54,6 @@
 - [x] Core Go tests and vet.
 - [x] Frontend JavaScript syntax check.
 - [x] Cross-platform serial control source files.
-- [ ] Build Wails GUI on Windows, Linux and macOS with CGO dependencies.
+- [ ] Build Qt 6 desktop application on Windows, Linux and macOS with CGO dependencies.
 - [ ] Hardware tests with dummy load and reference radios.
 - [ ] Interoperability review with the original Hamstation / ARCSSD-Go software.

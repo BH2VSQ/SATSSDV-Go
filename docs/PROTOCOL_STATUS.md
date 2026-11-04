@@ -67,7 +67,7 @@ DCT numeric vectors are checked against OpenCV orthonormal DCT output. A determi
 - The selected TX template is rendered at 320x240, 448x336 or 640x480 and packetized as a single-image transmission.
 - The TX title bar contains one combined Start/Stop button immediately to the left of TX IDLE/ACTIVE. The preview canvas has no text overlay for dimensions or quality. The four selectable template slots are always displayed above the canvas/editor, and component properties are arranged in grouped columns.
 - A decoded RX callsign automatically fills the QSO HisCall field. Once the operator enters a value manually, automatic updates are suspended; clearing the field re-enables automatic fill.
-- The Wails API accepts one rendered TX template per start request. Repeat mode resends that same image at the chosen interval; there is no multi-image TX queue API or gallery queue action.
+- The native Qt RPC API accepts one rendered TX template per start request. Repeat mode resends that same image at the chosen interval; there is no multi-image TX queue API or gallery queue action.
 - Single-template TX transmission is connected for all eight configured profiles (five legacy AX.25/CCSDS profiles plus three experimental M-ary profiles). SSDV uses the Go baseline-JPEG coefficient transcoder and 256-byte packetizer; PCSI uses the Go MMT packetizer.
 - RX PCSI previews/final PNGs and reconstructed SSDV PNGs are archived. SSDV album entries also retain the corrected `.ssdv` packet stream as an attachment.
 - Interface dictionaries support Simplified Chinese, English and Japanese.
