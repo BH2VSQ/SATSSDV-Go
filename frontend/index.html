@@ -25,7 +25,7 @@
           <div class="image-view"><div class="empty-image"><div class="image-glyph">▧</div><b data-i18n="rx.wait">等待接收音频</b><small>SSDV / PCSI progressive reconstruction</small></div></div>
           <div class="image-metadata"><span>CALL <b id="rx-callsign">---</b></span><span id="rx-ssid-wrap" hidden>SSID <b id="rx-ssid">--</b></span><span>IMAGE ID <b id="rx-image-id">--</b></span><span>PACKETS <b id="rx-packets">0 / 0</b></span><span>MODE <b id="rx-mode">---</b></span></div>
           <div class="spectrum-header"><b data-i18n="rx.spectrum">RX 瀑布图</b><span data-i18n="waterfall.rxInput">INPUT · AUDIO WATERFALL</span></div>
-          <div class="spectrum waterfall spectrum-split"><div class="waterfall-main"><canvas id="rx-spectrum" aria-label="RX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.rxWaiting">等待 RX 音频</div></div><div class="constellation-panel"><canvas id="rx-constellation" aria-label="RX constellation diagram"></canvas><small>RX FFT I/Q</small></div></div>
+          <div class="spectrum waterfall"><div class="waterfall-main"><canvas id="rx-spectrum" aria-label="RX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.rxWaiting">等待 RX 音频</div></div></div>
           <div class="spectrum-footer"><span>LEVEL <b id="rx-level">-∞ dBFS</b></span><span>PEAK <b id="rx-peak">---</b></span><span data-i18n="waterfall.frequencyAxis">横轴：频率 · 纵轴：时间</span></div>
         </section>
 
@@ -116,7 +116,7 @@
           </div>
 
           <div class="spectrum-header"><b data-i18n="tx.spectrum">TX 瀑布图</b><span data-i18n="waterfall.txOutput">OUTPUT · AUDIO WATERFALL</span></div>
-          <div class="spectrum tx-spectrum waterfall spectrum-split"><div class="waterfall-main"><canvas id="tx-spectrum" aria-label="TX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.txWaiting">等待 TX 音频</div></div><div class="constellation-panel"><canvas id="tx-constellation" aria-label="TX constellation diagram"></canvas><small>TX FFT I/Q</small></div></div>
+          <div class="spectrum tx-spectrum waterfall"><div class="waterfall-main"><canvas id="tx-spectrum" aria-label="TX audio waterfall"></canvas><div class="spectrum-watermark" data-i18n="waterfall.txWaiting">等待 TX 音频</div></div></div>
           <div class="spectrum-footer"><span>OUTPUT <b id="tx-level">-∞ dBFS</b></span><span>PEAK <b id="tx-peak">---</b></span><span>MODE <b id="tx-mode-label">SSDV AX.25</b></span></div>
         </section>
       </div>

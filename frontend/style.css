@@ -763,61 +763,60 @@
 /* Fixed receive preview frame: every resolution is contained in the same viewport. */
 .image-view{position:relative;overflow:hidden;min-height:130px;max-height:100%;}
 .image-view>img{display:block;width:100%;height:100%;max-width:100%;max-height:100%;object-fit:contain;object-position:center;background:#e6e8e9;}
-.spectrum-split{display:flex;gap:4px;padding:0 3px 0 0;}
-.waterfall-main{position:relative;flex:1 1 84%;min-width:0;height:100%;overflow:hidden;}
+
+.waterfall-main{position:relative;width:100%;height:100%;min-width:0;overflow:hidden;}
 .waterfall-main>canvas{width:100%;height:100%;display:block;}
 .waterfall-main>.spectrum-watermark{position:absolute;}
-.constellation-panel{position:relative;flex:0 0 16%;min-width:70px;height:100%;background:#0d1720;border-left:1px solid #50616c;display:grid;place-items:center;overflow:hidden;}
-.constellation-panel canvas{width:100%;height:100%;display:block;}
-.constellation-panel small{position:absolute;right:3px;bottom:2px;color:#8295a3;font-size:7px;pointer-events:none;}
+
+
+
 .transmission-repeat input:checked~span{font-weight:700;}
 .transmission-interval input:disabled{background:#e5e8ea;color:#68747d;font-weight:700;text-align:center;border-color:#aab4bb;}
 
 .image-view{height:clamp(220px,42vh,420px);min-height:220px;max-height:420px;flex:0 0 auto;}
-.constellation-panel{background-color:#0d1720;background-image:linear-gradient(#26374455 1px,transparent 1px),linear-gradient(90deg,#26374455 1px,transparent 1px),radial-gradient(circle at center,transparent 0 2px,#7f99a944 2px 3px,transparent 3px);background-size:25% 25%,25% 25%,100% 100%;}
 
 
-/* RX preview consumes the flexible area so its waterfall/footer baseline
-   aligns exactly with TX; every resolution is fully contained, never cropped. */
+
+/* RX preview uses an explicit, inset stage. The image keeps its intrinsic
+   aspect ratio and is constrained by BOTH stage dimensions; unlike a 100%
+   height image inside a flex/grid item, this cannot extend below the frame. */
 .rx-pane > .image-view {
-  flex: 1 1 0;
-  width: 100%;
-  height: auto;
-  min-height: 0;
-  max-height: none;
-  flex-basis: 0;
+  position: relative;
   display: grid;
   place-items: center;
+  flex: 1 1 0;
+  flex-basis: 0;
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  min-height: 0;
+  max-height: none;
   overflow: hidden;
   background: #e6e8e9;
 }
-.rx-pane > .image-view > img {
-  width: 100%;
-  height: 100%;
+.rx-image-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.rx-image-stage > .rx-preview-image {
+  display: block;
+  flex: 0 1 auto;
+  width: auto !important;
+  height: auto !important;
+  min-width: 0;
+  min-height: 0;
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
   object-position: center;
+  margin: auto;
 }
-.spectrum-split { align-items: center; }
-.constellation-panel {
-  box-sizing: border-box;
-  flex: 0 0 132px;
-  width: 132px;
-  height: 132px;
-  min-width: 0;
-  aspect-ratio: 1 / 1;
-  align-self: center;
-  background: #0d1720;
-  background-image: none;
-  overflow: hidden;
-}
-.constellation-panel canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-  aspect-ratio: 1 / 1;
-}
-@media (max-width: 1180px) {
-  .constellation-panel { flex-basis: 112px; width: 112px; height: 112px; }
-}
+
+
+

@@ -207,33 +207,6 @@
     ctx.restore();
     const watermark=canvas.parentElement?.querySelector('.spectrum-watermark');if(watermark)watermark.hidden=view.count>0;
   }
-  function drawConstellationGrid(canvas){
-    if(!canvas)return;
-    const rect=canvas.getBoundingClientRect(),dpr=Math.max(1,window.devicePixelRatio||1);
-    const side=Math.max(1,Math.floor(Math.min(rect.width,rect.height)*dpr));
-    if(canvas.width!==side||canvas.height!==side){canvas.width=side;canvas.height=side;}
-    const ctx=canvas.getContext('2d'),center=side/2,radius=side*.43;
-    ctx.clearRect(0,0,side,side);ctx.fillStyle='#0d1720';ctx.fillRect(0,0,side,side);
-    ctx.strokeStyle='rgba(155,180,198,.2)';ctx.lineWidth=Math.max(1,dpr);
-    for(const fraction of [.25,.5,.75,1]){ctx.beginPath();ctx.arc(center,center,radius*fraction,0,Math.PI*2);ctx.stroke();}
-    ctx.beginPath();ctx.moveTo(center-radius,center);ctx.lineTo(center+radius,center);ctx.moveTo(center,center-radius);ctx.lineTo(center,center+radius);ctx.stroke();
-  }
-  function drawConstellationData(canvas,bins,cfg){
-    if(!canvas)return;drawConstellationGrid(canvas);
-    if(!Array.isArray(bins)||!bins.length)return;
-    const ctx=canvas.getContext('2d'),side=canvas.width,center=side/2,radius=side*.40;
-    const selected=bins.filter(b=>Number(b.frequencyHz)>=cfg.minFrequencyHz&&Number(b.frequencyHz)<=cfg.maxFrequencyHz&&Number.isFinite(Number(b.real))&&Number.isFinite(Number(b.imag)));
-    let peak=0;for(const b of selected)peak=Math.max(peak,Math.hypot(Number(b.real),Number(b.imag)));
-    if(!(peak>0))return;
-    for(const b of selected){
-      const real=Number(b.real),imag=Number(b.imag),magnitude=Math.hypot(real,imag);
-      if(magnitude<peak*.035)continue;
-      const x=center+(real/peak)*radius,y=center-(imag/peak)*radius;
-      const level=Math.max(0,Math.min(1,(Number(b.magnitudeDbfs)-cfg.minDbfs)/(cfg.maxDbfs-cfg.minDbfs)));
-      ctx.fillStyle=`rgba(${Math.round(75+level*155)},${Math.round(165+level*75)},${Math.round(220-level*125)},${.28+level*.66})`;
-      const pointSize=Math.max(1,1.25*side/132);ctx.beginPath();ctx.arc(x,y,pointSize,0,Math.PI*2);ctx.fill();
-    }
-  }
   function resetWaterfallView(canvas){
     const cfg=effectiveWaterfallSettings(),dpr=Math.max(1,window.devicePixelRatio||1),rect=canvas.getBoundingClientRect();
     canvas.width=Math.max(1,Math.floor(rect.width*dpr));canvas.height=Math.max(1,Math.floor(rect.height*dpr));
@@ -242,7 +215,7 @@
     const view={buffer,cursor:0,count:0,lastRowAt:0,frequencyStart:cfg.minFrequencyHz,frequencyEnd:cfg.maxFrequencyHz};
     waterfallViews.set(canvas.id,view);renderWaterfallGrid(canvas,view,cfg);return view;
   }
-  function drawIdleWaterfall(canvas){if(!canvas)return;resetWaterfallView(canvas);drawConstellationGrid($(canvas.id==='rx-spectrum'?'rx-constellation':'tx-constellation'));const watermark=canvas.parentElement?.querySelector('.spectrum-watermark');if(watermark)watermark.hidden=false;window.addEventListener('resize',()=>{resetWaterfallView(canvas);drawConstellationGrid($(canvas.id==='rx-spectrum'?'rx-constellation':'tx-constellation'));});}
+  function drawIdleWaterfall(canvas){if(!canvas)return;resetWaterfallView(canvas);const watermark=canvas.parentElement?.querySelector('.spectrum-watermark');if(watermark)watermark.hidden=false;window.addEventListener('resize',()=>{resetWaterfallView(canvas);});}
   function drawWaterfallData(canvas,bins){
     if(!canvas||!Array.isArray(bins)||bins.length<2)return;
     let view=waterfallViews.get(canvas.id);if(!view)view=resetWaterfallView(canvas);
@@ -264,7 +237,6 @@
     const bctx=view.buffer.getContext('2d');bctx.putImageData(data,0,view.cursor);
     view.cursor=(view.cursor+1)%view.buffer.height;view.count=Math.min(view.buffer.height,view.count+1);
     renderWaterfallGrid(canvas,view,cfg);
-    drawConstellationData($(canvas.id==='rx-spectrum'?'rx-constellation':'tx-constellation'),bins,cfg);
     const levels=bins.reduce((max,b)=>Math.max(max,Number(b.magnitudeDbfs)||-160),-160);
     if(canvas.id==='tx-spectrum'){
       const power=bins.reduce((sum,b)=>sum+Math.pow(10,(Number(b.magnitudeDbfs)||-160)/10),0)/bins.length;
@@ -932,7 +904,7 @@ $('template-add-text').onclick=()=>runAction(()=>addTemplateComponent('text'));$
       state.profiles=[{id:'ssdv-ax25',name:'SSDV AX.25'},{id:'ssdv-ccsds-1200',name:'SSDV CCSDS 1200'},{id:'ssdv-ccsds-2400',name:'SSDV CCSDS 2400'},{id:'pcsi-ccsds-1200',name:'PCSI CCSDS 1200'},{id:'pcsi-ccsds-2400',name:'PCSI CCSDS 2400'}];
       renderProfiles();renderTXState();await loadTemplates();renderImageLibrary();renderTemplatePreview();await applyLocale('zh-CN');
     }
-    if(window.runtime?.EventsOn){window.runtime.EventsOn('ptt:test-state',s=>{state.ptt=s;renderPTTState();});window.runtime.EventsOn('ptt:error',m=>setMessage(m,true));window.runtime.EventsOn('audio:error',m=>{$('global-state').textContent=m;});window.runtime.EventsOn('rx:spectrum',bins=>drawWaterfallData($('rx-spectrum'),bins));window.runtime.EventsOn('tx:spectrum',bins=>drawWaterfallData($('tx-spectrum'),bins));window.runtime.EventsOn('rx:level',v=>{$('rx-level').textContent=`${Number(v.rmsDbfs).toFixed(1)} dBFS`;$('rx-peak').textContent=Number(v.peak).toFixed(3);});window.runtime.EventsOn('tx:progress',v=>{$('tx-progress').style.width=`${Math.max(0,Math.min(1,Number(v)))*100}%`;});window.runtime.EventsOn('rx:image',u=>{if(u.error){$('global-state').textContent=u.error;return;}if(u.started){const view=document.querySelector('.image-view');view.replaceChildren();state.latestRXData='';state.latestRXLoaded=false;}$('rx-callsign').textContent=u.callsign||'---';if(u.callsign)applyDecodedCallsign(u.callsign);if(u.hasAX25SSID){$('rx-ssid').textContent=String(u.ax25SourceSSID??0);$('rx-ssid-wrap').hidden=false;}else if(u.profile!=='ssdv-ax25')$('rx-ssid-wrap').hidden=true;$('rx-image-id').textContent=u.imageId??'--';$('rx-packets').textContent=u.packetsExpected?`${u.packetsReceived||0} / ${u.packetsExpected}`:`${u.packetsReceived||0} / --`;$('rx-mode').textContent=u.profile||'---';if(u.pngBase64){state.latestRXData='';state.latestRXLoaded=false;}if(u.pngBase64){const view=document.querySelector('.image-view');view.replaceChildren();const img=document.createElement('img');img.src=`data:image/png;base64,${u.pngBase64}`;img.alt=`${u.codec||'Digital'} received image preview`;img.style.width='100%';img.style.height='100%';img.style.maxWidth='100%';img.style.maxHeight='100%';img.style.objectFit='contain';img.style.objectPosition='center';img.draggable=false;view.appendChild(img);}if((u.pngBase64||u.packetPath)&&document.querySelector('#page-album').classList.contains('active'))loadAlbum();if(u.complete){$('global-state').textContent=u.codec==='SSDV'?tr('rx.ssdvPending'):tr('rx.complete');state.latestRXData='';state.latestRXLoaded=false;renderTemplatePreview();}else if(u.packetsExpected){$('global-state').textContent=tr('rx.packetCount',{received:u.packetsReceived||0,expected:u.packetsExpected});}});window.runtime.EventsOn('tx:tone-state',v=>{state.txToneActive=!!v.active;renderTXState();});window.runtime.EventsOn('tx:state',v=>{state.txActive=!!v.active;renderTXState();if(!state.txActive)$('tx-progress').style.width='0%';});window.runtime.EventsOn('tx:status',v=>{if(v.phase==='completed'){$('global-state').textContent=tr('tx.done');restoreRepeatInterval();}else if(v.phase==='countdown'){setRepeatCountdown(Number(v.error)||0);$('global-state').textContent=`下一次发射：${Math.max(0,Number(v.error)||0)} s`;}else if(v.phase==='sending'){restoreRepeatInterval();}});window.runtime.EventsOn('tx:error',m=>{setMessage(m,true);$('global-state').textContent=m;});}
+    if(window.runtime?.EventsOn){window.runtime.EventsOn('ptt:test-state',s=>{state.ptt=s;renderPTTState();});window.runtime.EventsOn('ptt:error',m=>setMessage(m,true));window.runtime.EventsOn('audio:error',m=>{$('global-state').textContent=m;});window.runtime.EventsOn('rx:spectrum',bins=>drawWaterfallData($('rx-spectrum'),bins));window.runtime.EventsOn('tx:spectrum',bins=>drawWaterfallData($('tx-spectrum'),bins));window.runtime.EventsOn('rx:level',v=>{$('rx-level').textContent=`${Number(v.rmsDbfs).toFixed(1)} dBFS`;$('rx-peak').textContent=Number(v.peak).toFixed(3);});window.runtime.EventsOn('tx:progress',v=>{$('tx-progress').style.width=`${Math.max(0,Math.min(1,Number(v)))*100}%`;});window.runtime.EventsOn('rx:image',u=>{if(u.error){$('global-state').textContent=u.error;return;}if(u.started){const view=document.querySelector('.image-view');view.replaceChildren();state.latestRXData='';state.latestRXLoaded=false;}$('rx-callsign').textContent=u.callsign||'---';if(u.callsign)applyDecodedCallsign(u.callsign);if(u.hasAX25SSID){$('rx-ssid').textContent=String(u.ax25SourceSSID??0);$('rx-ssid-wrap').hidden=false;}else if(u.profile!=='ssdv-ax25')$('rx-ssid-wrap').hidden=true;$('rx-image-id').textContent=u.imageId??'--';$('rx-packets').textContent=u.packetsExpected?`${u.packetsReceived||0} / ${u.packetsExpected}`:`${u.packetsReceived||0} / --`;$('rx-mode').textContent=u.profile||'---';if(u.pngBase64){state.latestRXData='';state.latestRXLoaded=false;}if(u.pngBase64){const view=document.querySelector('.rx-pane > .image-view');view.replaceChildren();const stage=document.createElement('div');stage.className='rx-image-stage';const img=document.createElement('img');img.className='rx-preview-image';img.src=`data:image/png;base64,${u.pngBase64}`;img.alt=`${u.codec||'Digital'} received image preview`;img.draggable=false;stage.appendChild(img);view.appendChild(stage);}if((u.pngBase64||u.packetPath)&&document.querySelector('#page-album').classList.contains('active'))loadAlbum();if(u.complete){$('global-state').textContent=u.codec==='SSDV'?tr('rx.ssdvPending'):tr('rx.complete');state.latestRXData='';state.latestRXLoaded=false;renderTemplatePreview();}else if(u.packetsExpected){$('global-state').textContent=tr('rx.packetCount',{received:u.packetsReceived||0,expected:u.packetsExpected});}});window.runtime.EventsOn('tx:tone-state',v=>{state.txToneActive=!!v.active;renderTXState();});window.runtime.EventsOn('tx:state',v=>{state.txActive=!!v.active;renderTXState();if(!state.txActive)$('tx-progress').style.width='0%';});window.runtime.EventsOn('tx:status',v=>{if(v.phase==='completed'){$('global-state').textContent=tr('tx.done');restoreRepeatInterval();}else if(v.phase==='countdown'){setRepeatCountdown(Number(v.error)||0);$('global-state').textContent=`下一次发射：${Math.max(0,Number(v.error)||0)} s`;}else if(v.phase==='sending'){restoreRepeatInterval();}});window.runtime.EventsOn('tx:error',m=>{setMessage(m,true);$('global-state').textContent=m;});}
     await refreshPTTState();await refreshAudioDevices();await refreshAudioState();
   }
 

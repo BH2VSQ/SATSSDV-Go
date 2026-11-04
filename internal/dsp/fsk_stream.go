@@ -13,14 +13,17 @@ import (
 // continuous packet capture where the radio and audio clocks are close; a
 // frequency/timing tracking loop is still needed for large oscillator errors.
 type FSKStreamDemodulator struct {
-	sampleRate int
-	bitRate    int
-	markHz     int
-	spaceHz    int
-	sps        int
-	pending    []float32
-	locked     bool
-	offsetHz   int
+	sampleRate      int
+	bitRate         int
+	markHz          int
+	spaceHz         int
+	sps             int
+	pending         []float32
+	locked          bool
+	offsetHz        int
+	candidatePhase  int
+	candidateOffset int
+	candidateCount  int
 }
 
 func NewFSKStreamDemodulator(sampleRate, bitRate, markHz, spaceHz int) (*FSKStreamDemodulator, error) {
@@ -46,6 +49,9 @@ func (d *FSKStreamDemodulator) Reset() {
 	d.pending = nil
 	d.locked = false
 	d.offsetHz = 0
+	d.candidatePhase = 0
+	d.candidateOffset = 0
+	d.candidateCount = 0
 }
 
 func (d *FSKStreamDemodulator) Feed(samples []float32) []bool {
@@ -61,17 +67,43 @@ func (d *FSKStreamDemodulator) Feed(samples []float32) []bool {
 		}
 		start := len(d.pending) - need
 		phase, offset, score, power := d.findBestPhase(d.pending[start:])
-		// Do not lock to silence or a nearly silent input. Retain a short tail
-		// and continue searching as soon as signal energy arrives.
-		if power < 1e-7 || score < 0.015 {
+		globalPhase := (start + phase) % d.sps
+		// Idle receiver noise may have substantial RMS energy and can produce
+		// isolated mark/space imbalance peaks. Never lock on one marginal
+		// window: require two overlapping windows with a stable timing phase
+		// and carrier estimate. A very strong clean burst may lock immediately
+		// so single-buffer capture decoding remains supported.
+		const minAcquireScore = 0.68
+		const immediateAcquireScore = 0.90
+		const minAcquirePower = 1e-7
+		if power < minAcquirePower || score < minAcquireScore {
+			d.candidateCount = 0
 			keep := need * 2
 			if len(d.pending) > keep {
 				d.pending = append([]float32(nil), d.pending[len(d.pending)-keep:]...)
 			}
 			return nil
 		}
-		start += phase
-		d.pending = append([]float32(nil), d.pending[start:]...)
+		if score >= immediateAcquireScore && power > 1e-4 {
+			d.candidateCount = 2
+		} else if d.candidateCount > 0 && absInt(globalPhase-d.candidatePhase) <= 1 && absInt(offset-d.candidateOffset) <= 25 {
+			d.candidateCount++
+		} else {
+			d.candidatePhase = globalPhase
+			d.candidateOffset = offset
+			d.candidateCount = 1
+		}
+		if d.candidateCount < 2 {
+			keep := need * 2
+			if len(d.pending) > keep {
+				d.pending = append([]float32(nil), d.pending[len(d.pending)-keep:]...)
+			}
+			return nil
+		}
+		// The acquisition window is only used to estimate symbol phase and
+		// common tone offset. Do not discard the samples preceding that window:
+		// they contain the packet preamble and often the first complete frames.
+		d.pending = append([]float32(nil), d.pending[globalPhase:]...)
 		d.offsetHz = offset
 		d.locked = true
 	}
@@ -83,7 +115,10 @@ func (d *FSKStreamDemodulator) Feed(samples []float32) []bool {
 	out := make([]bool, count)
 	for i := 0; i < count; i++ {
 		window := d.pending[i*d.sps : (i+1)*d.sps]
-		out[i] = toneEnergyAt(window, d.sampleRate, d.markHz+d.offsetHz) >= toneEnergyAt(window, d.sampleRate, d.spaceHz+d.offsetHz)
+		markEnergy := toneEnergyAt(window, d.sampleRate, d.markHz+d.offsetHz)
+		spaceEnergy := toneEnergyAt(window, d.sampleRate, d.spaceHz+d.offsetHz)
+		out[i] = markEnergy >= spaceEnergy
+
 	}
 	consumed := count * d.sps
 	if consumed == len(d.pending) {
@@ -148,4 +183,11 @@ func toneEnergyAt(samples []float32, sampleRate, frequency int) float64 {
 		previous2, previous = previous, current
 	}
 	return previous*previous + previous2*previous2 - coefficient*previous*previous2
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

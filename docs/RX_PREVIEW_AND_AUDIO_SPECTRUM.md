@@ -12,11 +12,11 @@ The RX image view now consumes the flexible space between the pane title and the
 
 The RX decode worker queue capacity is increased from 256 to 512 capture blocks. More importantly, overflow no longer drains every queued block. The non-blocking audio callback records a pending discontinuity and drops only incoming blocks while the queue is full. When at least two queue slots are available, it inserts a single `nil` reset marker followed by the next audio block. The decoder therefore processes the already-buffered audio in order and only resets at the actual capture gap. This cannot prevent loss if DSP processing remains slower than capture indefinitely, but it avoids throwing away several seconds of buffered frames in one overflow event.
 
-## FFT constellation projection
 
-`dsp.Spectrum` now includes normalized complex FFT bin components (`real`, `imag`) alongside frequency and magnitude. RX and TX spectrum events pass these values to a square canvas renderer. Each selected FFT bin is plotted at its complex coordinate, normalized to the strongest bin in the active frequency range. The plot includes circular amplitude guides and I/Q axes and uses a fixed square canvas, so it is not stretched by the wide waterfall container.
 
-This is explicitly a **frequency-domain complex FFT projection** derived from the audio spectrum, as requested. It is not a conventional post-demodulation symbol constellation: a true symbol constellation would require exporting the modem's per-symbol matched-filter I/Q decision samples from the AX.25/CCSDS demodulators.
+- 1200-bit/s AX.25/CCSDS FSK: matched-tone mark/space coordinates are collected per recovered symbol.
+- CCSDS 2400 GMSK: the phase-discriminator soft decision is sampled at the existing recovered symbol clock after carrier-offset correction.
+
 
 ## Waterfall frequency labels
 
@@ -27,6 +27,6 @@ Waterfall vertical frequency ticks are generated at 500 Hz intervals. Labels are
 - `go test ./...` passed using the locally installed Go 1.23.2 compiler with the `go` directive temporarily lowered for the test command; the checked-in `go.mod` was restored to Go 1.26.0 immediately afterwards.
 - `go vet ./...` passed under the same temporary local-toolchain workaround.
 - `go test -race ./internal/dsp ./internal/album` passed.
-- Frontend JavaScript syntax and UI regression tests passed, including functional canvas checks for a square complex FFT plot and exact 500 Hz labels.
+- Frontend JavaScript syntax and UI regression tests passed, including functional canvas checks for square 2-FSK/GMSK symbol-space plots and exact 500 Hz labels.
 - The Wails-tagged desktop entry could not be compiled because Wails v2.17.1 is not cached and external Go module downloads are unavailable in this environment.
 - No real radio capture was available, so improved packet retention under queue overload is code-path tested/static-reviewed but not an over-the-air measurement.

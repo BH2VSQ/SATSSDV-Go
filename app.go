@@ -727,6 +727,7 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 			runtime.EventsEmit(appCtx, "tx:spectrum", bins)
 		}
 	}
+
 }
 
 // TransmitPCM accepts mono float32 samples from the Go image/modem pipeline.

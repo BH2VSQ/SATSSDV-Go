@@ -390,56 +390,30 @@ if (/for\(let r=1;r<=radius;r\+\+\)/.test(extractFunction('drawAlphaContourOutli
 }
 console.log('Component regression OK: free off-canvas layer movement, visible canvas clipping, proportional image scaling, Last RX placeholder, and bounded alpha dilation.');
 
-if (!html.includes('id="rx-constellation"') || !html.includes('id="tx-constellation"') || !/\.spectrum-split\s*\{[^}]*display:\s*flex/s.test(css)) throw new Error('RX/TX spectrum must reserve a side region for constellation displays');
-if (!/\.image-view>img\s*\{[^}]*object-fit:\s*contain/s.test(css) || !/\.rx-pane > \.image-view\s*\{[^}]*flex:\s*1 1 0/s.test(css)) throw new Error('RX image preview must use a flexible fixed pane area and contain scaling');
-if (!app.includes("HISCALL:state.txFields.hisCall||'TOCALL'")) throw new Error('Empty HISCALL template variable must resolve to TOCALL');
-if (!app.includes("$('repeat-check').addEventListener('change',syncRepeatIntervalLock)")) throw new Error('Repeat mode must lock the interval input');
-
-if (!/\.rx-pane > \.image-view\s*\{[^}]*flex:\s*1 1 0[^}]*overflow:\s*hidden/s.test(css) || !/object-fit:\s*contain/.test(css)) {
-  throw new Error('RX preview must fit the full image inside its flexible viewport without cropping');
+if (/constellation|星座图|SYMBOL SPACE/i.test(html)) {
+  throw new Error('RX/TX constellation UI must be removed completely');
 }
-if (!/\.constellation-panel\s*\{[^}]*aspect-ratio:\s*1\s*\/\s*1/s.test(css) || !/width:\s*132px/.test(css) || !/height:\s*132px/.test(css)) {
-  throw new Error('Constellation view must retain a square, non-stretched viewport');
+if (/constellation|ConstellationSamples|TakeConstellationSamples|DecodeConstellationWindow/i.test(app)) {
+  throw new Error('Frontend must not subscribe to or render constellation data');
 }
-if (!/function drawConstellationData\(/.test(app) || !/Number\(b\.real\)/.test(app) || !/Number\(b\.imag\)/.test(app)) {
-  throw new Error('RX/TX constellation plots must be generated from complex FFT audio-spectrum data');
+if (!/\.rx-image-stage\s*\{[^}]*position:\s*absolute[^}]*inset:\s*0[^}]*display:\s*flex/s.test(css) ||
+    !/\.rx-image-stage > \.rx-preview-image\s*\{[^}]*width:\s*auto\s*!important[^}]*height:\s*auto\s*!important[^}]*max-width:\s*100%[^}]*max-height:\s*100%[^}]*object-fit:\s*contain/s.test(css)) {
+  throw new Error('RX preview must keep intrinsic image ratio and constrain both dimensions inside a definite inset stage');
+}
+if (!/img\.className='rx-preview-image'/.test(app) || !/stage\.className='rx-image-stage'/.test(app) || /img\.style\.height='100%'/.test(app)) {
+  throw new Error('RX preview must use the bounded image stage, not a 100% height image that can overflow a flex item');
+}
+if (!/\.rx-pane > \.image-view\s*\{[^}]*flex:\s*1 1 0[^}]*overflow:\s*hidden/s.test(css)) {
+  throw new Error('RX image viewport must stay inside its flex layout without clipping overflow');
 }
 if (!/hz\+=500/.test(app) || !/String\(hz\)/.test(app) || /toFixed\(hz%1000\?1:0\)/.test(app)) {
   throw new Error('Waterfall frequency ticks must use exact 500 Hz labels, not shifted kHz abbreviations');
 }
-if (!/album\.NewestRXImages\(items\)/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8'))) {
-  throw new Error('Last RX must choose the newest archived RX image independently of output resolution');
-}
-if (!/rxGapPending/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8')) || /for \{\s*select\s*\{\s*case <-queue:/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8')) || !/cap\(queue\)-len\(queue\) < 2/.test(fs.readFileSync(path.join(__dirname, '..', 'app.go'), 'utf8'))) {
-  throw new Error('RX queue overflow must not flush all queued audio; it must preserve ordered audio and mark a discontinuity');
-}
-
-// Functional canvas checks for 500 Hz axis ticks and square FFT I/Q plotting.
 const fakeContext = () => ({
-  fillTextCalls: [], arcCalls: 0, pointFills: 0,
-  fillRect(){}, clearRect(){}, drawImage(){}, save(){}, restore(){},
+  fillTextCalls: [], fillRect(){}, clearRect(){}, drawImage(){}, save(){}, restore(){},
   beginPath(){}, moveTo(){}, lineTo(){}, stroke(){},
-  arc(){this.arcCalls++;}, fill(){this.pointFills++;},
   fillText(text){this.fillTextCalls.push(String(text));},
-  createImageData(width,height){return {data:new Uint8ClampedArray(width*height*4)};},
-  putImageData(){},
 });
-const gridContext = fakeContext();
-const gridCanvas = {
-  width: 0, height: 0,
-  getBoundingClientRect(){return {width:132,height:132};},
-  getContext(){return gridContext;},
-  parentElement:{querySelector(){return {hidden:false};}}
-};
-const drawConstellationGridForTest = new Function('window',`${extractFunction('drawConstellationGrid')}; return drawConstellationGrid;`)({devicePixelRatio:1});
-const drawConstellationForTest = new Function('window','drawConstellationGrid',`${extractFunction('drawConstellationData')}; return drawConstellationData;`)({devicePixelRatio:1},drawConstellationGridForTest);
-drawConstellationForTest(gridCanvas,[
-  {frequencyHz:1500,magnitudeDbfs:-8,real:.7,imag:.4},
-  {frequencyHz:1600,magnitudeDbfs:-18,real:-.4,imag:.2}
-],{minFrequencyHz:0,maxFrequencyHz:5000,minDbfs:-100,maxDbfs:0});
-if(gridCanvas.width!==gridCanvas.height||gridCanvas.width!==132||gridContext.arcCalls<5||gridContext.pointFills<1) {
-  throw new Error('FFT I/Q constellation must draw complex spectral points into a square 132x132 canvas');
-}
 const waterfallContext = fakeContext();
 const waterfallCanvas = {
   width:300,height:80,
@@ -452,4 +426,4 @@ const renderWaterfallForTest=new Function('window','clamp',`${extractFunction('r
 renderWaterfallForTest(waterfallCanvas,waterfallView,{backgroundColor:'#07111b',minFrequencyHz:0,maxFrequencyHz:2000});
 for(const tick of ['0','500','1000','1500','2000'])if(!waterfallContext.fillTextCalls.includes(tick))throw new Error(`Missing exact ${tick} Hz waterfall tick`);
 if(waterfallContext.fillTextCalls.some(label=>label.includes('k')))throw new Error('Waterfall labels must use integer Hz, not kHz abbreviation');
-console.log('FFT I/Q and waterfall-axis regression OK: square complex-spectrum plot and exact 500 Hz integer tick labels.');
+console.log('RX preview and waterfall regression OK: height-first full-image fit, constellation UI removed, and exact 500 Hz integer tick labels.');

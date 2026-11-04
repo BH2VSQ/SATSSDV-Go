@@ -32,6 +32,16 @@ RX and TX profiles are selected independently. SSDV and PCSI MMT both have Go pa
 - Simplified Chinese, English and Japanese UI dictionaries.
 - SSDV packet sanity checks include image geometry, MCU-count, MCU-index and payload-offset bounds, in addition to RS8 correction and CRC32 validation.
 
+## RX viewport and AX.25 / CCSDS 1200 regression
+
+The RX preview uses height-first aspect-preserving fit in a fixed viewport; low, medium and high resolution images are fully visible without cropping. The optional RX/TX constellation display has been removed; the waterfall uses the full panel width.
+
+The FSK acquisition path preserves samples that precede its trailing 64-symbol timing/frequency acquisition window. Production image-to-waveform-to-image packet tests cover AX.25 and CCSDS 1200 with whole-waveform, 480-, 997- and 1920-sample callback boundaries. See [docs/INTEROPERABILITY_ROUND14.md](docs/INTEROPERABILITY_ROUND14.md).
+
+## AX.25 / CCSDS 1200 FSK acquisition
+
+The shared 1200-bit/s FSK receiver confirms timing and tone-offset acquisition across consecutive windows before locking, preventing idle audio noise from capturing the symbol clock before a packet arrives. Regression tests cover idle-noise pre-roll, native 19.2 kHz and 48 kHz capture, and multiple callback sizes. See [docs/FSK_NOISE_ACQUISITION.md](docs/FSK_NOISE_ACQUISITION.md).
+
 ## Build and test
 
 The repository pins Wails CLI/runtime v2.17.1 and requires Go 1.26.0 or newer.
@@ -144,7 +154,12 @@ The SSDV preview uses the standard MCU offset/index fields to locate complete bl
 - RX image previews use a flexible fixed pane viewport with `object-fit: contain`; all output resolutions stay fully visible and the RX waterfall/footer baseline aligns with TX.
 - Last RX template components choose the newest available RX album image across low, medium and high resolutions. Album selection is timestamp-ordered rather than quality-filtered.
 - RX capture queue overflow no longer drains the whole queued audio history. It preserves already queued samples and inserts one explicit decoder discontinuity before later audio when there is room for both the marker and the next sample block.
-- FFT spectrum events now include normalized complex real/imaginary components. RX/TX show a square frequency-domain I/Q projection based on complex FFT bins; this is distinct from a demodulator symbol-decision constellation.
 - Waterfall x-axis labels use exact integer-Hz ticks every 500 Hz (for example, 0, 500, 1000, 1500, 2000, 2500), without shifted kHz abbreviations.
 
-See [docs/RX_PREVIEW_AND_AUDIO_SPECTRUM.md](docs/RX_PREVIEW_AND_AUDIO_SPECTRUM.md) for implementation and validation notes.
+
+## RX preview full-image fit refinement (2026-11-04)
+
+- RX preview images are now mounted inside an absolutely inset `.rx-image-stage` whose dimensions are exactly the visible image viewport.
+- The `<img>` retains its intrinsic dimensions (`width:auto; height:auto`) and is constrained by both `max-width:100%` and `max-height:100%`; `object-fit:contain` and centered flex alignment preserve the complete image without cropping.
+- Removed the runtime inline `height:100%` / `width:auto` sizing that overrode the previous CSS fit rules. The empty RX placeholder remains centered through the parent grid layout.
+- Frontend regression checks assert the bounded stage, intrinsic image sizing, both-axis limits, and absence of the old inline 100%-height assignment.
