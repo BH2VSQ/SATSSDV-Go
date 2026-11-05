@@ -25,6 +25,9 @@
 #include <QMenu>
 #include <QCursor>
 #include <QMessageBox>
+#include <QColorDialog>
+#include <QStyle>
+#include <QTabBar>
 #include <QPainter>
 #include <QPainterPath>
 #include <QScrollArea>
@@ -93,27 +96,75 @@ private:
 
 class SpectrumWaterfallWidget final : public QWidget {
 public:
-    explicit SpectrumWaterfallWidget(QWidget *parent = nullptr) : QWidget(parent), m_waterfall(640, 220, QImage::Format_RGB32) {
-        m_waterfall.fill(QColor(QStringLiteral("#07111b")));
-        setMinimumHeight(250);
+    explicit SpectrumWaterfallWidget(QWidget *parent = nullptr)
+        : QWidget(parent), m_waterfall(640, 220, QImage::Format_RGB32) {
+        m_waterfall.fill(m_backgroundColor);
+        setMinimumHeight(95);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     }
 
+    void setDisplaySettings(const QJsonObject &settings) {
+        m_minFrequencyHz = qBound(0, settings.value(QStringLiteral("minFrequencyHz")).toInt(0), 47000);
+        m_maxFrequencyHz = qBound(100, settings.value(QStringLiteral("maxFrequencyHz")).toInt(5000), 48000);
+        if (m_maxFrequencyHz <= m_minFrequencyHz) m_maxFrequencyHz = qMin(48000, m_minFrequencyHz + 1000);
+        m_minDbfs = qBound(-120, settings.value(QStringLiteral("minDbfs")).toInt(-110), -10);
+        m_maxDbfs = qBound(-90, settings.value(QStringLiteral("maxDbfs")).toInt(-20), 0);
+        if (m_maxDbfs <= m_minDbfs + 4) m_maxDbfs = qMin(0, m_minDbfs + 5);
+        m_rowsPerSecond = qBound(1, settings.value(QStringLiteral("rowsPerSecond")).toInt(15), 40);
+        m_historySeconds = qBound(5, settings.value(QStringLiteral("historySeconds")).toInt(20), 60);
+        const auto color = [&settings](const QString &key, const QColor &fallback) {
+            const QColor parsed(settings.value(key).toString());
+            return parsed.isValid() ? parsed : fallback;
+        };
+        m_backgroundColor = color(QStringLiteral("backgroundColor"), QColor(QStringLiteral("#07111b")));
+        m_lowColor = color(QStringLiteral("lowColor"), QColor(QStringLiteral("#153a78")));
+        m_midColor = color(QStringLiteral("midColor"), QColor(QStringLiteral("#168fae")));
+        m_highColor = color(QStringLiteral("highColor"), QColor(QStringLiteral("#39c6b0")));
+        m_peakColor = color(QStringLiteral("peakColor"), QColor(QStringLiteral("#f7d45b")));
+        const int historyRows = qBound(30, m_rowsPerSecond * m_historySeconds, 2400);
+        m_waterfall = QImage(640, historyRows, QImage::Format_RGB32);
+        m_waterfall.fill(m_backgroundColor);
+        m_lastUpdateMs = 0;
+        update();
+    }
+
     void pushBins(const QJsonArray &bins) {
-        if (bins.isEmpty()) return;
+        if (bins.size() < 2) return;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        const qint64 interval = qMax<qint64>(1, 1000 / qMax(1, m_rowsPerSecond));
+        if (m_lastUpdateMs > 0 && now - m_lastUpdateMs < interval) return;
+        m_lastUpdateMs = now;
         QVector<double> values;
         values.reserve(bins.size());
-        for (const auto &value : bins) values.push_back(value.toObject().value(QStringLiteral("magnitudeDbfs")).toDouble(-120.0));
-        if (values.isEmpty()) return;
+        double firstHz = bins.first().toObject().value(QStringLiteral("frequencyHz")).toDouble(0.0);
+        double lastHz = firstHz;
+        for (const auto &value : bins) {
+            const QJsonObject bin = value.toObject();
+            values.push_back(bin.value(QStringLiteral("magnitudeDbfs")).toDouble(-120.0));
+            lastHz = bin.value(QStringLiteral("frequencyHz")).toDouble(lastHz);
+        }
+        if (values.size() < 2) return;
         m_latest = values;
-        if (m_waterfall.width() != 640 || m_waterfall.height() != 220) m_waterfall = QImage(640, 220, QImage::Format_RGB32);
+        m_dataMinFrequencyHz = firstHz;
+        m_dataMaxFrequencyHz = lastHz;
+        if (m_waterfall.width() != 640 || m_waterfall.height() != qBound(30, m_rowsPerSecond * m_historySeconds, 2400)) {
+            m_waterfall = QImage(640, qBound(30, m_rowsPerSecond * m_historySeconds, 2400), QImage::Format_RGB32);
+            m_waterfall.fill(m_backgroundColor);
+        }
         for (int y = 0; y < m_waterfall.height() - 1; ++y) {
             std::memcpy(m_waterfall.scanLine(y), m_waterfall.constScanLine(y + 1), size_t(m_waterfall.width()) * 4);
         }
+        double minHz = qMax(m_dataMinFrequencyHz, double(m_minFrequencyHz));
+        double maxHz = qMin(m_dataMaxFrequencyHz, double(m_maxFrequencyHz));
+        if (maxHz <= minHz) { minHz = m_dataMinFrequencyHz; maxHz = m_dataMaxFrequencyHz; }
+        m_visibleMinFrequencyHz = minHz;
+        m_visibleMaxFrequencyHz = maxHz;
         QRgb *row = reinterpret_cast<QRgb *>(m_waterfall.scanLine(m_waterfall.height() - 1));
+        const double sourceSpan = qMax(1.0, m_dataMaxFrequencyHz - m_dataMinFrequencyHz);
         for (int x = 0; x < m_waterfall.width(); ++x) {
-            const int index = qBound(0, int((qreal(x) / qMax(1, int(m_waterfall.width()) - 1)) * (values.size() - 1)), values.size() - 1);
-            const double level = qBound(0.0, (values[index] + 110.0) / 90.0, 1.0);
+            const double hz = minHz + (maxHz - minHz) * (double(x) / qMax(1, m_waterfall.width() - 1));
+            const int index = qBound(0, qRound((hz - m_dataMinFrequencyHz) / sourceSpan * (int(values.size()) - 1)), int(values.size()) - 1);
+            const double level = qBound(0.0, (values[index] - m_minDbfs) / qMax(1.0, double(m_maxDbfs - m_minDbfs)), 1.0);
             row[x] = colorFor(level).rgb();
         }
         update();
@@ -122,7 +173,7 @@ public:
 protected:
     void paintEvent(QPaintEvent *) override {
         QPainter painter(this);
-        painter.fillRect(rect(), QColor(QStringLiteral("#07111b")));
+        painter.fillRect(rect(), m_backgroundColor);
         const QRectF waterfallRect(0, height() * 0.30, width(), height() * 0.70);
         painter.drawImage(waterfallRect, m_waterfall);
         painter.setPen(QPen(QColor(QStringLiteral("#294252")), 1));
@@ -138,7 +189,7 @@ protected:
             QPainterPath path;
             for (int i = 0; i < m_latest.size(); ++i) {
                 const qreal x = width() * qreal(i) / qMax(1, int(m_latest.size()) - 1);
-                const qreal level = qBound(0.0, (m_latest[i] + 110.0) / 90.0, 1.0);
+                const qreal level = qBound(0.0, (m_latest[i] - m_minDbfs) / qMax(1.0, double(m_maxDbfs - m_minDbfs)), 1.0);
                 const qreal y = height() * 0.27 - level * height() * 0.24;
                 if (i == 0) path.moveTo(x, y); else path.lineTo(x, y);
             }
@@ -147,23 +198,42 @@ protected:
         }
         painter.setPen(QColor(QStringLiteral("#9fb3c0")));
         painter.drawText(QRect(8, 5, 160, 20), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("SPECTRUM / WATERFALL"));
-        painter.drawText(QRect(width() - 100, 5, 92, 20), Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("0–24 kHz"));
+        const double minHz = m_visibleMaxFrequencyHz > m_visibleMinFrequencyHz ? m_visibleMinFrequencyHz : m_minFrequencyHz;
+        const double maxHz = m_visibleMaxFrequencyHz > m_visibleMinFrequencyHz ? m_visibleMaxFrequencyHz : m_maxFrequencyHz;
+        const QString range = QStringLiteral("%1–%2 kHz").arg(minHz / 1000.0, 0, 'f', 1).arg(maxHz / 1000.0, 0, 'f', 1);
+        painter.drawText(QRect(width() - 115, 5, 107, 20), Qt::AlignRight | Qt::AlignVCenter, range);
     }
 
 private:
-    static QColor colorFor(double value) {
-        const QColor a(QStringLiteral("#07111b"));
-        const QColor b(QStringLiteral("#153a78"));
-        const QColor c(QStringLiteral("#168fae"));
-        const QColor d(QStringLiteral("#39c6b0"));
-        const QColor e(QStringLiteral("#f7d45b"));
-        if (value < 0.30) return QColor::fromRgbF(a.redF() + (b.redF()-a.redF())*value/0.30, a.greenF() + (b.greenF()-a.greenF())*value/0.30, a.blueF() + (b.blueF()-a.blueF())*value/0.30);
-        if (value < 0.58) { const double t=(value-0.30)/0.28; return QColor::fromRgbF(b.redF()+(c.redF()-b.redF())*t,b.greenF()+(c.greenF()-b.greenF())*t,b.blueF()+(c.blueF()-b.blueF())*t); }
-        if (value < 0.84) { const double t=(value-0.58)/0.26; return QColor::fromRgbF(c.redF()+(d.redF()-c.redF())*t,c.greenF()+(d.greenF()-c.greenF())*t,c.blueF()+(d.blueF()-c.blueF())*t); }
-        const double t=(value-0.84)/0.16; return QColor::fromRgbF(d.redF()+(e.redF()-d.redF())*t,d.greenF()+(e.greenF()-d.greenF())*t,d.blueF()+(e.blueF()-d.blueF())*t);
+    QColor colorFor(double value) const {
+        const QList<QColor> stops{m_backgroundColor, m_lowColor, m_midColor, m_highColor, m_peakColor};
+        const double scaled = qBound(0.0, value, 1.0) * (stops.size() - 1);
+        const int index = qMin(int(stops.size()) - 2, int(std::floor(scaled)));
+        const double t = scaled - index;
+        const QColor a = stops[index], b = stops[index + 1];
+        return QColor::fromRgbF(a.redF() + (b.redF() - a.redF()) * t,
+                                a.greenF() + (b.greenF() - a.greenF()) * t,
+                                a.blueF() + (b.blueF() - a.blueF()) * t);
     }
+
     QImage m_waterfall;
     QVector<double> m_latest;
+    int m_minFrequencyHz = 0;
+    int m_maxFrequencyHz = 5000;
+    int m_minDbfs = -110;
+    int m_maxDbfs = -20;
+    int m_rowsPerSecond = 15;
+    int m_historySeconds = 20;
+    QColor m_backgroundColor{QStringLiteral("#07111b")};
+    QColor m_lowColor{QStringLiteral("#153a78")};
+    QColor m_midColor{QStringLiteral("#168fae")};
+    QColor m_highColor{QStringLiteral("#39c6b0")};
+    QColor m_peakColor{QStringLiteral("#f7d45b")};
+    double m_dataMinFrequencyHz = 0.0;
+    double m_dataMaxFrequencyHz = 24000.0;
+    double m_visibleMinFrequencyHz = 0.0;
+    double m_visibleMaxFrequencyHz = 0.0;
+    qint64 m_lastUpdateMs = 0;
 };
 
 namespace {
@@ -204,6 +274,9 @@ MainWindow::MainWindow(BackendClient *backend, const QString &startupError, QWid
         m_audioStatus->setText(QStringLiteral("后端启动失败"));
         m_audioStatus->setToolTip(startupError);
         m_audioStatus->setStyleSheet(QStringLiteral("background:#f8eeee; border:1px solid #d7b2b7; padding:6px 10px; color:#98545c;"));
+        if (m_rxToggle) m_rxToggle->setEnabled(false);
+        if (m_txToggle) m_txToggle->setEnabled(false);
+        if (m_txToneToggle) m_txToneToggle->setEnabled(false);
         statusBar()->showMessage(startupError.isEmpty() ? QStringLiteral("Go 后端不可用") : QStringLiteral("Go 后端启动失败：%1").arg(startupError));
         appendLog(startupError);
     }
@@ -263,7 +336,20 @@ void MainWindow::buildUi() {
     QFont brandFont = brand->font(); brandFont.setBold(true); brand->setFont(brandFont);
     headerLayout->addWidget(mark);
     headerLayout->addWidget(brand);
+    headerLayout->addSpacing(16);
+    m_workbenchNav = new QPushButton(QStringLiteral("工作台"), header);
+    m_workbenchNav->setCheckable(true);
+    m_workbenchNav->setChecked(true);
+    m_workbenchNav->setMinimumWidth(78);
+    m_albumNav = new QPushButton(QStringLiteral("相册"), header);
+    m_albumNav->setCheckable(true);
+    m_albumNav->setMinimumWidth(78);
+    headerLayout->addWidget(m_workbenchNav);
+    headerLayout->addWidget(m_albumNav);
     headerLayout->addStretch();
+    m_languageSelect = makeCombo(header, {QStringLiteral("简体中文"), QStringLiteral("English"), QStringLiteral("日本語")});
+    m_languageSelect->setMinimumWidth(105);
+    headerLayout->addWidget(m_languageSelect);
     m_audioStatus = new QLabel(QStringLiteral("音频：正在连接"), header);
     m_audioStatus->setMinimumWidth(205);
     m_audioStatus->setAlignment(Qt::AlignCenter);
@@ -283,9 +369,26 @@ void MainWindow::buildUi() {
     m_rxProfile->hide();
     m_txProfile->hide();
 
-    auto *tabs = new QTabWidget(central);
+    m_mainTabs = new QTabWidget(central);
+    auto *tabs = m_mainTabs;
     tabs->setDocumentMode(true);
     tabs->setMovable(false);
+    tabs->tabBar()->hide();
+    connect(m_workbenchNav, &QPushButton::clicked, this, [this] {
+        m_mainTabs->setCurrentIndex(0);
+        m_workbenchNav->setChecked(true);
+        m_albumNav->setChecked(false);
+    });
+    connect(m_albumNav, &QPushButton::clicked, this, [this] {
+        m_mainTabs->setCurrentIndex(1);
+        m_workbenchNav->setChecked(false);
+        m_albumNav->setChecked(true);
+        refreshAlbum();
+    });
+    connect(m_languageSelect, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        const QString locale = index == 1 ? QStringLiteral("en") : index == 2 ? QStringLiteral("ja-JP") : QStringLiteral("zh-CN");
+        applyLanguage(locale);
+    });
 
     auto *workbench = new QWidget(tabs);
     auto *workLayout = new QVBoxLayout(workbench);
@@ -310,11 +413,6 @@ void MainWindow::buildUi() {
         buttons->setContentsMargins(0, 0, 0, 0);
         buttons->setSpacing(5);
         layout->addLayout(buttons, 1);
-        auto *meta = new QLabel(title.startsWith(QStringLiteral("RX")) ? QStringLiteral("RX 待机") : QStringLiteral("TX 就绪"), row);
-        meta->setMinimumWidth(100);
-        meta->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        meta->setStyleSheet(QStringLiteral("font-size:8pt; color:#838c93;"));
-        layout->addWidget(meta);
         profileLayout->addWidget(row);
         *target = buttons;
     };
@@ -339,23 +437,20 @@ void MainWindow::buildUi() {
     m_rxStatus = new QLabel(QStringLiteral("RX 待机 · 等待接收音频"), rxPane);
     m_rxStatus->setStyleSheet(QStringLiteral("font-size:8pt; color:#77838b;"));
     m_rxStatus->setWordWrap(true);
-    auto *rxStart = new QPushButton(QStringLiteral("启动 RX"), rxPane);
-    rxStart->setProperty("role", "primary");
-    auto *rxStop = new QPushButton(QStringLiteral("停止 RX"), rxPane);
-    rxStop->setProperty("role", "danger");
-    connect(rxStart, &QPushButton::clicked, this, [this] { startRX(); });
-    connect(rxStop, &QPushButton::clicked, this, [this] { stopRX(); });
+    m_rxToggle = new QPushButton(QStringLiteral("启动 RX"), rxPane);
+    m_rxToggle->setProperty("role", "primary");
+    m_rxToggle->setMinimumWidth(105);
+    connect(m_rxToggle, &QPushButton::clicked, this, [this] { toggleRX(); });
     rxHeader->addWidget(rxTitle);
     rxHeader->addStretch();
     rxHeader->addWidget(m_rxStatus, 1);
-    rxHeader->addWidget(rxStart);
-    rxHeader->addWidget(rxStop);
+    rxHeader->addWidget(m_rxToggle);
     rxLayout->addLayout(rxHeader);
     m_rxPreview = makePreview(rxPane);
     m_rxPreview->setMinimumSize(340, 260);
     m_rxPreview->setStyleSheet(QStringLiteral("QLabel { background:#ffffff; color:#87939b; border:1px solid #a1aab1; border-radius:0; }"));
     rxLayout->addWidget(m_rxPreview, 5);
-    m_rxMeta = new QLabel(QStringLiteral("CALL  ---      IMAGE ID  --      PACKETS  0 / 0      MODE  ---"), rxPane);
+    m_rxMeta = new QLabel(QStringLiteral("CALL  ---   SSID  --   IMAGE ID  --   PACKETS  0 / 0   MODE  ---"), rxPane);
     m_rxMeta->setStyleSheet(QStringLiteral("font-size:8pt; color:#7e8991; padding:2px 1px;"));
     rxLayout->addWidget(m_rxMeta);
     auto *rxSpectrumTitle = new QHBoxLayout();
@@ -367,7 +462,7 @@ void MainWindow::buildUi() {
     rxLayout->addLayout(rxSpectrumTitle);
     m_rxSpectrumStatus = new QLabel(QStringLiteral("等待 RX 音频"), rxPane);
     m_rxSpectrumStatus->setStyleSheet(QStringLiteral("font-size:8pt; color:#77858f;"));
-    rxLayout->addWidget(m_rxSpectrumStatus);
+    m_rxSpectrumStatus->hide();
     m_rxSpectrum = new SpectrumWaterfallWidget(rxPane);
     m_rxSpectrum->setMinimumHeight(95);
     m_rxSpectrum->setMaximumHeight(155);
@@ -402,23 +497,31 @@ void MainWindow::buildUi() {
     m_repeatInterval->setSuffix(QStringLiteral(" 秒"));
     m_repeatInterval->setMaximumWidth(90);
     txHeader->addWidget(m_repeatInterval);
-    auto *send = new QPushButton(QStringLiteral("开始发射"), txPane);
-    send->setProperty("role", "primary");
-    auto *tone = new QPushButton(QStringLiteral("1500 Hz 测试音"), txPane);
-    auto *stop = new QPushButton(QStringLiteral("停止 TX"), txPane);
-    stop->setProperty("role", "danger");
-    txHeader->addWidget(send);
-    txHeader->addWidget(tone);
-    txHeader->addWidget(stop);
+    m_txToggle = new QPushButton(QStringLiteral("开始发射"), txPane);
+    m_txToggle->setProperty("role", "primary");
+    m_txToggle->setMinimumWidth(112);
+    m_txToneToggle = new QPushButton(QStringLiteral("1500 Hz 测试音"), txPane);
+    m_txToneToggle->setMinimumWidth(118);
+    txHeader->addWidget(m_txToggle);
+    txHeader->addWidget(m_txToneToggle);
     txLayout->addLayout(txHeader);
-    connect(send, &QPushButton::clicked, this, [this] { startTX(); });
-    connect(tone, &QPushButton::clicked, this, [this] {
+    connect(m_txToggle, &QPushButton::clicked, this, [this] { toggleTX(); });
+    connect(m_txToneToggle, &QPushButton::clicked, this, [this] {
+        if (m_txToneActive) {
+            m_backend->call(QStringLiteral("StopTX"), {}, [this](bool ok, const QJsonValue &, const QString &error) {
+                if (!ok) showError(error);
+            });
+            return;
+        }
         m_backend->call(QStringLiteral("Start1500HzTestTone"), {}, [this](bool ok, const QJsonValue &, const QString &error) {
             if (ok) appendLog(QStringLiteral("已启动 1500 Hz 测试音")); else showError(error);
         });
     });
-    connect(stop, &QPushButton::clicked, this, [this] {
-        m_backend->call(QStringLiteral("StopTX"), {}, [this](bool, const QJsonValue &, const QString &) { appendLog(QStringLiteral("已请求停止发射")); });
+    connect(m_repeat, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!m_repeatInterval) return;
+        if (enabled) m_repeatIntervalSeconds = m_repeatInterval->value();
+        else m_repeatInterval->setValue(m_repeatIntervalSeconds);
+        m_repeatInterval->setEnabled(!enabled);
     });
 
     auto *templateStrip = new QWidget(txPane);
@@ -439,31 +542,25 @@ void MainWindow::buildUi() {
     auto *newPreset = new QPushButton(QStringLiteral("＋ 新建预设"), templateStrip);
     auto *duplicatePreset = new QPushButton(QStringLiteral("复制当前"), templateStrip);
     auto *deletePreset = new QPushButton(QStringLiteral("删除当前"), templateStrip);
-    auto *editTemplate = new QPushButton(QStringLiteral("编辑组件…"), templateStrip);
     auto *background = new QPushButton(QStringLiteral("背景图"), templateStrip);
-    auto *pack = new QPushButton(QStringLiteral("导入 / 导出模板包"), templateStrip);
+    auto *importPack = new QPushButton(QStringLiteral("导入模板包"), templateStrip);
+    auto *exportPack = new QPushButton(QStringLiteral("导出模板包"), templateStrip);
     deletePreset->setProperty("role", "danger");
     templateStripLayout->addWidget(newPreset, 1, 2);
     templateStripLayout->addWidget(duplicatePreset, 1, 3);
     templateStripLayout->addWidget(deletePreset, 1, 4);
-    templateStripLayout->addWidget(editTemplate, 1, 5);
-    templateStripLayout->addWidget(background, 1, 6);
-    templateStripLayout->addWidget(pack, 1, 7);
+    templateStripLayout->addWidget(background, 1, 5);
+    templateStripLayout->addWidget(importPack, 1, 6);
+    templateStripLayout->addWidget(exportPack, 1, 7);
     templateStripLayout->setColumnStretch(1, 1);
-    connect(editTemplate, &QPushButton::clicked, this, [this] { editSelectedTemplate(); });
     connect(background, &QPushButton::clicked, this, [this] { selectTemplateBackground(); });
-    connect(pack, &QPushButton::clicked, this, [this] {
-        QMenu menu(this);
-        QAction *importAction = menu.addAction(QStringLiteral("导入模板包"));
-        QAction *exportAction = menu.addAction(QStringLiteral("导出模板包"));
-        QAction *chosen = menu.exec(QCursor::pos());
-        if (chosen == importAction) importTemplatePack();
-        else if (chosen == exportAction) exportTemplatePack();
-    });
+    connect(importPack, &QPushButton::clicked, this, [this] { importTemplatePack(); });
+    connect(exportPack, &QPushButton::clicked, this, [this] { exportTemplatePack(); });
     connect(m_template, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         const QJsonObject selected = selectedTemplate();
         if (m_templateName) m_templateName->setText(selected.value(QStringLiteral("name")).toString());
         refreshTemplateComponentList();
+        refreshTemplateCanvas();
         QString error;
         const QImage image = renderTemplate(&error);
         if (!image.isNull()) m_txPreview->setSourceImage(image);
@@ -487,6 +584,7 @@ void MainWindow::buildUi() {
             refreshTemplates();
             const int index = m_template->findData(id);
             if (index >= 0) m_template->setCurrentIndex(index);
+            refreshTemplateCanvas();
             statusBar()->showMessage(QStringLiteral("模板预设已保存"), 4000);
         });
     });
@@ -552,9 +650,49 @@ void MainWindow::buildUi() {
     txPreviewLayout->setContentsMargins(0, 0, 0, 0);
     txPreviewLayout->setSpacing(5);
     m_txPreview = makePreview(txPreviewColumn);
-    m_txPreview->setMinimumSize(330, 230);
-    m_txPreview->setStyleSheet(QStringLiteral("QLabel { background:#ffffff; color:#87939b; border:1px solid #9da6ad; border-radius:0; }"));
-    txPreviewLayout->addWidget(m_txPreview, 4);
+    m_txPreview->hide(); // retained as the rasterized transmit image source
+    m_templateCanvas = new TemplateCanvas(txPreviewColumn);
+    m_templateCanvas->setMinimumSize(330, 230);
+    m_templateCanvas->setStyleSheet(QStringLiteral("background:#101923; border:1px solid #9da6ad;"));
+    txPreviewLayout->addWidget(m_templateCanvas, 4);
+    m_templateCanvas->setComponentsChangedCallback([this](const QJsonArray &updated) {
+        const QString selectedId = m_template ? m_template->currentData().toString() : QString();
+        for (int i = 0; i < m_templates.size(); ++i) {
+            QJsonObject item = m_templates.at(i).toObject();
+            if (item.value(QStringLiteral("id")).toString() == selectedId) {
+                item.insert(QStringLiteral("components"), updated);
+                m_templates.replace(i, item);
+                break;
+            }
+        }
+        bool listOutOfSync = !m_templateComponentList || m_templateComponentList->count() != updated.size();
+        if (!listOutOfSync && m_templateComponentList) {
+            for (int i = 0; i < updated.size(); ++i) {
+                if (m_templateComponentList->item(i)->data(Qt::UserRole).toString() != updated.at(i).toObject().value(QStringLiteral("id")).toString()) {
+                    listOutOfSync = true;
+                    break;
+                }
+            }
+        }
+        if (listOutOfSync) refreshTemplateComponentList();
+        if (m_templateCanvas && m_templateComponentList && m_templateCanvas->selectedIndex() != m_templateComponentList->currentRow())
+            m_templateCanvas->setSelectedIndex(m_templateComponentList->currentRow());
+        const int selectedIndex = m_templateCanvas ? m_templateCanvas->selectedIndex() : -1;
+        const QJsonArray currentComponents = selectedTemplate().value(QStringLiteral("components")).toArray();
+        if (selectedIndex >= 0 && selectedIndex < currentComponents.size()) {
+            const QJsonObject selectedComponent = currentComponents.at(selectedIndex).toObject();
+            const QSignalBlocker scaleBlocker(m_componentScaleSlider), fontBlocker(m_componentFontSlider);
+            if (m_componentScaleSlider) m_componentScaleSlider->setValue(qBound(5, selectedComponent.value(QStringLiteral("scale")).toInt(35), 100));
+            if (m_componentFontSlider) m_componentFontSlider->setValue(qBound(6, selectedComponent.value(QStringLiteral("fontSize")).toInt(28), 160));
+        }
+        if (m_templateComponentsSummary) m_templateComponentsSummary->setText(QStringLiteral("修改已更新到当前预设，点击‘保存预设’后写入配置。"));
+    });
+    m_templateCanvas->setSelectionChangedCallback([this](int index) {
+        if (!m_templateComponentList) return;
+        const QSignalBlocker blocker(m_templateComponentList);
+        m_templateComponentList->setCurrentRow(index);
+        refreshInlineTemplateEditor();
+    });
     auto *qsoBox = new QGroupBox(QStringLiteral("本次 QSO 信息"), txPreviewColumn);
     auto *qsoGrid = new QGridLayout(qsoBox);
     qsoGrid->setContentsMargins(7, 7, 7, 7);
@@ -602,65 +740,136 @@ void MainWindow::buildUi() {
     qsoGrid->setColumnStretch(1, 1);
     qsoGrid->setColumnStretch(2, 1);
     txPreviewLayout->addWidget(qsoBox, 1);
+    const QList<QLineEdit *> liveTemplateFields = {m_callsign, m_hisCall, m_qth, m_locator, m_report, m_message};
+    for (QLineEdit *field : liveTemplateFields) {
+        connect(field, &QLineEdit::textChanged, this, [this] { refreshTemplateCanvas(); });
+    }
 
     auto *templateEditor = new QGroupBox(QStringLiteral("模板组件 / 属性"), txMain);
     auto *editorLayout = new QVBoxLayout(templateEditor);
-    m_templateComponentsSummary = new QLabel(QStringLiteral("选择模板后显示组件概要。"), templateEditor);
+    editorLayout->setContentsMargins(7, 8, 7, 7);
+    editorLayout->setSpacing(5);
+    m_templateComponentsSummary = new QLabel(QStringLiteral("模板组件"), templateEditor);
     m_templateComponentsSummary->setWordWrap(true);
     m_templateComponentsSummary->setStyleSheet(QStringLiteral("color:#6d7982; font-size:8pt;"));
     editorLayout->addWidget(m_templateComponentsSummary);
+    auto *componentActions = new QHBoxLayout();
+    auto *addText = new QPushButton(QStringLiteral("＋ 文字"), templateEditor);
+    auto *addImage = new QPushButton(QStringLiteral("＋ 图库图像"), templateEditor);
+    auto *addLastRX = new QPushButton(QStringLiteral("＋ 上次接收图像"), templateEditor);
+    auto *clearBg = new QPushButton(QStringLiteral("清除底图"), templateEditor);
+    componentActions->addWidget(addText);
+    componentActions->addWidget(addImage);
+    componentActions->addWidget(addLastRX);
+    componentActions->addWidget(clearBg);
+    editorLayout->addLayout(componentActions);
     m_templateComponentList = new QListWidget(templateEditor);
     m_templateComponentList->setViewMode(QListView::IconMode);
     m_templateComponentList->setFlow(QListView::LeftToRight);
     m_templateComponentList->setWrapping(true);
     m_templateComponentList->setResizeMode(QListView::Adjust);
     m_templateComponentList->setMovement(QListView::Static);
-    m_templateComponentList->setGridSize(QSize(150, 42));
-    m_templateComponentList->setMinimumHeight(86);
-    m_templateComponentList->setMaximumHeight(122);
-    m_templateComponentList->setStyleSheet(QStringLiteral("QListWidget { background:#f8f9fa; border:1px solid #c4cbd0; } QListWidget::item { padding:5px; border-bottom:1px solid #e1e5e8; } QListWidget::item:selected { background:#dceef5; color:#315c70; }"));
-    editorLayout->addWidget(m_templateComponentList, 2);
-    m_templatePropertiesTable = new QTableWidget(templateEditor);
-    m_templatePropertiesTable->setColumnCount(2);
-    m_templatePropertiesTable->setRowCount(0);
-    m_templatePropertiesTable->setHorizontalHeaderLabels({QStringLiteral("属性"), QStringLiteral("值")});
-    m_templatePropertiesTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    m_templatePropertiesTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    m_templatePropertiesTable->verticalHeader()->hide();
-    m_templatePropertiesTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_templatePropertiesTable->setSelectionMode(QAbstractItemView::NoSelection);
-    m_templatePropertiesTable->setMaximumHeight(190);
-    editorLayout->addWidget(m_templatePropertiesTable, 2);
-    auto *editHint = new QLabel(QStringLiteral("模板支持文字、图库图像和上次 RX 图层。可打开组件编辑器调整位置、字号、颜色及图层顺序。"), templateEditor);
-    editHint->setWordWrap(true);
-    editHint->setStyleSheet(QStringLiteral("color:#687780; font-size:8pt; padding:5px; background:#e9eef1; border:1px solid #cbd3d8;"));
-    editorLayout->addWidget(editHint);
-    auto *editComponents = new QPushButton(QStringLiteral("打开组件编辑器…"), templateEditor);
-    editorLayout->addWidget(editComponents);
+    m_templateComponentList->setGridSize(QSize(132, 36));
+    m_templateComponentList->setMinimumHeight(65);
+    m_templateComponentList->setMaximumHeight(105);
+    m_templateComponentList->setStyleSheet(QStringLiteral("QListWidget { background:#f8f9fa; border:1px solid #c4cbd0; } QListWidget::item { padding:4px; border-bottom:1px solid #e1e5e8; } QListWidget::item:selected { background:#dceef5; color:#315c70; }"));
+    editorLayout->addWidget(m_templateComponentList);
+
+    auto *propertyForm = new QFormLayout();
+    propertyForm->setContentsMargins(0, 3, 0, 0);
+    propertyForm->setHorizontalSpacing(7);
+    propertyForm->setVerticalSpacing(4);
+    m_componentTextEdit = new QTextEdit(templateEditor);
+    m_componentTextEdit->setPlaceholderText(QStringLiteral("文字内容 / {MYCALL} / {LOCATOR}"));
+    m_componentTextEdit->setMaximumHeight(54);
+    propertyForm->addRow(QStringLiteral("文字内容"), m_componentTextEdit);
+    m_componentAssetCombo = makeCombo(templateEditor, {});
+    propertyForm->addRow(QStringLiteral("图库图像"), m_componentAssetCombo);
+    m_componentScaleSlider = new QSlider(Qt::Horizontal, templateEditor);
+    m_componentScaleSlider->setRange(5, 100);
+    propertyForm->addRow(QStringLiteral("图像缩放"), m_componentScaleSlider);
+    m_componentFontSlider = new QSlider(Qt::Horizontal, templateEditor);
+    m_componentFontSlider->setRange(6, 160);
+    propertyForm->addRow(QStringLiteral("文字字号"), m_componentFontSlider);
+    m_componentOutlineSlider = new QSlider(Qt::Horizontal, templateEditor);
+    m_componentOutlineSlider->setRange(0, 20);
+    propertyForm->addRow(QStringLiteral("描边宽度"), m_componentOutlineSlider);
+    editorLayout->addLayout(propertyForm);
+    auto *colorRow = new QHBoxLayout();
+    m_componentColorButton = new QPushButton(QStringLiteral("文字颜色"), templateEditor);
+    m_componentOutlineColorButton = new QPushButton(QStringLiteral("描边颜色"), templateEditor);
+    colorRow->addWidget(m_componentColorButton);
+    colorRow->addWidget(m_componentOutlineColorButton);
+    editorLayout->addLayout(colorRow);
+    auto *flagsRow = new QHBoxLayout();
+    m_componentBoldCheck = new QCheckBox(QStringLiteral("粗体"), templateEditor);
+    m_componentVisibleCheck = new QCheckBox(QStringLiteral("显示"), templateEditor);
+    m_componentOutlineCheck = new QCheckBox(QStringLiteral("描边"), templateEditor);
+    flagsRow->addWidget(m_componentBoldCheck);
+    flagsRow->addWidget(m_componentVisibleCheck);
+    flagsRow->addWidget(m_componentOutlineCheck);
+    flagsRow->addStretch();
+    auto *deleteComponent = new QPushButton(QStringLiteral("删除组件"), templateEditor);
+    deleteComponent->setProperty("role", "danger");
+    flagsRow->addWidget(deleteComponent);
+    editorLayout->addLayout(flagsRow);
+    m_componentEditorHint = new QLabel(QStringLiteral("可直接拖动画布中的组件移动位置，拖动右下角控制点调整字号或图像比例。"), templateEditor);
+    m_componentEditorHint->setWordWrap(true);
+    m_componentEditorHint->setStyleSheet(QStringLiteral("color:#687780; font-size:8pt; padding:4px; background:#e9eef1; border:1px solid #cbd3d8;"));
+    editorLayout->addWidget(m_componentEditorHint);
+
     connect(m_templateComponentList, &QListWidget::currentRowChanged, this, [this](int row) {
-        if (!m_templatePropertiesTable) return;
-        m_templatePropertiesTable->setRowCount(0);
-        const QJsonArray components = selectedTemplate().value(QStringLiteral("components")).toArray();
-        if (row < 0 || row >= components.size()) return;
-        const QJsonObject component = components.at(row).toObject();
-        const QString type = component.value(QStringLiteral("type")).toString();
-        const QList<QPair<QString, QString>> values = {
-            {QStringLiteral("类型"), type == QStringLiteral("text") ? QStringLiteral("文字") : type == QStringLiteral("image") ? QStringLiteral("图库图像") : QStringLiteral("上次 RX 图像")},
-            {QStringLiteral("内容 / 来源"), valueOr(component, QStringLiteral("text"), valueOr(component, QStringLiteral("assetId"), QStringLiteral("--")))},
-            {QStringLiteral("X / Y"), QStringLiteral("%1% / %2%格").arg(component.value(QStringLiteral("x")).toDouble(), 0, 'f', 1).arg(component.value(QStringLiteral("y")).toDouble(), 0, 'f', 1)},
-            {QStringLiteral("字号"), QString::number(component.value(QStringLiteral("fontSize")).toDouble(0), 'f', 0)},
-            {QStringLiteral("缩放"), QStringLiteral("%1%").arg(component.value(QStringLiteral("scale")).toDouble(0), 0, 'f', 1)},
-            {QStringLiteral("显示 / 描边"), QStringLiteral("%1 / %2").arg(component.value(QStringLiteral("visible")).toBool(true) ? QStringLiteral("显示") : QStringLiteral("隐藏"), component.value(QStringLiteral("outline")).toBool() ? QStringLiteral("开启") : QStringLiteral("关闭"))}
-        };
-        for (const auto &entry : values) {
-            const int newRow = m_templatePropertiesTable->rowCount();
-            m_templatePropertiesTable->insertRow(newRow);
-            m_templatePropertiesTable->setItem(newRow, 0, new QTableWidgetItem(entry.first));
-            m_templatePropertiesTable->setItem(newRow, 1, new QTableWidgetItem(entry.second));
-        }
+        if (m_templateCanvas) m_templateCanvas->setSelectedIndex(row);
+        refreshInlineTemplateEditor();
     });
-    connect(editComponents, &QPushButton::clicked, this, [this] { editSelectedTemplate(); });
-    editorLayout->addStretch();
+    connect(addText, &QPushButton::clicked, this, [this] { addInlineTemplateComponent(QStringLiteral("text")); });
+    connect(addImage, &QPushButton::clicked, this, [this] { selectInlineGalleryAsset(); });
+    connect(addLastRX, &QPushButton::clicked, this, [this] { addInlineTemplateComponent(QStringLiteral("last-rx-image")); });
+    connect(clearBg, &QPushButton::clicked, this, [this] {
+        m_settings.remove(QStringLiteral("templateBackgroundAssetId"));
+        saveSettings(m_settings);
+        m_templateImageCache.clear();
+        refreshTemplateCanvas();
+    });
+    connect(deleteComponent, &QPushButton::clicked, this, [this] {
+        const int row = m_templateComponentList ? m_templateComponentList->currentRow() : -1;
+        QJsonObject tpl = selectedTemplate();
+        QJsonArray components = tpl.value(QStringLiteral("components")).toArray();
+        if (row < 0 || row >= components.size()) return;
+        components.removeAt(row);
+        tpl.insert(QStringLiteral("components"), components);
+        const QString id = tpl.value(QStringLiteral("id")).toString();
+        for (int i=0;i<m_templates.size();++i) if(m_templates.at(i).toObject().value(QStringLiteral("id")).toString()==id){m_templates.replace(i,tpl);break;}
+        refreshTemplateComponentList();
+        refreshTemplateCanvas();
+    });
+    auto propertyChanged = [this] { applyInlineTemplateProperties(); };
+    connect(m_componentTextEdit, &QTextEdit::textChanged, this, propertyChanged);
+    connect(m_componentAssetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, propertyChanged);
+    connect(m_componentScaleSlider, &QSlider::valueChanged, this, propertyChanged);
+    connect(m_componentFontSlider, &QSlider::valueChanged, this, propertyChanged);
+    connect(m_componentOutlineSlider, &QSlider::valueChanged, this, propertyChanged);
+    connect(m_componentBoldCheck, &QCheckBox::toggled, this, propertyChanged);
+    connect(m_componentVisibleCheck, &QCheckBox::toggled, this, propertyChanged);
+    connect(m_componentOutlineCheck, &QCheckBox::toggled, this, propertyChanged);
+    connect(m_componentColorButton, &QPushButton::clicked, this, [this] {
+        const auto component = selectedTemplate().value(QStringLiteral("components")).toArray().at(m_templateComponentList->currentRow()).toObject();
+        QColor color(valueOr(component, QStringLiteral("color"), QStringLiteral("#ffffff")));
+        color = QColorDialog::getColor(color, this, QStringLiteral("文字颜色"));
+        if (!color.isValid()) return;
+        m_componentColorButton->setProperty("color", color.name(QColor::HexRgb));
+        m_componentColorButton->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(color.name(), color.lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
+        applyInlineTemplateProperties();
+    });
+    connect(m_componentOutlineColorButton, &QPushButton::clicked, this, [this] {
+        const auto component = selectedTemplate().value(QStringLiteral("components")).toArray().at(m_templateComponentList->currentRow()).toObject();
+        QColor color(valueOr(component, QStringLiteral("outlineColor"), QStringLiteral("#000000")));
+        color = QColorDialog::getColor(color, this, QStringLiteral("描边颜色"));
+        if (!color.isValid()) return;
+        m_componentOutlineColorButton->setProperty("color", color.name(QColor::HexRgb));
+        m_componentOutlineColorButton->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(color.name(), color.lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
+        applyInlineTemplateProperties();
+    });
     txMain->addWidget(txPreviewColumn);
     txMain->addWidget(templateEditor);
     txMain->setStretchFactor(0, 3);
@@ -680,7 +889,7 @@ void MainWindow::buildUi() {
     txLayout->addLayout(txSpectrumTitle);
     m_txSpectrumStatus = new QLabel(QStringLiteral("等待 TX 音频"), txPane);
     m_txSpectrumStatus->setStyleSheet(QStringLiteral("font-size:8pt; color:#77858f;"));
-    txLayout->addWidget(m_txSpectrumStatus);
+    m_txSpectrumStatus->hide();
     m_txSpectrum = new SpectrumWaterfallWidget(txPane);
     m_txSpectrum->setMinimumHeight(95);
     m_txSpectrum->setMaximumHeight(155);
@@ -778,6 +987,32 @@ void MainWindow::loadInitialState() {
         statusBar()->showMessage(QStringLiteral("设置读取失败，使用默认值：%1").arg(error));
     }
     m_settings = settings;
+    QJsonObject waterfall = settings.value(QStringLiteral("waterfall")).toObject();
+    if (waterfall.isEmpty()) {
+        waterfall.insert(QStringLiteral("minFrequencyHz"), 0);
+        waterfall.insert(QStringLiteral("maxFrequencyHz"), 5000);
+        waterfall.insert(QStringLiteral("minDbfs"), -110);
+        waterfall.insert(QStringLiteral("maxDbfs"), -20);
+        waterfall.insert(QStringLiteral("rowsPerSecond"), 15);
+        waterfall.insert(QStringLiteral("historySeconds"), 20);
+        waterfall.insert(QStringLiteral("backgroundColor"), QStringLiteral("#07111b"));
+        waterfall.insert(QStringLiteral("lowColor"), QStringLiteral("#153a78"));
+        waterfall.insert(QStringLiteral("midColor"), QStringLiteral("#168fae"));
+        waterfall.insert(QStringLiteral("highColor"), QStringLiteral("#39c6b0"));
+        waterfall.insert(QStringLiteral("peakColor"), QStringLiteral("#f7d45b"));
+        m_settings.insert(QStringLiteral("waterfall"), waterfall);
+    }
+    if (m_rxSpectrum) m_rxSpectrum->setDisplaySettings(waterfall);
+    if (m_txSpectrum) m_txSpectrum->setDisplaySettings(waterfall);
+    const QString locale = valueOr(settings, QStringLiteral("language"), QStringLiteral("zh-CN"));
+    if (m_backend && m_backend->isRunning()) {
+        QString localeError;
+        m_localeDictionary = m_backend->callSync(QStringLiteral("GetLocaleDictionary"), QJsonArray{locale}, &localeError, 5000).toObject();
+    }
+    if (m_languageSelect) {
+        const QSignalBlocker blocker(m_languageSelect);
+        m_languageSelect->setCurrentIndex(locale == QStringLiteral("en") ? 1 : locale.startsWith(QStringLiteral("ja")) ? 2 : 0);
+    }
     m_callsign->setText(valueOr(settings, QStringLiteral("callsign"), QStringLiteral("N0CALL")));
     m_locator->setText(valueOr(settings, QStringLiteral("locator"), QStringLiteral("JJ00")));
     m_ax25SSID->setValue(settings.value(QStringLiteral("ax25Ssid")).toInt(0));
@@ -813,10 +1048,19 @@ void MainWindow::loadInitialState() {
     }
     const QString quality = valueOr(settings, QStringLiteral("quality"), QStringLiteral("medium"));
     m_quality->setCurrentIndex(quality == QStringLiteral("low") ? 0 : quality == QStringLiteral("high") ? 2 : 1);
-    connect(m_quality, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) { m_settings.insert(QStringLiteral("quality"),index==0?QStringLiteral("low"):index==2?QStringLiteral("high"):QStringLiteral("medium")); saveSettings(m_settings); });
+    m_repeatIntervalSeconds = m_repeatInterval->value();
+    m_repeatInterval->setEnabled(!m_repeat->isChecked());
+    connect(m_quality, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        m_settings.insert(QStringLiteral("quality"),index==0?QStringLiteral("low"):index==2?QStringLiteral("high"):QStringLiteral("medium"));
+        saveSettings(m_settings);
+        refreshTemplateCanvas();
+    });
+    connect(m_repeatInterval, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) { if (!m_repeat->isChecked()) m_repeatIntervalSeconds = value; });
     refreshTemplates();
     refreshGallery();
     refreshAlbum();
+    refreshTemplateCanvas();
+    refreshInlineTemplateEditor();
     QString initialTemplateError;
     const QImage initialTemplate = renderTemplate(&initialTemplateError);
     if (!initialTemplate.isNull()) m_txPreview->setSourceImage(initialTemplate);
@@ -843,30 +1087,32 @@ void MainWindow::refreshLatestRXPreview() {
 }
 
 void MainWindow::refreshStatus() {
-    if (m_statusRequestPending) return;
+    if (m_statusRequestPending || !m_backend || !m_backend->isRunning()) return;
     m_statusRequestPending = true;
     m_backend->call(QStringLiteral("GetAudioState"), {}, [this](bool ok, const QJsonValue &value, const QString &error) {
         m_statusRequestPending = false;
         if (!ok) {
             m_audioStatus->setText(QStringLiteral("音频后端异常"));
             m_audioStatus->setToolTip(error);
-            m_audioStatus->setStyleSheet(QStringLiteral("background:#4d2730; padding:8px; border-radius:6px;"));
+            m_audioStatus->setStyleSheet(QStringLiteral("background:#f8eeee; border:1px solid #d7b2b7; padding:6px 10px; color:#98545c;"));
             return;
         }
         const QJsonObject state = value.toObject();
         const bool connected = state.value(QStringLiteral("connected")).toBool();
-        const bool rx = state.value(QStringLiteral("rxActive")).toBool();
-        const bool tx = state.value(QStringLiteral("txActive")).toBool();
+        m_rxActive = state.value(QStringLiteral("rxActive")).toBool();
+        m_txActive = state.value(QStringLiteral("txActive")).toBool();
         const int rate = state.value(QStringLiteral("sampleRate")).toInt();
         m_audioStatus->setText(QStringLiteral("音频：%1 · %2 Hz · RX %3 / TX %4")
             .arg(connected ? QStringLiteral("已连接") : QStringLiteral("未初始化"))
             .arg(rate)
-            .arg(rx ? QStringLiteral("运行") : QStringLiteral("待机"))
-            .arg(tx ? QStringLiteral("运行") : QStringLiteral("待机")));
+            .arg(m_rxActive ? QStringLiteral("运行") : QStringLiteral("待机"))
+            .arg(m_txActive ? QStringLiteral("运行") : QStringLiteral("待机")));
         m_audioStatus->setStyleSheet(connected
-            ? QStringLiteral("background:#173b32; border:1px solid #2c8b6a; padding:8px 12px; border-radius:6px;")
-            : QStringLiteral("background:#3d3030; border:1px solid #805050; padding:8px 12px; border-radius:6px;"));
+            ? QStringLiteral("background:#e4f0e9; border:1px solid #a9c8b5; padding:6px 10px; color:#47735a;")
+            : QStringLiteral("background:#f7eddb; border:1px solid #ddc99f; padding:6px 10px; color:#8a6732;"));
         m_audioStatus->setToolTip(state.value(QStringLiteral("error")).toString());
+        updateRXToggle();
+        updateTXToggle();
     });
 }
 
@@ -880,29 +1126,357 @@ void MainWindow::refreshTemplates() {
     if (index >= 0) m_template->setCurrentIndex(index);
     if (m_templateName) m_templateName->setText(m_template->currentText());
     refreshTemplateComponentList();
+    refreshTemplateCanvas();
 }
 
 void MainWindow::refreshTemplateComponentList() {
     const QJsonObject selected = selectedTemplate();
     const QJsonArray components = selected.value(QStringLiteral("components")).toArray();
     if (m_templateComponentsSummary) {
-        m_templateComponentsSummary->setText(QStringLiteral("%1 · %2 个组件 · 可打开组件编辑器调整图层、文本和图像属性。")
+        m_templateComponentsSummary->setText(QStringLiteral("%1 · %2 个组件 · 拖动右侧预览画布中的图层可调整位置")
             .arg(selected.value(QStringLiteral("name")).toString(), QString::number(components.size())));
     }
     if (!m_templateComponentList) return;
+    const QString selectedComponentId = m_templateComponentList->currentItem()
+        ? m_templateComponentList->currentItem()->data(Qt::UserRole).toString() : QString();
+    const QSignalBlocker blocker(m_templateComponentList);
     m_templateComponentList->clear();
+    int preferredRow = -1;
     for (int i = 0; i < components.size(); ++i) {
         const QJsonObject component = components.at(i).toObject();
         const QString type = component.value(QStringLiteral("type")).toString();
+        const QString id = component.value(QStringLiteral("id")).toString();
+        QString label = type == QStringLiteral("text")
+            ? QStringLiteral("T · %1").arg(valueOr(component, QStringLiteral("text"), QStringLiteral("文字组件")))
+            : type == QStringLiteral("image") ? QStringLiteral("IMG · %1").arg(valueOr(component, QStringLiteral("assetName"), valueOr(component, QStringLiteral("assetId"), QStringLiteral("图库图像"))))
+            : QStringLiteral("RX · 上次接收图像");
+        auto *item = new QListWidgetItem(label.left(34), m_templateComponentList);
+        item->setData(Qt::UserRole, id);
+        if (id == selectedComponentId) preferredRow = i;
+    }
+    if (preferredRow < 0 && !components.isEmpty()) preferredRow = 0;
+    m_templateComponentList->setCurrentRow(preferredRow);
+    refreshInlineTemplateEditor();
+}
+
+void MainWindow::refreshTemplateCanvas() {
+    if (!m_templateCanvas) return;
+    const QJsonObject selected = selectedTemplate();
+    const QJsonArray components = selected.value(QStringLiteral("components")).toArray();
+    QImage background(640, 480, QImage::Format_ARGB32_Premultiplied);
+    background.fill(QColor(QStringLiteral("#17232d")));
+    const QString backgroundId = valueOr(m_settings, QStringLiteral("templateBackgroundAssetId"));
+    if (!backgroundId.isEmpty() && m_backend && m_backend->isRunning()) {
+        const QString cacheKey = QStringLiteral("background:%1").arg(backgroundId);
+        if (!m_templateImageCache.contains(cacheKey)) {
+            QString error;
+            const QString data = m_backend->callSync(QStringLiteral("GetGalleryImageData"), QJsonArray{backgroundId}, &error, 5000).toString();
+            if (error.isEmpty()) m_templateImageCache.insert(cacheKey, imageFromDataUrl(data));
+        }
+        const QImage source = m_templateImageCache.value(cacheKey);
+        if (!source.isNull()) {
+            QPainter painter(&background);
+            const qreal factor = qMax(background.width() / qreal(source.width()), background.height() / qreal(source.height()));
+            const QSizeF scaled(source.width() * factor, source.height() * factor);
+            painter.drawImage(QRectF((background.width() - scaled.width()) / 2.0,
+                                     (background.height() - scaled.height()) / 2.0,
+                                     scaled.width(), scaled.height()), source);
+        }
+    }
+    QHash<QString, QImage> images;
+    if (m_backend && m_backend->isRunning()) {
+        for (const QJsonValue &value : components) {
+            const QJsonObject component = value.toObject();
+            const QString id = component.value(QStringLiteral("id")).toString();
+            const QString type = component.value(QStringLiteral("type")).toString();
+            if (id.isEmpty() || (type != QStringLiteral("image") && type != QStringLiteral("last-rx-image"))) continue;
+            const QString cacheKey = type == QStringLiteral("image")
+                ? QStringLiteral("gallery:%1").arg(component.value(QStringLiteral("assetId")).toString())
+                : QStringLiteral("last-rx");
+            if (!m_templateImageCache.contains(cacheKey)) {
+                QString error;
+                const QString data = type == QStringLiteral("image")
+                    ? m_backend->callSync(QStringLiteral("GetGalleryImageData"), QJsonArray{component.value(QStringLiteral("assetId")).toString()}, &error, 5000).toString()
+                    : m_backend->callSync(QStringLiteral("GetLatestRXImageData"), {}, &error, 5000).toString();
+                if (error.isEmpty()) m_templateImageCache.insert(cacheKey, imageFromDataUrl(data));
+            }
+            images.insert(id, m_templateImageCache.value(cacheKey));
+        }
+    }
+    m_templateCanvas->setDocument(components, background, images,
+        [this](const QString &text) { return resolveTemplateText(text); });
+    if (m_templateComponentList && m_templateComponentList->currentRow() >= 0)
+        m_templateCanvas->setSelectedIndex(m_templateComponentList->currentRow());
+}
+
+void MainWindow::refreshInlineTemplateEditor() {
+    if (!m_templateComponentList) return;
+    const int row = m_templateComponentList->currentRow();
+    const QJsonArray components = selectedTemplate().value(QStringLiteral("components")).toArray();
+    const bool valid = row >= 0 && row < components.size();
+    const QJsonObject component = valid ? components.at(row).toObject() : QJsonObject();
+    const QString type = component.value(QStringLiteral("type")).toString();
+    const bool isText = valid && type == QStringLiteral("text");
+    const bool isImage = valid && type == QStringLiteral("image");
+    const bool isImageLayer = isImage || (valid && type == QStringLiteral("last-rx-image"));
+    const QSignalBlocker b1(m_componentTextEdit), b2(m_componentAssetCombo), b3(m_componentScaleSlider),
+        b4(m_componentFontSlider), b5(m_componentOutlineSlider), b6(m_componentBoldCheck),
+        b7(m_componentVisibleCheck), b8(m_componentOutlineCheck);
+    if (m_componentTextEdit) {
+        m_componentTextEdit->setPlainText(component.value(QStringLiteral("text")).toString());
+        m_componentTextEdit->setEnabled(isText);
+    }
+    if (m_componentAssetCombo) {
+        m_componentAssetCombo->clear();
+        for (const QJsonValue &assetValue : m_gallery) {
+            const QJsonObject asset = assetValue.toObject();
+            m_componentAssetCombo->addItem(valueOr(asset, QStringLiteral("name"), asset.value(QStringLiteral("id")).toString()), asset.value(QStringLiteral("id")).toString());
+        }
+        const int assetIndex = m_componentAssetCombo->findData(component.value(QStringLiteral("assetId")).toString());
+        if (assetIndex >= 0) m_componentAssetCombo->setCurrentIndex(assetIndex);
+        m_componentAssetCombo->setEnabled(isImage);
+    }
+    if (m_componentScaleSlider) { m_componentScaleSlider->setValue(qBound(5, component.value(QStringLiteral("scale")).toInt(35), 100)); m_componentScaleSlider->setEnabled(isImageLayer); }
+    if (m_componentFontSlider) { m_componentFontSlider->setValue(qBound(6, component.value(QStringLiteral("fontSize")).toInt(28), 160)); m_componentFontSlider->setEnabled(isText); }
+    if (m_componentOutlineSlider) { m_componentOutlineSlider->setValue(qBound(0, component.value(QStringLiteral("outlineWidth")).toInt(2), 20)); m_componentOutlineSlider->setEnabled(valid); }
+    if (m_componentBoldCheck) { m_componentBoldCheck->setChecked(component.value(QStringLiteral("bold")).toBool()); m_componentBoldCheck->setEnabled(isText); }
+    if (m_componentVisibleCheck) { m_componentVisibleCheck->setChecked(component.value(QStringLiteral("visible")).toBool(true)); m_componentVisibleCheck->setEnabled(valid); }
+    if (m_componentOutlineCheck) { m_componentOutlineCheck->setChecked(component.value(QStringLiteral("outline")).toBool(true)); m_componentOutlineCheck->setEnabled(valid); }
+    const QString color = valueOr(component, QStringLiteral("color"), QStringLiteral("#ffffff"));
+    const QString outline = valueOr(component, QStringLiteral("outlineColor"), QStringLiteral("#000000"));
+    if (m_componentColorButton) {
+        m_componentColorButton->setEnabled(isText);
+        m_componentColorButton->setProperty("color", color);
+        m_componentColorButton->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(color, QColor(color).lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
+    }
+    if (m_componentOutlineColorButton) {
+        m_componentOutlineColorButton->setEnabled(valid);
+        m_componentOutlineColorButton->setProperty("color", outline);
+        m_componentOutlineColorButton->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(outline, QColor(outline).lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
+    }
+    if (m_componentEditorHint) m_componentEditorHint->setText(!valid ? QStringLiteral("选择一个组件后即可修改属性。") : isText ? QStringLiteral("文字组件：支持变量替换、字号、颜色、粗体和描边。拖动画布可移动位置。") : QStringLiteral("图像组件：可调整等比例缩放、可见性和描边。拖动画布可移动位置。"));
+}
+
+void MainWindow::applyInlineTemplateProperties() {
+    const int row = m_templateComponentList ? m_templateComponentList->currentRow() : -1;
+    QJsonObject tpl = selectedTemplate();
+    QJsonArray components = tpl.value(QStringLiteral("components")).toArray();
+    if (row < 0 || row >= components.size()) return;
+    QJsonObject component = components.at(row).toObject();
+    const QString type = component.value(QStringLiteral("type")).toString();
+    if (type == QStringLiteral("text")) {
+        component.insert(QStringLiteral("text"), m_componentTextEdit->toPlainText());
+        component.insert(QStringLiteral("fontSize"), m_componentFontSlider->value());
+        component.insert(QStringLiteral("bold"), m_componentBoldCheck->isChecked());
+        component.insert(QStringLiteral("color"), m_componentColorButton->property("color").toString());
+    } else {
+        component.insert(QStringLiteral("scale"), m_componentScaleSlider->value());
+        if (type == QStringLiteral("image")) component.insert(QStringLiteral("assetId"), m_componentAssetCombo->currentData().toString());
+    }
+    component.insert(QStringLiteral("outlineWidth"), m_componentOutlineSlider->value());
+    component.insert(QStringLiteral("outlineColor"), m_componentOutlineColorButton->property("color").toString());
+    component.insert(QStringLiteral("visible"), m_componentVisibleCheck->isChecked());
+    component.insert(QStringLiteral("outline"), m_componentOutlineCheck->isChecked());
+    components.replace(row, component);
+    tpl.insert(QStringLiteral("components"), components);
+    const QString id = tpl.value(QStringLiteral("id")).toString();
+    for (int i=0;i<m_templates.size();++i) if(m_templates.at(i).toObject().value(QStringLiteral("id")).toString()==id){m_templates.replace(i,tpl);break;}
+    if (m_templateComponentList->currentItem()) {
         const QString label = type == QStringLiteral("text")
             ? QStringLiteral("T · %1").arg(valueOr(component, QStringLiteral("text"), QStringLiteral("文字组件")))
-            : type == QStringLiteral("image") ? QStringLiteral("IMG · %1").arg(valueOr(component, QStringLiteral("assetId"), QStringLiteral("图库图像")))
+            : type == QStringLiteral("image") ? QStringLiteral("IMG · %1").arg(m_componentAssetCombo->currentText().isEmpty() ? valueOr(component, QStringLiteral("assetId"), QStringLiteral("图库图像")) : m_componentAssetCombo->currentText())
             : QStringLiteral("RX · 上次接收图像");
-        auto *item = new QListWidgetItem(label, m_templateComponentList);
-        item->setData(Qt::UserRole, i);
+        m_templateComponentList->currentItem()->setText(label.left(34));
     }
-    if (!components.isEmpty()) m_templateComponentList->setCurrentRow(0);
-    else if (m_templatePropertiesTable) m_templatePropertiesTable->setRowCount(0);
+    refreshTemplateCanvas();
+}
+
+void MainWindow::addInlineTemplateComponent(const QString &type, const QString &assetId) {
+    QJsonObject tpl = selectedTemplate();
+    if (tpl.isEmpty()) { statusBar()->showMessage(QStringLiteral("请先选择发射模板"), 4000); return; }
+    QJsonArray components = tpl.value(QStringLiteral("components")).toArray();
+    if (components.size() >= 64) { statusBar()->showMessage(QStringLiteral("单个模板最多支持 64 个组件"), 5000); return; }
+    if (type == QStringLiteral("image") && assetId.isEmpty()) return;
+    QJsonObject component;
+    const QString id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    component.insert(QStringLiteral("id"), id);
+    component.insert(QStringLiteral("type"), type);
+    component.insert(QStringLiteral("x"), type == QStringLiteral("last-rx-image") ? 58.0 : 8.0);
+    component.insert(QStringLiteral("y"), 42.0);
+    component.insert(QStringLiteral("scale"), 35.0);
+    component.insert(QStringLiteral("fontSize"), 28.0);
+    component.insert(QStringLiteral("bold"), true);
+    component.insert(QStringLiteral("color"), QStringLiteral("#ffffff"));
+    component.insert(QStringLiteral("visible"), true);
+    component.insert(QStringLiteral("outline"), true);
+    component.insert(QStringLiteral("outlineWidth"), 2.0);
+    component.insert(QStringLiteral("outlineColor"), QStringLiteral("#000000"));
+    if (type == QStringLiteral("text")) component.insert(QStringLiteral("text"), QStringLiteral("新文本"));
+    if (type == QStringLiteral("image")) component.insert(QStringLiteral("assetId"), assetId);
+    components.append(component);
+    tpl.insert(QStringLiteral("components"), components);
+    const QString templateId = tpl.value(QStringLiteral("id")).toString();
+    for (int i=0;i<m_templates.size();++i) if(m_templates.at(i).toObject().value(QStringLiteral("id")).toString()==templateId){m_templates.replace(i,tpl);break;}
+    m_templateImageCache.clear();
+    refreshTemplateComponentList();
+    if (m_templateComponentList) m_templateComponentList->setCurrentRow(components.size()-1);
+    refreshTemplateCanvas();
+    refreshInlineTemplateEditor();
+}
+
+void MainWindow::selectInlineGalleryAsset() {
+    refreshGallery();
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("图像图库"));
+    dialog.resize(760, 560);
+    auto *root = new QVBoxLayout(&dialog);
+    auto *toolbar = new QHBoxLayout();
+    auto *title = new QLabel(QStringLiteral("选择图像资源"), &dialog);
+    title->setStyleSheet(QStringLiteral("font-weight:700; color:#344b58;"));
+    auto *importButton = new QPushButton(QStringLiteral("导入图片…"), &dialog);
+    toolbar->addWidget(title);
+    toolbar->addStretch();
+    toolbar->addWidget(importButton);
+    root->addLayout(toolbar);
+    auto *scroll = new QScrollArea(&dialog);
+    scroll->setWidgetResizable(true);
+    auto *host = new QWidget(scroll);
+    auto *grid = new QGridLayout(host);
+    grid->setContentsMargins(6, 6, 6, 6);
+    grid->setSpacing(8);
+    grid->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    scroll->setWidget(host);
+    root->addWidget(scroll, 1);
+    auto *footer = new QLabel(QStringLiteral("选择‘设为底图’设置共享背景；选择‘添加图层’将图片放入当前 TX 模板。"), &dialog);
+    footer->setStyleSheet(QStringLiteral("font-size:8pt; color:#7d8991;"));
+    root->addWidget(footer);
+    connect(importButton, &QPushButton::clicked, &dialog, [this, &dialog]() {
+        importGalleryImage();
+        refreshGallery();
+        dialog.accept();
+    });
+
+    const int columns = 3;
+    int row = 0, column = 0;
+    for (const QJsonValue &value : m_gallery) {
+        const QJsonObject asset = value.toObject();
+        const QString id = asset.value(QStringLiteral("id")).toString();
+        if (id.isEmpty()) continue;
+        auto *card = new QFrame(host);
+        card->setMinimumWidth(205);
+        card->setMaximumWidth(245);
+        card->setStyleSheet(QStringLiteral("QFrame { background:#f8f9fa; border:1px solid #c4cbd0; }"));
+        auto *cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(6, 6, 6, 6);
+        cardLayout->setSpacing(5);
+        auto *preview = new QLabel(card);
+        preview->setAlignment(Qt::AlignCenter);
+        preview->setMinimumHeight(118);
+        preview->setStyleSheet(QStringLiteral("background:#ffffff; border:1px solid #d0d6da; color:#8b959c;"));
+        preview->setText(QStringLiteral("加载预览…"));
+        cardLayout->addWidget(preview);
+        QString imageError;
+        const QString imageData = m_backend->callSync(QStringLiteral("GetGalleryImageData"), QJsonArray{id}, &imageError, 8000).toString();
+        const QImage image = imageFromDataUrl(imageData);
+        if (!image.isNull()) preview->setPixmap(QPixmap::fromImage(image).scaled(220, 118, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        else preview->setText(QStringLiteral("预览不可用"));
+        auto *name = new QLabel(valueOr(asset, QStringLiteral("name"), id), card);
+        name->setWordWrap(true);
+        name->setStyleSheet(QStringLiteral("font-size:9pt; font-weight:600; color:#44535e;"));
+        cardLayout->addWidget(name);
+        auto *size = new QLabel(QStringLiteral("%1 × %2").arg(asset.value(QStringLiteral("width")).toInt()).arg(asset.value(QStringLiteral("height")).toInt()), card);
+        size->setStyleSheet(QStringLiteral("font-size:8pt; color:#89939b;"));
+        cardLayout->addWidget(size);
+        auto *actions = new QHBoxLayout();
+        auto *setBackground = new QPushButton(QStringLiteral("设为底图"), card);
+        auto *addLayer = new QPushButton(QStringLiteral("添加图层"), card);
+        actions->addWidget(setBackground);
+        actions->addWidget(addLayer);
+        cardLayout->addLayout(actions);
+        connect(setBackground, &QPushButton::clicked, &dialog, [this, id, &dialog]() {
+            m_settings.insert(QStringLiteral("templateBackgroundAssetId"), id);
+            saveSettings(m_settings);
+            m_templateImageCache.clear();
+            refreshTemplateCanvas();
+            QString renderError;
+            const QImage rendered = renderTemplate(&renderError);
+            if (!rendered.isNull() && m_txPreview) m_txPreview->setSourceImage(rendered);
+            statusBar()->showMessage(QStringLiteral("模板共享底图已更新"), 4000);
+            dialog.accept();
+        });
+        connect(addLayer, &QPushButton::clicked, &dialog, [this, id, &dialog]() {
+            addInlineTemplateComponent(QStringLiteral("image"), id);
+            dialog.accept();
+        });
+        grid->addWidget(card, row, column);
+        ++column;
+        if (column >= columns) { column = 0; ++row; }
+    }
+    if (m_gallery.isEmpty()) {
+        auto *empty = new QLabel(QStringLiteral("图库暂无图片。请使用右上方‘导入图片’添加图像资源。"), host);
+        empty->setAlignment(Qt::AlignCenter);
+        empty->setMinimumHeight(180);
+        grid->addWidget(empty, 0, 0, 1, columns);
+    }
+    dialog.exec();
+}
+
+void MainWindow::updateRXToggle() {
+    if (!m_rxToggle) return;
+    m_rxToggle->setText(m_rxActive
+        ? m_localeDictionary.value(QStringLiteral("audio.rxOn")).toString(QStringLiteral("停止 RX"))
+        : m_localeDictionary.value(QStringLiteral("audio.rxOff")).toString(QStringLiteral("启动 RX")));
+    m_rxToggle->setProperty("role", m_rxActive ? "danger" : "primary");
+    m_rxToggle->style()->unpolish(m_rxToggle);
+    m_rxToggle->style()->polish(m_rxToggle);
+}
+
+void MainWindow::updateTXToggle() {
+    if (!m_txToggle) return;
+    m_txToggle->setText(m_txActive
+        ? m_localeDictionary.value(QStringLiteral("tx.stop")).toString(QStringLiteral("停止发射"))
+        : m_localeDictionary.value(QStringLiteral("tx.start")).toString(QStringLiteral("开始发射")));
+    m_txToggle->setProperty("role", m_txActive ? "danger" : "primary");
+    m_txToggle->setEnabled(m_backend && m_backend->isRunning() && !m_txToneActive);
+    m_txToggle->style()->unpolish(m_txToggle);
+    m_txToggle->style()->polish(m_txToggle);
+    if (m_txToneToggle) {
+        m_txToneToggle->setText(m_txToneActive
+            ? m_localeDictionary.value(QStringLiteral("tx.testToneActive")).toString(QStringLiteral("停止测试音"))
+            : m_localeDictionary.value(QStringLiteral("tx.testTone")).toString(QStringLiteral("1500 Hz 测试音")));
+        m_txToneToggle->setEnabled(m_txToneActive || (!m_txActive && m_backend && m_backend->isRunning()));
+    }
+}
+
+void MainWindow::toggleRX() { if (m_rxActive) stopRX(); else startRX(); }
+void MainWindow::toggleTX() {
+    if (m_txActive) {
+        m_backend->call(QStringLiteral("StopTX"), {}, [this](bool ok, const QJsonValue &, const QString &error) {
+            if (!ok) showError(error);
+        });
+    } else {
+        startTX();
+    }
+}
+
+void MainWindow::applyLanguage(const QString &locale) {
+    if (!m_backend || !m_backend->isRunning()) return;
+    m_settings.insert(QStringLiteral("language"), locale);
+    saveSettings(m_settings);
+    QString error;
+    const QJsonObject dictionary = m_backend->callSync(QStringLiteral("GetLocaleDictionary"), QJsonArray{locale}, &error, 5000).toObject();
+    if (error.isEmpty()) m_localeDictionary = dictionary;
+    if (!error.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("语言设置已保存；部分界面文本将在下次版本完善。"), 5000);
+        return;
+    }
+    const QString workbench = valueOr(dictionary, QStringLiteral("nav.workbench"), locale == QStringLiteral("en") ? QStringLiteral("Workbench") : locale.startsWith(QStringLiteral("ja")) ? QStringLiteral("ワークベンチ") : QStringLiteral("工作台"));
+    const QString album = valueOr(dictionary, QStringLiteral("nav.album"), locale == QStringLiteral("en") ? QStringLiteral("Album") : locale.startsWith(QStringLiteral("ja")) ? QStringLiteral("アルバム") : QStringLiteral("相册"));
+    if (m_workbenchNav) m_workbenchNav->setText(workbench);
+    if (m_albumNav) m_albumNav->setText(album);
+    updateRXToggle();
+    updateTXToggle();
+    statusBar()->showMessage(QStringLiteral("语言偏好已保存：%1").arg(locale), 3000);
 }
 
 void MainWindow::refreshGallery() {
@@ -920,6 +1494,12 @@ void MainWindow::refreshAlbum() {
         return;
     }
     m_album = result.toArray();
+    QList<QJsonObject> orderedAlbum;
+    orderedAlbum.reserve(m_album.size());
+    for (const QJsonValue &entry : m_album) orderedAlbum.push_back(entry.toObject());
+    std::stable_sort(orderedAlbum.begin(), orderedAlbum.end(), [](const QJsonObject &a, const QJsonObject &b) {
+        return a.value(QStringLiteral("createdAt")).toString() > b.value(QStringLiteral("createdAt")).toString();
+    });
 
     while (QLayoutItem *item = m_albumCardsLayout->takeAt(0)) {
         if (QWidget *widget = item->widget()) widget->deleteLater();
@@ -932,8 +1512,7 @@ void MainWindow::refreshAlbum() {
     int visibleRow = 0;
     int visibleColumn = 0;
 
-    for (const QJsonValue &entry : m_album) {
-        const QJsonObject record = entry.toObject();
+    for (const QJsonObject &record : orderedAlbum) {
         const QString type = record.value(QStringLiteral("type")).toString().toUpper();
         if (filter == 1 && type != QStringLiteral("RX")) continue;
         if (filter == 2 && type != QStringLiteral("TX")) continue;
@@ -1010,10 +1589,11 @@ void MainWindow::refreshAlbum() {
         const QString callsign = valueOr(record, QStringLiteral("callsign"), QStringLiteral("---"));
         const QString packets = QStringLiteral("%1/%2").arg(record.value(QStringLiteral("packetsReceived")).toInt()).arg(record.value(QStringLiteral("packetsExpected")).toInt());
         const QString quality = valueOr(record, QStringLiteral("quality"), QStringLiteral("-"));
-        auto *metadata = new QLabel(QStringLiteral("%1\n%2 · ID %3 · %4 · %5")
+        const QString dimensions = QStringLiteral("%1×%2").arg(record.value(QStringLiteral("imageWidth")).toInt()).arg(record.value(QStringLiteral("imageHeight")).toInt());
+        auto *metadata = new QLabel(QStringLiteral("%1\n%2 · ID %3 · %4 · %5 · %6")
             .arg(timeText, callsign)
             .arg(record.value(QStringLiteral("imageId")).toInt())
-            .arg(packets, record.value(QStringLiteral("status")).toString()), card);
+            .arg(dimensions, packets, record.value(QStringLiteral("status")).toString()), card);
         metadata->setWordWrap(true);
         metadata->setStyleSheet(QStringLiteral("font-size:8pt; color:#74808a;"));
         cardLayout->addWidget(metadata);
@@ -1074,6 +1654,8 @@ void MainWindow::handleEvent(const QJsonObject &event) {
     if(name==QStringLiteral("rx:image")){
         const auto payload=payloadValue.toObject();
         if(payload.value(QStringLiteral("hasPreview")).toBool()) refreshLatestRXPreview();
+        m_templateImageCache.remove(QStringLiteral("last-rx"));
+        refreshTemplateCanvas();
         const QString profile = payload.value(QStringLiteral("profile")).toString();
         const QString callsign = payload.value(QStringLiteral("callsign")).toString();
         const int received = payload.value(QStringLiteral("packetsReceived")).toInt();
@@ -1081,10 +1663,22 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         const int imageId = payload.value(QStringLiteral("imageId")).toInt();
         const double coverage = payload.value(QStringLiteral("coverage")).toDouble() * 100.0;
         const bool complete = payload.value(QStringLiteral("complete")).toBool();
+        const bool hasSSID = payload.value(QStringLiteral("hasAX25SSID")).toBool();
+        const QString ssid = hasSSID ? QString::number(payload.value(QStringLiteral("ax25SourceSSID")).toInt()) : QStringLiteral("--");
+        QString shownProfile = profile;
+        if (m_rxProfile && m_rxProfile->currentData().toString() == QStringLiteral("auto")) {
+            for (const QJsonValue &v : m_profiles) {
+                const QJsonObject item = v.toObject();
+                if (item.value(QStringLiteral("id")).toString() == profile) {
+                    shownProfile = QStringLiteral("自动识别 · %1").arg(valueOr(item, QStringLiteral("name"), profile));
+                    break;
+                }
+            }
+        }
         m_rxStatus->setText(QStringLiteral("%1 · %2 · %3% · %4")
-            .arg(profile, callsign).arg(coverage, 0, 'f', 1).arg(complete ? QStringLiteral("完成") : QStringLiteral("接收中")));
-        m_rxMeta->setText(QStringLiteral("CALL  %1      IMAGE ID  %2      PACKETS  %3 / %4      MODE  %5")
-            .arg(callsign).arg(imageId).arg(received).arg(expected).arg(profile));
+            .arg(shownProfile, callsign).arg(coverage, 0, 'f', 1).arg(complete ? QStringLiteral("完成") : QStringLiteral("接收中")));
+        m_rxMeta->setText(QStringLiteral("CALL  %1   SSID  %2   IMAGE ID  %3   PACKETS  %4 / %5   MODE  %6")
+            .arg(callsign, ssid).arg(imageId).arg(received).arg(expected).arg(shownProfile));
         if(payload.value(QStringLiteral("complete")).toBool())refreshAlbum();
     } else if(name==QStringLiteral("rx:level")){
         const auto p=payloadValue.toObject();m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
@@ -1099,9 +1693,25 @@ void MainWindow::handleEvent(const QJsonObject &event) {
     } else if(name==QStringLiteral("tx:progress")){
         m_txProgress->setValue(static_cast<int>(payloadValue.toDouble()*1000.0));
     } else if(name==QStringLiteral("tx:state")){
-        if(!payloadValue.toObject().value(QStringLiteral("active")).toBool()){m_txProgress->setValue(0);refreshAlbum();}
+        m_txActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
+        updateTXToggle();
+        if(!m_txActive){m_txProgress->setValue(0);refreshAlbum();}
+    } else if(name==QStringLiteral("tx:tone-state")){
+        m_txToneActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
+        updateTXToggle();
     } else if(name==QStringLiteral("tx:status")){
-        const auto p=payloadValue.toObject();appendLog(QStringLiteral("TX: ")+QJsonDocument(p).toJson(QJsonDocument::Compact));
+        const auto p=payloadValue.toObject();
+        const QString phase=p.value(QStringLiteral("phase")).toString();
+        if (phase == QStringLiteral("countdown") && m_repeat && m_repeat->isChecked()) {
+            const int remaining = qMax(0, p.value(QStringLiteral("error")).toInt());
+            m_repeatInterval->setEnabled(false);
+            m_repeatInterval->setValue(remaining);
+            statusBar()->showMessage(QStringLiteral("下一次循环发射：%1 秒").arg(remaining));
+        } else if (phase == QStringLiteral("sending") || phase == QStringLiteral("completed")) {
+            m_repeatInterval->setValue(m_repeatIntervalSeconds);
+            m_repeatInterval->setEnabled(!m_repeat->isChecked());
+        }
+        appendLog(QStringLiteral("TX: ")+QJsonDocument(p).toJson(QJsonDocument::Compact));
     } else if(name.endsWith(QStringLiteral(":error"))||name==QStringLiteral("ptt:error")||name==QStringLiteral("audio:error")){
         showError(payloadValue.isString()?payloadValue.toString():QJsonDocument(payloadValue.toObject()).toJson(QJsonDocument::Compact));
     }
@@ -1113,12 +1723,15 @@ void MainWindow::startRX() {
     m_backend->callSync(QStringLiteral("SaveSettings"), QJsonArray{m_settings}, &saveError, 15000);
     if (!saveError.isEmpty()) { showError(saveError); return; }
     m_backend->call(QStringLiteral("StartRX"), {}, [this](bool ok, const QJsonValue &, const QString &error) {
-        if (ok) { m_rxStatus->setText(QStringLiteral("RX 已启动")); appendLog(QStringLiteral("接收已启动")); }
+        if (ok) { m_rxActive = true; m_rxStatus->setText(QStringLiteral("RX 已启动")); updateRXToggle(); appendLog(QStringLiteral("接收已启动")); }
         else showError(error);
     });
 }
 void MainWindow::stopRX() {
-    m_backend->call(QStringLiteral("StopRX"),{},[this](bool ok,const QJsonValue&,const QString &error){if(ok){m_rxStatus->setText(QStringLiteral("RX 已停止"));appendLog(QStringLiteral("接收已停止"));}else showError(error);});
+    m_backend->call(QStringLiteral("StopRX"), {}, [this](bool ok, const QJsonValue &, const QString &error) {
+        if (ok) { m_rxActive = false; m_rxStatus->setText(QStringLiteral("RX 已停止")); updateRXToggle(); appendLog(QStringLiteral("接收已停止")); }
+        else showError(error);
+    });
 }
 
 QJsonObject MainWindow::selectedTemplate() const {
@@ -1172,6 +1785,12 @@ void MainWindow::startTX() {
     m_settings.insert(QStringLiteral("txProfile"), m_txProfile->currentData().toString());
     m_settings.insert(QStringLiteral("quality"), selectedQuality());
     m_settings.insert(QStringLiteral("ax25Ssid"), m_ax25SSID->value());
+    if (m_txProfile->currentData().toString() == QStringLiteral("ssdv-ax25")) {
+        const QString templateName = selectedTemplate().value(QStringLiteral("name")).toString().trimmed();
+        const QString hisCall = m_hisCall ? m_hisCall->text().trimmed().toUpper() : QString();
+        const bool cqTemplate = templateName.compare(QStringLiteral("CQ"), Qt::CaseInsensitive) == 0;
+        m_ax25To->setText(cqTemplate || hisCall.isEmpty() ? QStringLiteral("CQ") : hisCall);
+    }
 
     QString saveError;
     m_backend->callSync(QStringLiteral("SaveSettings"), QJsonArray{m_settings}, &saveError, 15000);
@@ -1197,7 +1816,7 @@ void MainWindow::startTX() {
     rendered.insert(QStringLiteral("pngBase64"), QString::fromLatin1(png.toBase64()));
     const QJsonArray args{rendered, m_repeat->isChecked(), m_repeatInterval->value(), m_ax25To->text().trimmed()};
     m_backend->call(QStringLiteral("StartTXRendered"), args, [this](bool ok, const QJsonValue &, const QString &error) {
-        if (ok) { m_txProgress->setValue(0); appendLog(QStringLiteral("已提交图像发射任务")); }
+        if (ok) { m_txActive = true; updateTXToggle(); m_txProgress->setValue(0); appendLog(QStringLiteral("已提交图像发射任务")); }
         else showError(error);
     });
 }
@@ -1215,13 +1834,16 @@ void MainWindow::openSettings() {
     dialog.setWindowTitle(QStringLiteral("设备与电台设置"));
     dialog.resize(620, 760);
     auto *layout = new QVBoxLayout(&dialog);
+    auto *settingsTabs = new QTabWidget(&dialog);
+    auto *generalPage = new QWidget(settingsTabs);
+    auto *generalLayout = new QVBoxLayout(generalPage);
     auto *form = new QFormLayout();
 
     auto *callsign = new QLineEdit(settings.value(QStringLiteral("callsign")).toString(), &dialog);
     auto *locator = new QLineEdit(settings.value(QStringLiteral("locator")).toString(), &dialog);
     auto *language = makeCombo(&dialog, {QStringLiteral("简体中文"), QStringLiteral("English"), QStringLiteral("日本語")});
     const QString locale = settings.value(QStringLiteral("language")).toString();
-    language->setCurrentIndex(locale == QStringLiteral("en") ? 1 : locale == QStringLiteral("ja") ? 2 : 0);
+    language->setCurrentIndex(locale == QStringLiteral("en") ? 1 : locale.startsWith(QStringLiteral("ja")) ? 2 : 0);
 
     auto *sample = makeCombo(&dialog, {QStringLiteral("19200"), QStringLiteral("44100"), QStringLiteral("48000"), QStringLiteral("96000")});
     const int rateIndex = sample->findText(QString::number(settings.value(QStringLiteral("audioSampleRate")).toInt(48000)));
@@ -1287,7 +1909,7 @@ void MainWindow::openSettings() {
 
     form->addRow(QStringLiteral("本站呼号"), callsign);
     form->addRow(QStringLiteral("本站网格"), locator);
-    form->addRow(QStringLiteral("界面语言（本地化迁移中）"), language);
+    form->addRow(QStringLiteral("界面语言"), language);
     form->addRow(QStringLiteral("音频采样率"), sample);
     form->addRow(QStringLiteral("RX 音频输入"), rxDevice);
     form->addRow(QStringLiteral("TX 音频输出"), txDevice);
@@ -1297,13 +1919,101 @@ void MainWindow::openSettings() {
     form->addRow(QString(), activeHigh);
     form->addRow(QStringLiteral("PTT 发射前延时"), lead);
     form->addRow(QStringLiteral("PTT 发射后延时"), tail);
-    layout->addLayout(form);
+    generalLayout->addLayout(form);
+
+    // Wails-compatible display settings: both RX and TX waterfalls share the
+    // same frequency range, dB range, scrolling rate, history and palette.
+    auto *displayPage = new QWidget(settingsTabs);
+    auto *displayLayout = new QVBoxLayout(displayPage);
+    auto *waterfallForm = new QFormLayout();
+    QJsonObject waterfall = settings.value(QStringLiteral("waterfall")).toObject();
+    if (waterfall.isEmpty()) {
+        waterfall.insert(QStringLiteral("minFrequencyHz"), 0);
+        waterfall.insert(QStringLiteral("maxFrequencyHz"), 5000);
+        waterfall.insert(QStringLiteral("minDbfs"), -110);
+        waterfall.insert(QStringLiteral("maxDbfs"), -20);
+        waterfall.insert(QStringLiteral("rowsPerSecond"), 15);
+        waterfall.insert(QStringLiteral("historySeconds"), 20);
+        waterfall.insert(QStringLiteral("backgroundColor"), QStringLiteral("#07111b"));
+        waterfall.insert(QStringLiteral("lowColor"), QStringLiteral("#153a78"));
+        waterfall.insert(QStringLiteral("midColor"), QStringLiteral("#168fae"));
+        waterfall.insert(QStringLiteral("highColor"), QStringLiteral("#39c6b0"));
+        waterfall.insert(QStringLiteral("peakColor"), QStringLiteral("#f7d45b"));
+    }
+    auto addWaterfallSlider = [&](const QString &label, const QString &key, int min, int max, int fallback, const QString &suffix) {
+        auto *row = new QWidget(displayPage);
+        auto *rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(0, 0, 0, 0);
+        auto *slider = new QSlider(Qt::Horizontal, row);
+        slider->setRange(min, max);
+        slider->setValue(qBound(min, waterfall.value(key).toInt(fallback), max));
+        auto *value = new QLabel(QString::number(slider->value()) + suffix, row);
+        value->setMinimumWidth(78);
+        value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        rowLayout->addWidget(slider, 1);
+        rowLayout->addWidget(value);
+        connect(slider, &QSlider::valueChanged, value, [value, suffix](int next) { value->setText(QString::number(next) + suffix); });
+        waterfallForm->addRow(label, row);
+        return slider;
+    };
+    auto *minFrequency = addWaterfallSlider(QStringLiteral("最低频率"), QStringLiteral("minFrequencyHz"), 0, 47000, 0, QStringLiteral(" Hz"));
+    auto *maxFrequency = addWaterfallSlider(QStringLiteral("最高频率"), QStringLiteral("maxFrequencyHz"), 100, 48000, 5000, QStringLiteral(" Hz"));
+    auto *minDb = addWaterfallSlider(QStringLiteral("最低电平"), QStringLiteral("minDbfs"), -120, -10, -110, QStringLiteral(" dBFS"));
+    auto *maxDb = addWaterfallSlider(QStringLiteral("最高电平"), QStringLiteral("maxDbfs"), -90, 0, -20, QStringLiteral(" dBFS"));
+    auto *rowsPerSecond = addWaterfallSlider(QStringLiteral("滚动速度"), QStringLiteral("rowsPerSecond"), 1, 40, 15, QStringLiteral(" 行/秒"));
+    auto *historySeconds = addWaterfallSlider(QStringLiteral("历史时长"), QStringLiteral("historySeconds"), 5, 60, 20, QStringLiteral(" 秒"));
+    displayLayout->addLayout(waterfallForm);
+
+    auto *paletteBox = new QGroupBox(QStringLiteral("瀑布图颜色"), displayPage);
+    auto *paletteGrid = new QGridLayout(paletteBox);
+    const QStringList colorKeys = {QStringLiteral("backgroundColor"), QStringLiteral("lowColor"), QStringLiteral("midColor"), QStringLiteral("highColor"), QStringLiteral("peakColor")};
+    const QStringList colorNames = {QStringLiteral("背景色"), QStringLiteral("弱信号"), QStringLiteral("中等信号"), QStringLiteral("强信号"), QStringLiteral("峰值信号")};
+    QHash<QString, QPushButton *> colorButtons;
+    for (int i = 0; i < colorKeys.size(); ++i) {
+        auto *button = new QPushButton(colorNames[i], paletteBox);
+        const QString initial = valueOr(waterfall, colorKeys[i], QStringLiteral("#07111b"));
+        button->setProperty("color", initial);
+        button->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(initial, QColor(initial).lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
+        connect(button, &QPushButton::clicked, &dialog, [button, key=colorKeys[i], colorNames, i]() {
+            QColor selected(button->property("color").toString());
+            selected = QColorDialog::getColor(selected, button, colorNames[i]);
+            if (!selected.isValid()) return;
+            const QString hex = selected.name(QColor::HexRgb);
+            button->setProperty("color", hex);
+            button->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(hex, selected.lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
+        });
+        colorButtons.insert(colorKeys[i], button);
+        paletteGrid->addWidget(button, i / 3, i % 3);
+    }
+    displayLayout->addWidget(paletteBox);
+    auto *displayHint = new QLabel(QStringLiteral("横轴为频率，纵轴为时间；颜色代表信号强度。修改参数后点击保存应用到 RX 与 TX 两个瀑布图。"), displayPage);
+    displayHint->setWordWrap(true);
+    displayHint->setStyleSheet(QStringLiteral("font-size:8pt; color:#7d8991;"));
+    displayLayout->addWidget(displayHint);
+    auto *resetWaterfall = new QPushButton(QStringLiteral("恢复默认显示设置"), displayPage);
+    displayLayout->addWidget(resetWaterfall, 0, Qt::AlignLeft);
+    connect(resetWaterfall, &QPushButton::clicked, &dialog, [=]() {
+        minFrequency->setValue(0); maxFrequency->setValue(5000);
+        minDb->setValue(-110); maxDb->setValue(-20);
+        rowsPerSecond->setValue(15); historySeconds->setValue(20);
+        const QStringList defaults = {QStringLiteral("#07111b"), QStringLiteral("#153a78"), QStringLiteral("#168fae"), QStringLiteral("#39c6b0"), QStringLiteral("#f7d45b")};
+        for (int i=0;i<colorKeys.size();++i) {
+            auto *button = colorButtons.value(colorKeys[i]);
+            const QString hex = defaults[i];
+            button->setProperty("color", hex);
+            button->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(hex, QColor(hex).lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
+        }
+    });
+    displayLayout->addStretch();
+    settingsTabs->addTab(generalPage, QStringLiteral("设备与电台"));
+    settingsTabs->addTab(displayPage, QStringLiteral("显示设置"));
+    layout->addWidget(settingsTabs, 1);
 
     auto collectSettings = [=]() mutable {
         QJsonObject updated = settings;
         updated.insert(QStringLiteral("callsign"), callsign->text().trimmed());
         updated.insert(QStringLiteral("locator"), locator->text().trimmed());
-        updated.insert(QStringLiteral("language"), language->currentIndex() == 1 ? QStringLiteral("en") : language->currentIndex() == 2 ? QStringLiteral("ja") : QStringLiteral("zh-CN"));
+        updated.insert(QStringLiteral("language"), language->currentIndex() == 1 ? QStringLiteral("en") : language->currentIndex() == 2 ? QStringLiteral("ja-JP") : QStringLiteral("zh-CN"));
         updated.insert(QStringLiteral("audioSampleRate"), sample->currentText().toInt());
         updated.insert(QStringLiteral("rxInputDevice"), rxDevice->currentData().toString());
         updated.insert(QStringLiteral("txOutputDevice"), txDevice->currentData().toString());
@@ -1315,6 +2025,15 @@ void MainWindow::openSettings() {
         updated.insert(QStringLiteral("ptt"), updatedPTT);
         updated.insert(QStringLiteral("pttLeadMs"), lead->value());
         updated.insert(QStringLiteral("pttTailMs"), tail->value());
+        QJsonObject updatedWaterfall;
+        updatedWaterfall.insert(QStringLiteral("minFrequencyHz"), minFrequency->value());
+        updatedWaterfall.insert(QStringLiteral("maxFrequencyHz"), qMax(maxFrequency->value(), minFrequency->value() + 100));
+        updatedWaterfall.insert(QStringLiteral("minDbfs"), minDb->value());
+        updatedWaterfall.insert(QStringLiteral("maxDbfs"), qMax(maxDb->value(), minDb->value() + 5));
+        updatedWaterfall.insert(QStringLiteral("rowsPerSecond"), rowsPerSecond->value());
+        updatedWaterfall.insert(QStringLiteral("historySeconds"), historySeconds->value());
+        for (const QString &key : colorKeys) updatedWaterfall.insert(key, colorButtons.value(key)->property("color").toString());
+        updated.insert(QStringLiteral("waterfall"), updatedWaterfall);
         return updated;
     };
 
@@ -1324,13 +2043,17 @@ void MainWindow::openSettings() {
     pttActions->addWidget(pttStart);
     pttActions->addWidget(pttStop);
     pttActions->addStretch();
-    layout->addLayout(pttActions);
+    generalLayout->addLayout(pttActions);
+    generalLayout->addStretch();
     connect(pttStart, &QPushButton::clicked, &dialog, [this, collectSettings]() mutable {
         const QJsonObject updated = collectSettings();
         QString saveError;
         m_backend->callSync(QStringLiteral("SaveSettings"), QJsonArray{updated}, &saveError, 15000);
         if (!saveError.isEmpty()) { showError(saveError); return; }
         m_settings = updated;
+        const QJsonObject waterfallSettings = updated.value(QStringLiteral("waterfall")).toObject();
+        if (m_rxSpectrum) m_rxSpectrum->setDisplaySettings(waterfallSettings);
+        if (m_txSpectrum) m_txSpectrum->setDisplaySettings(waterfallSettings);
         m_backend->call(QStringLiteral("StartPTTTest"), {}, [this](bool ok, const QJsonValue &, const QString &pttError) {
             if (ok) appendLog(QStringLiteral("PTT 测试已启动")); else showError(pttError);
         });
@@ -1352,16 +2075,26 @@ void MainWindow::openSettings() {
     m_backend->callSync(QStringLiteral("SaveSettings"), QJsonArray{updated}, &saveError, 15000);
     if (!saveError.isEmpty()) { showError(saveError); return; }
     m_settings = updated;
+    const QJsonObject waterfallSettings = updated.value(QStringLiteral("waterfall")).toObject();
+    if (m_rxSpectrum) m_rxSpectrum->setDisplaySettings(waterfallSettings);
+    if (m_txSpectrum) m_txSpectrum->setDisplaySettings(waterfallSettings);
     m_callsign->setText(callsign->text());
     m_locator->setText(locator->text());
     m_ax25SSID->setValue(updated.value(QStringLiteral("ax25Ssid")).toInt(m_ax25SSID->value()));
+    const QString updatedLocale = updated.value(QStringLiteral("language")).toString(QStringLiteral("zh-CN"));
+    if (m_languageSelect) {
+        const QSignalBlocker blocker(m_languageSelect);
+        m_languageSelect->setCurrentIndex(updatedLocale == QStringLiteral("en") ? 1 : updatedLocale.startsWith(QStringLiteral("ja")) ? 2 : 0);
+    }
+    applyLanguage(updatedLocale);
+    refreshTemplateCanvas();
     appendLog(QStringLiteral("设备设置已保存"));
     refreshStatus();
 }
 
 void MainWindow::importGalleryImage() {
     const QString path=QFileDialog::getOpenFileName(this,QStringLiteral("导入图库图片"),QStandardPaths::writableLocation(QStandardPaths::PicturesLocation),QStringLiteral("Images (*.png *.jpg *.jpeg *.bmp *.webp)"));if(path.isEmpty())return;
-    m_backend->call(QStringLiteral("ImportGalleryImage"),QJsonArray{path},[this](bool ok,const QJsonValue &value,const QString &error){if(!ok){showError(error);return;}const auto asset=value.toObject();appendLog(QStringLiteral("已导入图库：")+asset.value(QStringLiteral("name")).toString());refreshGallery();});
+    m_backend->call(QStringLiteral("ImportGalleryImage"),QJsonArray{path},[this](bool ok,const QJsonValue &value,const QString &error){if(!ok){showError(error);return;}const auto asset=value.toObject();appendLog(QStringLiteral("已导入图库：")+asset.value(QStringLiteral("name")).toString());m_templateImageCache.clear();refreshGallery();refreshInlineTemplateEditor();refreshTemplateCanvas();});
 }
 void MainWindow::exportAlbum() {
     const QString dir=QFileDialog::getExistingDirectory(this,QStringLiteral("导出相册到文件夹"),QStandardPaths::writableLocation(QStandardPaths::PicturesLocation));if(dir.isEmpty())return;
@@ -1373,7 +2106,7 @@ void MainWindow::exportTemplatePack() {
 }
 void MainWindow::importTemplatePack() {
     const QString path=QFileDialog::getOpenFileName(this,QStringLiteral("导入模板包"),QString(),QStringLiteral("Template packs (*.zip)"));if(path.isEmpty())return;
-    m_backend->call(QStringLiteral("ImportTemplatePackFrom"),QJsonArray{path},[this](bool ok,const QJsonValue &value,const QString &error){if(!ok){showError(error);return;}refreshTemplates();QMessageBox::information(this,QStringLiteral("导入完成"),QStringLiteral("已导入 %1 个模板").arg(value.toInt()));});
+    m_backend->call(QStringLiteral("ImportTemplatePackFrom"),QJsonArray{path},[this](bool ok,const QJsonValue &value,const QString &error){if(!ok){showError(error);return;}m_templateImageCache.clear();refreshGallery();refreshTemplates();refreshTemplateCanvas();QMessageBox::information(this,QStringLiteral("导入完成"),QStringLiteral("已导入 %1 个模板").arg(value.toInt()));});
 }
 
 void MainWindow::editSelectedTemplate() {
@@ -1717,10 +2450,7 @@ void MainWindow::editSelectedTemplate() {
 }
 
 void MainWindow::selectTemplateBackground() {
-    refreshGallery();QStringList labels;QStringList ids;for(const auto &value:m_gallery){const auto asset=value.toObject();labels<<valueOr(asset,QStringLiteral("name"),asset.value(QStringLiteral("id")).toString());ids<<asset.value(QStringLiteral("id")).toString();}
-    if(labels.isEmpty()){if(QMessageBox::question(this,QStringLiteral("模板背景"),QStringLiteral("图库为空，是否先导入图片？"))==QMessageBox::Yes)importGalleryImage();return;}
-    bool ok=false;const QString choice=QInputDialog::getItem(this,QStringLiteral("选择模板背景"),QStringLiteral("背景图片"),labels,0,false,&ok);if(!ok)return;const int index=labels.indexOf(choice);if(index<0)return;
-    m_settings.insert(QStringLiteral("templateBackgroundAssetId"),ids[index]);saveSettings(m_settings);appendLog(QStringLiteral("模板背景已更新"));QImage image=renderTemplate();if(!image.isNull())m_txPreview->setSourceImage(image);
+    selectInlineGalleryAsset();
 }
 
 void MainWindow::showImage(const QString &dataUrl, ImagePreviewLabel *target) { const QImage image = imageFromDataUrl(dataUrl); if (!image.isNull()) target->setSourceImage(image); }
