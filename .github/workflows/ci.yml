@@ -65,7 +65,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build qt6-base-dev \
+            build-essential cmake ninja-build qt6-base-dev patchelf \
             libasound2-dev libasound2t64 pkg-config
       - name: Verify native build tools
         run: |
@@ -88,14 +88,52 @@ jobs:
           test -x build-qt6/bin/satssdv-backend
           ! ldd build-qt6/bin/SATSSDV-Go | grep -q 'not found'
           ! ldd build-qt6/bin/satssdv-backend | grep -q 'not found'
-      - name: Stage Linux build
+      - name: Stage Linux build and tarball
         run: |
           cmake --install build-qt6 --prefix dist
           tar -czf SATSSDV-Go-linux-x86_64.tar.gz -C dist .
+      - name: Build Debian package
+        run: |
+          mkdir -p package-deb
+          cpack --config build-qt6/CPackConfig.cmake -G DEB -B package-deb
+          DEB_FILE="$(find package-deb -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "$DEB_FILE"
+          cp "$DEB_FILE" SATSSDV-Go-linux-x86_64.deb
+      - name: Build AppImage
+        run: |
+          TOOL_DIR="$RUNNER_TEMP/linuxdeploy-tools"
+          mkdir -p "$TOOL_DIR" AppDir/usr
+          cp -a dist/. AppDir/usr/
+          cp packaging/linux/satssdv-go.desktop AppDir/satssdv-go.desktop
+          cp packaging/linux/satssdv-go.svg AppDir/satssdv-go.svg
+          curl --fail --location --retry 3 \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+            --output "$TOOL_DIR/linuxdeploy-x86_64.AppImage"
+          curl --fail --location --retry 3 \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage \
+            --output "$TOOL_DIR/linuxdeploy-plugin-qt-x86_64.AppImage"
+          chmod +x "$TOOL_DIR"/*.AppImage
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="$(command -v qmake6)"
+          test -x "$QMAKE"
+          "$TOOL_DIR/linuxdeploy-x86_64.AppImage" \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/SATSSDV-Go \
+            --executable AppDir/usr/bin/satssdv-backend \
+            --desktop-file AppDir/satssdv-go.desktop \
+            --icon-file AppDir/satssdv-go.svg \
+            --plugin qt \
+            --output appimage
+          APPIMAGE_FILE="$(find . -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+          test -n "$APPIMAGE_FILE"
+          mv "$APPIMAGE_FILE" SATSSDV-Go-linux-x86_64.AppImage
       - uses: actions/upload-artifact@v4
         with:
           name: SATSSDV-Go-linux-x86_64
-          path: SATSSDV-Go-linux-x86_64.tar.gz
+          path: |
+            SATSSDV-Go-linux-x86_64.tar.gz
+            SATSSDV-Go-linux-x86_64.deb
+            SATSSDV-Go-linux-x86_64.AppImage
           if-no-files-found: error
 
   qt-windows:
@@ -107,6 +145,9 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -152,6 +193,14 @@ jobs:
           test -f build-qt6/bin/satssdv-backend.exe
           test -f build-qt6/bin/Qt6Core.dll
           test -f build-qt6/bin/Qt6Widgets.dll
+      - name: Bundle transitive MinGW DLL dependencies
+        shell: msys2 {0}
+        run: |
+          export PATH="/mingw64/bin:$PATH"
+          python scripts/deploy_windows_dlls.py \
+            --package-dir "$(cygpath -w build-qt6/bin)" \
+            --mingw-bin "$(cygpath -w /mingw64/bin)" \
+            --objdump "$(cygpath -w /mingw64/bin/objdump.exe)"
       - uses: actions/upload-artifact@v4
         with:
           name: SATSSDV-Go-windows-x86_64
@@ -188,15 +237,17 @@ jobs:
           test "$(uname -m)" = "${{ matrix.uname_arch }}"
           test "$(go env GOARCH)" = "${{ matrix.arch }}"
       - name: Install Qt
-        run: brew install qt pkg-config
+        run: brew install qtbase pkg-config
       - name: Configure native Qt application
         run: |
-          QT_PREFIX="$(brew --prefix qt)"
+          QT_PREFIX="$(brew --prefix qtbase)"
+          HOMEBREW_PREFIX="$(brew --prefix)"
           cmake -S . -B build-qt6 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="${{ matrix.cmake_arch }}" \
             -DQt6_DIR="$QT_PREFIX/lib/cmake/Qt6" \
             -DSATSSDV_WITH_MALGO=ON \
+            -DSATSSDV_HOMEBREW_PREFIX="$HOMEBREW_PREFIX" \
             -DGO_EXECUTABLE="$(command -v go)"
       - name: Build native Qt application
         run: cmake --build build-qt6 --parallel 2 --verbose
@@ -207,8 +258,9 @@ jobs:
           BACKEND="$APP/Contents/MacOS/satssdv-backend"
           test -x "$BACKEND"
           file "$BACKEND"
-          lipo -verify_arch "${{ matrix.cmake_arch }}" "$BACKEND"
-          lipo -verify_arch "${{ matrix.cmake_arch }}" "$APP/Contents/MacOS/SATSSDV-Go"
+          lipo "$BACKEND" -verify_arch "${{ matrix.cmake_arch }}"
+          lipo "$APP/Contents/MacOS/SATSSDV-Go" -verify_arch "${{ matrix.cmake_arch }}"
+          codesign --verify --deep --strict "$APP"
       - name: Archive macOS app bundle
         run: |
           ditto -c -k --sequesterRsrc --keepParent \

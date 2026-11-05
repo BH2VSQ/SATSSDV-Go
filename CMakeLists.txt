@@ -122,20 +122,59 @@ if(NOT SATSSDV_BUILD_BACKEND_ONLY)
             HINTS "${Qt6_DIR}/../../../bin"
             REQUIRED
         )
+        # macdeployqt must be able to resolve non-Qt Homebrew dependencies
+        # (Brotli, ICU, HarfBuzz, etc.) before it rewrites their install names.
+        set(MACDEPLOYQT_LIBPATH_ARGS)
+        if(DEFINED SATSSDV_HOMEBREW_PREFIX AND NOT SATSSDV_HOMEBREW_PREFIX STREQUAL "")
+            file(GLOB HOMEBREW_LIBRARY_DIRS LIST_DIRECTORIES true
+                "${SATSSDV_HOMEBREW_PREFIX}/opt/*/lib")
+            foreach(LIB_DIR IN LISTS HOMEBREW_LIBRARY_DIRS)
+                list(APPEND MACDEPLOYQT_LIBPATH_ARGS "-libpath=${LIB_DIR}")
+            endforeach()
+            list(APPEND MACDEPLOYQT_LIBPATH_ARGS "-libpath=${SATSSDV_HOMEBREW_PREFIX}/lib")
+        endif()
         add_custom_command(TARGET SATSSDV-Go POST_BUILD
-            COMMAND "${MACDEPLOYQT_EXECUTABLE}" "$<TARGET_BUNDLE_DIR:SATSSDV-Go>"
+            COMMAND "${MACDEPLOYQT_EXECUTABLE}"
+                "$<TARGET_BUNDLE_DIR:SATSSDV-Go>"
+                -codesign=-
+                ${MACDEPLOYQT_LIBPATH_ARGS}
             VERBATIM
         )
     endif()
 
-    install(TARGETS SATSSDV-Go RUNTIME DESTINATION . BUNDLE DESTINATION .)
     if(APPLE)
+        install(TARGETS SATSSDV-Go RUNTIME DESTINATION . BUNDLE DESTINATION .)
         # QProcess resolves the backend beside the executable inside the app bundle.
         install(PROGRAMS "${BACKEND_OUTPUT}" DESTINATION "SATSSDV-Go.app/Contents/MacOS")
-    else()
-        # Windows and Linux executables share the same runtime directory.
+    elseif(WIN32)
+        install(TARGETS SATSSDV-Go RUNTIME DESTINATION .)
         install(PROGRAMS "${BACKEND_OUTPUT}" DESTINATION .)
+    else()
+        # Keep the Qt client and Go backend side by side for QProcess lookup.
+        install(TARGETS SATSSDV-Go RUNTIME DESTINATION bin)
+        install(PROGRAMS "${BACKEND_OUTPUT}" DESTINATION bin)
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/satssdv-go.desktop"
+            DESTINATION share/applications)
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/satssdv-go.svg"
+            DESTINATION share/icons/hicolor/scalable/apps)
     endif()
 else()
     install(PROGRAMS "${BACKEND_OUTPUT}" DESTINATION .)
+endif()
+
+# Debian package: let dpkg-shlibdeps derive the runtime package dependencies
+# from both installed ELF executables (Qt client and Go audio backend).
+if(UNIX AND NOT APPLE AND NOT SATSSDV_BUILD_BACKEND_ONLY)
+    set(CPACK_PACKAGE_NAME "satssdv-go")
+    set(CPACK_PACKAGE_VENDOR "BH2VSQ")
+    set(CPACK_PACKAGE_CONTACT "BH2VSQ")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Native Qt6 satellite digital image modem")
+    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+    set(CPACK_GENERATOR "DEB")
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "BH2VSQ")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "hamradio")
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
+    include(CPack)
 endif()

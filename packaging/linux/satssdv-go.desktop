@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SATSSDV-Go
+Comment=Satellite digital image and SSTV communication
+Exec=SATSSDV-Go
+Icon=satssdv-go
+Terminal=false
+Categories=HamRadio;Science;Utility;
+StartupWMClass=SATSSDV-Go
