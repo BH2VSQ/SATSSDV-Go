@@ -31,6 +31,8 @@ jobs:
         run: go vet ./...
       - name: Native UI architecture checks
         run: python scripts/check_native_ui.py
+      - name: Qt single-window and no-console startup checks
+        run: python scripts/check_qt_startup_contract.py
       - name: Build backend without native audio
         run: go build -tags "" ./...
       - name: Verify backend RPC lifecycle
@@ -193,6 +195,9 @@ jobs:
           test -f build-qt6/bin/satssdv-backend.exe
           test -f build-qt6/bin/Qt6Core.dll
           test -f build-qt6/bin/Qt6Widgets.dll
+          # Both PE images must use the GUI subsystem; no console window may appear.
+          objdump -p build-qt6/bin/SATSSDV-Go.exe | grep -E 'Subsystem.*Windows GUI'
+          objdump -p build-qt6/bin/satssdv-backend.exe | grep -E 'Subsystem.*Windows GUI'
       - name: Bundle transitive MinGW DLL dependencies
         shell: msys2 {0}
         run: |

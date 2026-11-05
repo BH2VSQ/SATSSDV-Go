@@ -34,13 +34,21 @@ if(SATSSDV_WITH_MALGO)
     set(GO_BUILD_TAGS "malgo")
 endif()
 
+# Both processes are GUI applications on Windows. The Qt parent still receives
+# the backend's stdout/stderr through QProcess pipes, but neither process owns
+# or creates a visible console window.
+set(GO_BUILD_LDFLAGS)
+if(WIN32)
+    list(APPEND GO_BUILD_LDFLAGS "-ldflags=-H=windowsgui")
+endif()
+
 file(GLOB_RECURSE GO_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.go")
 
 if(GO_BUILD_TAGS)
     add_custom_command(
         OUTPUT "${BACKEND_OUTPUT}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
-        COMMAND "${CMAKE_COMMAND}" -E env "CGO_ENABLED=1" "${GO_EXECUTABLE}" build -trimpath -tags "${GO_BUILD_TAGS}" -o "${BACKEND_OUTPUT}" .
+        COMMAND "${CMAKE_COMMAND}" -E env "CGO_ENABLED=1" "${GO_EXECUTABLE}" build -trimpath -tags "${GO_BUILD_TAGS}" ${GO_BUILD_LDFLAGS} -o "${BACKEND_OUTPUT}" .
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/go.mod"
@@ -53,7 +61,7 @@ else()
     add_custom_command(
         OUTPUT "${BACKEND_OUTPUT}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
-        COMMAND "${CMAKE_COMMAND}" -E env "CGO_ENABLED=0" "${GO_EXECUTABLE}" build -trimpath -o "${BACKEND_OUTPUT}" .
+        COMMAND "${CMAKE_COMMAND}" -E env "CGO_ENABLED=0" "${GO_EXECUTABLE}" build -trimpath ${GO_BUILD_LDFLAGS} -o "${BACKEND_OUTPUT}" .
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/go.mod" "${CMAKE_CURRENT_SOURCE_DIR}/go.sum" ${GO_SOURCES}
         COMMENT "Building SATSSDV-Go backend (audio runtime stub)"
@@ -64,26 +72,22 @@ add_custom_target(satssdv-backend-build ALL DEPENDS "${BACKEND_OUTPUT}")
 
 if(NOT SATSSDV_BUILD_BACKEND_ONLY)
     find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Network)
+    set(SATSSDV_QT_SOURCES
+        qt6/main.cpp
+        qt6/mainwindow.cpp
+        qt6/mainwindow.h
+        qt6/backend_client.cpp
+        qt6/backend_client.h
+        qt6/template_canvas.cpp
+        qt6/template_canvas.h
+    )
     if(APPLE)
-        add_executable(SATSSDV-Go MACOSX_BUNDLE
-            qt6/main.cpp
-            qt6/mainwindow.cpp
-            qt6/mainwindow.h
-            qt6/backend_client.cpp
-            qt6/backend_client.h
-            qt6/template_canvas.cpp
-            qt6/template_canvas.h
-        )
+        add_executable(SATSSDV-Go MACOSX_BUNDLE ${SATSSDV_QT_SOURCES})
+    elseif(WIN32)
+        # WIN32 selects the Windows GUI subsystem (no attached console window).
+        add_executable(SATSSDV-Go WIN32 ${SATSSDV_QT_SOURCES})
     else()
-        add_executable(SATSSDV-Go
-            qt6/main.cpp
-            qt6/mainwindow.cpp
-            qt6/mainwindow.h
-            qt6/backend_client.cpp
-            qt6/backend_client.h
-            qt6/template_canvas.cpp
-            qt6/template_canvas.h
-        )
+        add_executable(SATSSDV-Go ${SATSSDV_QT_SOURCES})
     endif()
     target_link_libraries(SATSSDV-Go PRIVATE Qt6::Widgets Qt6::Network)
     add_dependencies(SATSSDV-Go satssdv-backend-build)

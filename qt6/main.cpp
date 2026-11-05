@@ -2,7 +2,6 @@
 #include "mainwindow.h"
 
 #include <QApplication>
-#include <QMessageBox>
 
 int main(int argc, char *argv[]) {
     QApplication application(argc, argv);
@@ -10,11 +9,11 @@ int main(int argc, char *argv[]) {
     QCoreApplication::setApplicationName(QStringLiteral("SATSSDV-Go"));
     BackendClient backend;
     QString error;
-    if (!backend.start(QCoreApplication::applicationDirPath(), &error)) {
-        QMessageBox::critical(nullptr, QStringLiteral("SATSSDV-Go 后端启动失败"), error);
-        return 2;
-    }
-    MainWindow window(&backend);
+    // Never show a startup dialog or launch a console window.  If the backend
+    // cannot start, keep the single main window visible and report the reason
+    // in its status area instead of creating a second top-level window.
+    const bool backendStarted = backend.start(QCoreApplication::applicationDirPath(), &error);
+    MainWindow window(&backend, backendStarted ? QString() : error);
     window.show();
     const int result = application.exec();
     window.stopBackgroundPolling();

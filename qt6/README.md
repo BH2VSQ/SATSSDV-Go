@@ -26,3 +26,19 @@ The build places the `satssdv-backend` Go service next to the Qt executable. The
 - `events.go`: bounded event history so a UI stall cannot backpressure RX/audio workers.
 
 The current native client implements the main RX/TX workbench, QSO fields, template selection/rendering and an interactive template canvas. The canvas supports component selection, drag-to-move, text-size/image-scale adjustment, adding text/gallery/last-RX image layers, deletion and a property table. Native gallery import, album listing/preview/export/delete, template-pack import/export, audio/PTT settings, RX previews, and spectrum/waterfall rendering are also included. Layer ordering, snap/alignment guides, full translation catalogs and an advanced waterfall palette/range editor remain follow-up parity work.
+
+## Desktop layout and startup behavior
+
+The native workbench follows the original SATSSDV-Go layout: RX and TX profile
+shortcut rows remain above a side-by-side RX/TX workspace; each side has an
+independent audio spectrum/waterfall; and the album is presented as an image-card
+grid with thumbnails and per-record actions. TX preset management supports creating,
+duplicating, renaming, deleting and editing presets. The TX panel keeps the QSO
+fields and a compact component/property overview visible, while the full drag/edit
+canvas remains available from the explicit template editor action.
+
+Startup is single-window: a backend startup problem is reported in the main
+window status area instead of opening a second error dialog. On Windows, both
+the Qt executable and the Go helper are linked with the Windows GUI subsystem
+so starting the application does not open a console window. The helper's
+handshake remains available through the redirected QProcess stdout pipe.

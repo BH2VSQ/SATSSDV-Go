@@ -13,6 +13,7 @@
 #include <QProgressBar>
 #include <QTextEdit>
 #include <QTableWidget>
+#include <QListWidget>
 #include <QCheckBox>
 #include <QSpinBox>
 #include <QPushButton>
@@ -20,10 +21,12 @@
 
 class SpectrumWaterfallWidget;
 class ImagePreviewLabel;
+class QHBoxLayout;
+class QGridLayout;
 
 class MainWindow final : public QMainWindow {
 public:
-    explicit MainWindow(BackendClient *backend, QWidget *parent = nullptr);
+    explicit MainWindow(BackendClient *backend, const QString &startupError = QString(), QWidget *parent = nullptr);
     void stopBackgroundPolling();
 
 private:
@@ -34,6 +37,7 @@ private:
     void refreshAlbum();
     void refreshGallery();
     void refreshTemplates();
+    void refreshTemplateComponentList();
     void pollEvents();
     void handleEvent(const QJsonObject &event);
     void startRX();
@@ -73,6 +77,7 @@ private:
     QComboBox *m_txProfile = nullptr;
     QComboBox *m_quality = nullptr;
     QComboBox *m_template = nullptr;
+    QLineEdit *m_templateName = nullptr;
     QLineEdit *m_callsign = nullptr;
     QLineEdit *m_locator = nullptr;
     QLineEdit *m_hisCall = nullptr;
@@ -86,10 +91,20 @@ private:
     QProgressBar *m_txProgress = nullptr;
     QLabel *m_audioStatus = nullptr;
     QLabel *m_rxStatus = nullptr;
+    QLabel *m_rxMeta = nullptr;
     ImagePreviewLabel *m_rxPreview = nullptr;
     ImagePreviewLabel *m_txPreview = nullptr;
-    QLabel *m_spectrumStatus = nullptr;
-    SpectrumWaterfallWidget *m_spectrum = nullptr;
+    QLabel *m_rxSpectrumStatus = nullptr;
+    QLabel *m_txSpectrumStatus = nullptr;
+    SpectrumWaterfallWidget *m_rxSpectrum = nullptr;
+    SpectrumWaterfallWidget *m_txSpectrum = nullptr;
+    QHBoxLayout *m_rxProfileButtons = nullptr;
+    QHBoxLayout *m_txProfileButtons = nullptr;
+    QComboBox *m_albumFilter = nullptr;
+    QWidget *m_albumCardsHost = nullptr;
+    QGridLayout *m_albumCardsLayout = nullptr;
+    QLabel *m_templateComponentsSummary = nullptr;
+    QListWidget *m_templateComponentList = nullptr;
+    QTableWidget *m_templatePropertiesTable = nullptr;
     QTextEdit *m_log = nullptr;
-    QTableWidget *m_albumTable = nullptr;
 };
