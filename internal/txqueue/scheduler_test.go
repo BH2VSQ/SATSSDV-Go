@@ -2,8 +2,8 @@ package txqueue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,9 +52,7 @@ func TestRepeatIntervalEmitsCountdownAndCompletes(t *testing.T) {
 	}, func(event Event) {
 		phases = append(phases, event.Phase)
 		if event.Phase == "countdown" {
-			var n int
-			_, _ = fmt.Sscanf(event.Error, "%d", &n)
-			countdown = append(countdown, n)
+			countdown = append(countdown, event.RemainingSeconds)
 		}
 	})
 	if err != nil {
@@ -138,5 +136,23 @@ func TestRunCancellationDuringCountdownEmitsCancelled(t *testing.T) {
 	}
 	if sent.Load() != 1 {
 		t.Fatalf("sent %d jobs before countdown cancellation, want the initial transmission to complete", sent.Load())
+	}
+}
+
+func TestCountdownRemainingSecondsJSONIsNumeric(t *testing.T) {
+	data, err := json.Marshal(Event{Phase: "countdown", RemainingSeconds: 37})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	var seconds int
+	if err := json.Unmarshal(payload["remainingSeconds"], &seconds); err != nil {
+		t.Fatalf("remainingSeconds must be a JSON number: %s (%v)", payload["remainingSeconds"], err)
+	}
+	if seconds != 37 {
+		t.Fatalf("remainingSeconds = %d, want 37", seconds)
 	}
 }

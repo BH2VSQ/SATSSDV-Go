@@ -67,6 +67,7 @@ private:
     void showImage(const QString &dataUrl, ImagePreviewLabel *target);
     QString selectedQuality() const;
     QImage renderTemplate(QString *errorMessage = nullptr);
+    QJsonObject buildRenderedTXPayload(const QImage &preview, QString *errorMessage = nullptr);
     QByteArray imageDataUrlBytes(const QString &dataUrl) const;
     QImage imageFromDataUrl(const QString &dataUrl) const;
     QJsonObject selectedTemplate() const;

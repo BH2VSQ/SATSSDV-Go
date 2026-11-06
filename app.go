@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/draw"
 	_ "image/gif"
 	_ "image/jpeg"
 	"image/png"
@@ -24,7 +25,10 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/gallery"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/gifmode"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/i18n"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/radio/ptt"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/radio/serialptt"
 	rxengine "github.com/BH2VSQ/SATSSDV-Go/internal/rx"
@@ -506,9 +510,12 @@ func (a *App) Start1500HzTestTone() error {
 }
 
 type RenderedTXImage struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	PNGBase64 string `json:"pngBase64"`
+	ID               string       `json:"id"`
+	Name             string       `json:"name"`
+	PNGBase64        string       `json:"pngBase64"`
+	GIFBase64        string       `json:"gifBase64,omitempty"`
+	OverlayPNGBase64 string       `json:"overlayPNGBase64,omitempty"`
+	GIFRect          gifmode.Rect `json:"gifRect,omitempty"`
 }
 
 // StartTXRendered transmits the currently selected template as one image.
@@ -534,7 +541,7 @@ func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSecond
 		return errors.New("rendered TX template is not a PNG")
 	}
 	a.mu.Lock()
-	profile, quality, ax25SSID, audioRate := a.settings.TXProfile, a.settings.Quality, a.settings.AX25SSID, a.settings.AudioSampleRate
+	profile, quality, callsign, ax25SSID, audioRate := a.settings.TXProfile, a.settings.Quality, a.settings.Callsign, a.settings.AX25SSID, a.settings.AudioSampleRate
 	a.mu.Unlock()
 	ax25To = strings.ToUpper(strings.TrimSpace(ax25To))
 	if ax25To == "" {
@@ -547,11 +554,184 @@ func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSecond
 	if parsedProfile.LinkLayer == "CCSDS-MARY" && audioRate < 44100 {
 		return errors.New("QPSK/8PSK/16QAM 1600-symbol TX requires an audio sample rate of at least 44100 Hz; use 48000 Hz or higher")
 	}
+	if strings.TrimSpace(image.GIFBase64) != "" {
+		if parsedProfile.ImageCodec != "SSDV" {
+			return errors.New("GIF template components require an SSDV TX profile")
+		}
+		return a.startTransmissionGIF(image, data, profile, quality, callsign, ax25SSID, audioRate, ax25To, repeat, intervalSeconds)
+	}
 	job := txqueue.Job{ID: image.ID, ImageName: image.Name, ImageDataBase64: image.PNGBase64, Profile: profile, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
 	return a.startTransmission(job, repeat, intervalSeconds)
 }
 
+// startTransmissionGIF runs the attachment's private SATSSDV-Go incremental
+// GIF transport through the existing radio/audio path. It is intentionally
+// limited to SSDV profiles; PCSI has a different packet format.
+func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, profileID, quality, callsign string, ax25SSID, audioRate int, ax25To string, repeat bool, intervalSeconds int) error {
+	gifData, err := base64.StdEncoding.DecodeString(rendered.GIFBase64)
+	if err != nil || len(gifData) == 0 || len(gifData) > 8*1024*1024 {
+		return errors.New("template GIF must be valid and no larger than 8 MiB")
+	}
+	baseImage, err := png.Decode(bytes.NewReader(basePNG))
+	if err != nil {
+		return fmt.Errorf("decode template base PNG: %w", err)
+	}
+	base := image.NewRGBA(image.Rect(0, 0, baseImage.Bounds().Dx(), baseImage.Bounds().Dy()))
+	draw.Draw(base, base.Bounds(), baseImage, baseImage.Bounds().Min, draw.Src)
+	var overlay *image.RGBA
+	if rendered.OverlayPNGBase64 != "" {
+		overlayData, decodeErr := base64.StdEncoding.DecodeString(rendered.OverlayPNGBase64)
+		if decodeErr != nil || len(overlayData) == 0 || len(overlayData) > 8*1024*1024 {
+			return errors.New("template GIF overlay PNG is invalid or exceeds 8 MiB")
+		}
+		overlayImage, imageErr := png.Decode(bytes.NewReader(overlayData))
+		if imageErr != nil {
+			return fmt.Errorf("decode template overlay PNG: %w", imageErr)
+		}
+		if overlayImage.Bounds().Dx() != base.Bounds().Dx() || overlayImage.Bounds().Dy() != base.Bounds().Dy() {
+			return errors.New("template GIF overlay dimensions do not match the base canvas")
+		}
+		overlay = image.NewRGBA(base.Bounds())
+		draw.Draw(overlay, overlay.Bounds(), overlayImage, overlayImage.Bounds().Min, draw.Src)
+	} else {
+		overlay = image.NewRGBA(base.Bounds())
+	}
+	parsedProfile, err := domain.ParseProfile(profileID)
+	if err != nil {
+		return err
+	}
+	if parsedProfile.ImageCodec != "SSDV" {
+		return errors.New("GIF template components require an SSDV TX profile")
+	}
+	if parsedProfile.LinkLayer == "CCSDS-MARY" && audioRate < 44100 {
+		return errors.New("QPSK/8PSK/16QAM 1600-symbol TX requires an audio sample rate of at least 44100 Hz")
+	}
+	if intervalSeconds < 0 || intervalSeconds > 86400 {
+		return errors.New("TX interval must be between 0 and 86400 seconds")
+	}
+	if strings.TrimSpace(ax25To) == "" {
+		ax25To = "CQ"
+	}
+	if quality == "" {
+		quality = "medium"
+	}
+
+	job := txqueue.Job{ID: rendered.ID, ImageName: rendered.Name, Profile: profileID, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
+	// The GIF can be expensive to decode/packetize. Prepare it in the TX worker,
+	// not on the Qt event thread, then reuse the same burst for each repeat cycle.
+	prepared := false
+	var prepareErr error
+	var frames []gifmode.Frame
+	var stats gifmode.Stats
+	var waveform []float32
+	var waveformRate int
+	var duplex *audio.Duplex
+	var currentCallsign string
+	var baseImageID uint8
+	sender := func(ctx context.Context, _ txqueue.Job) error {
+		if !prepared {
+			frames, prepareErr = gifmode.DecodeTemplate(gifData, quality, base, overlay, rendered.GIFRect)
+			if prepareErr != nil {
+				prepared = true
+				return prepareErr
+			}
+			if err := ctx.Err(); err != nil {
+				prepared = true
+				return err
+			}
+			a.mu.Lock()
+			currentCallsign = strings.TrimSpace(a.settings.Callsign)
+			if currentCallsign == "" {
+				currentCallsign = callsign
+			}
+			a.txImageID++
+			baseImageID = a.txImageID
+			if len(frames) > 1 {
+				a.txImageID += uint8(len(frames) - 1)
+			}
+			duplex = a.audioDuplex
+			a.mu.Unlock()
+			if duplex == nil {
+				prepareErr = audio.ErrRuntimeUnavailable
+				prepared = true
+				return prepareErr
+			}
+			packets, packetStats, encodeErr := gifmode.EncodeContext(ctx, frames, currentCallsign, baseImageID, ssdv.DefaultJPEGQuality)
+			if encodeErr != nil {
+				prepareErr = encodeErr
+				prepared = true
+				return prepareErr
+			}
+			stats = packetStats
+			airtime := gifmode.EstimateAirtime(stats.TotalPackets, parsedProfile.BitRate)
+			if airtime > 10*time.Minute {
+				prepareErr = fmt.Errorf("GIF template requires an estimated %s of airtime (%d packets); the GIF mode safety limit is 10 minutes", airtime.Round(time.Second), stats.TotalPackets)
+				prepared = true
+				return prepareErr
+			}
+			transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: audioRate}
+			if parsedProfile.LinkLayer == "AX.25 UI / HDLC" {
+				transportConfig.Source = ax25.Address{Callsign: currentCallsign, SSID: uint8(ax25SSID)}
+				transportConfig.Destination = ax25.Address{Callsign: ax25To}
+			}
+			encoder, createErr := transport.NewEncoder(transportConfig)
+			if createErr != nil {
+				prepareErr = createErr
+				prepared = true
+				return prepareErr
+			}
+			waveform, prepareErr = encoder.EncodePackets(packets)
+			if prepareErr != nil {
+				prepared = true
+				return fmt.Errorf("modulate GIF template packets: %w", prepareErr)
+			}
+			waveformRate, prepareErr = encoder.SampleRate()
+			if prepareErr == nil {
+				prepareErr = transport.FilterTXWaveformInPlace(domain.TransportMode(profileID), waveform, waveformRate)
+			}
+			if prepareErr != nil {
+				prepared = true
+				return fmt.Errorf("prepare GIF template audio: %w", prepareErr)
+			}
+			prepared = true
+			a.emit("tx:gif-stats", map[string]any{
+				"frames": stats.Frames, "keyframes": stats.Keyframes,
+				"dataPackets": stats.DataPackets, "totalPackets": stats.TotalPackets,
+				"changedMCUs": stats.ChangedMCUs, "totalMCUs": stats.TotalMCUs,
+				"estimatedSeconds": int(airtime.Seconds()),
+			})
+		}
+		if prepareErr != nil {
+			return prepareErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		startedAt := time.Now().UTC()
+		if err := duplex.Transmit(ctx, waveform, func(progress float64) {
+			a.emitTXProgress(waveform, waveformRate, progress)
+		}); err != nil {
+			return err
+		}
+		if err := a.archiveTXGIF(frames, profileID, currentCallsign, baseImageID, stats, startedAt); err != nil {
+			return fmt.Errorf("archive transmitted GIF: %w", err)
+		}
+		a.emit("tx:gif-sent", map[string]any{"fileName": rendered.Name, "frames": stats.Frames, "packetsSent": stats.TotalPackets, "startedAt": startedAt})
+		return nil
+	}
+	return a.startTransmissionWithSender(job, repeat, intervalSeconds, sender)
+}
+
 func (a *App) startTransmission(job txqueue.Job, repeat bool, intervalSeconds int) error {
+	return a.startTransmissionWithSender(job, repeat, intervalSeconds, func(ctx context.Context, item txqueue.Job) error {
+		return a.sendImageJob(ctx, item)
+	})
+}
+
+func (a *App) startTransmissionWithSender(job txqueue.Job, repeat bool, intervalSeconds int, sender txqueue.Sender) error {
+	if sender == nil {
+		return errors.New("TX sender is required")
+	}
 	a.mu.Lock()
 	parent, duplex, test := a.ctx, a.audioDuplex, a.pttTest
 	a.mu.Unlock()
@@ -589,9 +769,7 @@ func (a *App) startTransmission(job txqueue.Job, repeat bool, intervalSeconds in
 		if ctx.Err() == nil {
 			a.emit("tx:state", map[string]any{"active": true})
 		}
-		err := txqueue.Run(ctx, []txqueue.Job{job}, txqueue.Config{Repeat: repeat, Interval: time.Duration(intervalSeconds) * time.Second}, func(sendCtx context.Context, job txqueue.Job) error {
-			return a.sendImageJob(sendCtx, job)
-		}, func(event txqueue.Event) {
+		err := txqueue.Run(ctx, []txqueue.Job{job}, txqueue.Config{Repeat: repeat, Interval: time.Duration(intervalSeconds) * time.Second}, sender, func(event txqueue.Event) {
 			a.emit("tx:status", event)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -699,6 +877,52 @@ func (a *App) archiveTXImage(img image.Image, job txqueue.Job, callsign string, 
 		Type: "TX", ImagePath: path, CreatedAt: created, Profile: job.Profile,
 		Callsign: callsign, ImageID: uint16(imageID), PacketsReceived: packetCount,
 		PacketsExpected: packetCount, Quality: job.Quality, Status: "sent",
+	})
+	if err := storage.SaveJSON(filepath.Join(dir, "album.json"), index); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+func (a *App) archiveTXGIF(frames []gifmode.Frame, profileID, callsign string, imageID uint8, stats gifmode.Stats, transmissionStartedAt time.Time) error {
+	data, err := gifmode.EncodeGIF(frames)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 || len(data) > 16*1024*1024 {
+		return errors.New("transmitted GIF preview is empty or exceeds the 16 MiB album limit")
+	}
+	dir, err := a.requireDataDir()
+	if err != nil {
+		return err
+	}
+	a.albumMu.Lock()
+	defer a.albumMu.Unlock()
+	imageDir := filepath.Join(dir, "album", "images")
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		return err
+	}
+	created := transmissionStartedAt.UTC()
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
+	name := fmt.Sprintf("TX_%s_%s_%03d.gif", created.Format("20060102T150405.000000000Z"), safeAlbumName(callsign), imageID)
+	path := filepath.Join(imageDir, name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	var index album.Index
+	if err := storage.LoadJSON(filepath.Join(dir, "album.json"), &index); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(path)
+		return err
+	}
+	index.Records = append(index.Records, album.Record{
+		ID:   fmt.Sprintf("tx-gif-%s-%d", created.Format("20060102150405.000000000"), imageID),
+		Type: "TX", ImagePath: path, ImageWidth: frames[0].Image.Bounds().Dx(), ImageHeight: frames[0].Image.Bounds().Dy(),
+		CreatedAt: created, Profile: profileID, Callsign: callsign, ImageID: uint16(imageID),
+		PacketsReceived: stats.TotalPackets, PacketsExpected: stats.TotalPackets,
+		Quality: fmt.Sprintf("SSDV GIF · %d frames", stats.Frames), Status: "sent",
 	})
 	if err := storage.SaveJSON(filepath.Join(dir, "album.json"), index); err != nil {
 		_ = os.Remove(path)

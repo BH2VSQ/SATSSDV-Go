@@ -20,19 +20,28 @@ const (
 )
 
 type Packet struct {
-	Raw         [PacketSize]byte
-	Callsign    string
-	ImageID     uint8
-	PacketID    uint16
-	Width       int
-	Height      int
-	Quality     uint8
-	EOI         bool
-	Subsampling uint8
-	MCUOffset   uint8
-	MCUIndex    uint16
-	MCUCount    uint32
-	FEC         bool
+	Raw            [PacketSize]byte
+	Callsign       string
+	ImageID        uint8
+	PacketID       uint16
+	Width          int
+	Height         int
+	Quality        uint8
+	EOI            bool
+	Subsampling    uint8
+	MCUOffset      uint8
+	MCUIndex       uint16
+	MCUCount       uint32
+	FEC            bool
+	GIFMode        bool
+	GIFKeyframe    bool
+	GIFControl     bool
+	GIFFrameStart  bool
+	GIFFrameEnd    bool
+	GIFDataPackets uint16
+	GIFDelayCS     uint16
+	GIFStart       bool // animation stream start
+	GIFEnd         bool // animation stream end
 }
 
 func ParsePacket(raw []byte) (Packet, error) {
@@ -89,6 +98,27 @@ func ParsePacket(raw []byte) (Packet, error) {
 	p.MCUOffset = p.Raw[12]
 	p.MCUIndex = binary.BigEndian.Uint16(p.Raw[13:15])
 	p.FEC = typ == TypeFEC
+	p.GIFMode = flags&0x80 != 0
+	p.GIFKeyframe = flags&0x40 != 0
+	p.GIFControl = p.GIFMode && (p.PacketID == 0xfffe || p.PacketID == 0xffff) && p.MCUOffset == 0xff && p.MCUIndex == 0xffff
+	if p.GIFControl {
+		p.GIFDelayCS = binary.BigEndian.Uint16(p.Raw[15:17])
+		// SGV1 control packets distinguish frame-open and frame-close markers.
+		// Packet IDs 0xfffe/0xffff keep them independently deduplicable by the
+		// existing streaming decoder. Older prototypes used only 0xffff and are
+		// interpreted as an end-of-frame marker.
+		if string(p.Raw[17:21]) == "SGV1" {
+			controlFlags := p.Raw[21]
+			p.GIFStart = controlFlags&0x01 != 0
+			p.GIFEnd = controlFlags&0x02 != 0
+			p.GIFFrameStart = controlFlags&0x04 != 0
+			p.GIFFrameEnd = controlFlags&0x08 != 0
+			p.GIFDataPackets = binary.BigEndian.Uint16(p.Raw[22:24])
+		}
+		if !p.GIFFrameStart && !p.GIFFrameEnd {
+			p.GIFFrameEnd = true // legacy SGV1 delimiter compatibility
+		}
+	}
 	if p.Width == 0 || p.Height == 0 || p.Width > 4080 || p.Height > 4080 || p.Width%16 != 0 || p.Height%16 != 0 {
 		return Packet{}, errors.New("SSDV packet has invalid image dimensions")
 	}

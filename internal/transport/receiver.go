@@ -27,6 +27,15 @@ type ReceivedPacket struct {
 	MCUIndex        uint16 `json:"mcuIndex,omitempty"`
 	MCUCount        uint32 `json:"mcuCount,omitempty"`
 	FEC             bool   `json:"fec"`
+	GIFMode         bool   `json:"gifMode,omitempty"`
+	GIFKeyframe     bool   `json:"gifKeyframe,omitempty"`
+	GIFControl      bool   `json:"gifControl,omitempty"`
+	GIFFrameStart   bool   `json:"gifFrameStart,omitempty"`
+	GIFFrameEnd     bool   `json:"gifFrameEnd,omitempty"`
+	GIFDataPackets  uint16 `json:"gifDataPackets,omitempty"`
+	GIFDelayCS      uint16 `json:"gifDelayCs,omitempty"`
+	GIFStart        bool   `json:"gifStart,omitempty"`
+	GIFEnd          bool   `json:"gifEnd,omitempty"`
 	HasAX25SSID     bool   `json:"hasAX25SSID,omitempty"`
 	AX25SourceSSID  uint8  `json:"ax25SourceSSID,omitempty"`
 	AX25Destination string `json:"ax25Destination,omitempty"`
@@ -115,6 +124,12 @@ func DecodeAudioAtRate(profileID domain.TransportMode, samples []float32, captur
 			item.Callsign, item.ImageID, item.PacketID = p.Callsign, p.ImageID, p.PacketID
 			item.ImageWidth, item.ImageHeight, item.Quality = p.Width, p.Height, p.Quality
 			item.EOI, item.Subsampling, item.MCUOffset, item.MCUIndex, item.MCUCount, item.FEC = p.EOI, p.Subsampling, p.MCUOffset, p.MCUIndex, p.MCUCount, p.FEC
+			item.GIFMode, item.GIFKeyframe, item.GIFControl, item.GIFDelayCS = p.GIFMode, p.GIFKeyframe, p.GIFControl, p.GIFDelayCS
+			item.GIFFrameStart, item.GIFFrameEnd, item.GIFDataPackets = p.GIFFrameStart, p.GIFFrameEnd, p.GIFDataPackets
+			item.GIFStart, item.GIFEnd = p.GIFStart, p.GIFEnd
+			if p.GIFMode {
+				item.Codec = "SSDV-GIF"
+			}
 			item.Raw = append([]byte(nil), p.Raw[:]...)
 		} else {
 			corrected, _, correctionErr := pcsi.CorrectPacket(payload)

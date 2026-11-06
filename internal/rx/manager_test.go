@@ -571,3 +571,12 @@ func TestSSDVPreviewAttemptIsMadeForEveryValidPacket(t *testing.T) {
 		t.Fatalf("first SSDV preview was delayed until packet %d", firstPreviewAt)
 	}
 }
+
+func TestGIFPacketsAreNotRoutedIntoStaticImageAssemblers(t *testing.T) {
+	m := &Manager{}
+	if update, handled := m.process(transport.ReceivedPacket{
+		Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", GIFMode: true,
+	}); handled || update.Codec != "" {
+		t.Fatalf("GIF packets must be excluded from static SSDV/PCSI assemblers: handled=%v update=%+v", handled, update)
+	}
+}

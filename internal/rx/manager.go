@@ -341,6 +341,12 @@ func (m *Manager) pruneSessionsLocked(now time.Time) {
 }
 
 func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
+	// This native Qt build currently transmits the private SSDV-GIF extension
+	// but does not yet expose animated GIF RX reconstruction/playback. Do not
+	// route its control packets into the static SSDV or PCSI image assemblers.
+	if packet.GIFMode || packet.Codec == "SSDV-GIF" {
+		return Update{}, false
+	}
 	if packet.Codec == "SSDV" {
 		parsed, err := ssdv.ParsePacket(packet.Raw)
 		if err != nil {

@@ -49,6 +49,11 @@ type EncodeConfig struct {
 	ImageID  uint8
 	Quality  uint8 // SSDV JPEG quantizer level 0..7; distinct from image dimensions.
 	FEC      bool
+	// GIFMode and Keyframe use the two reserved SSDV flag bits to identify
+	// SATSSDV-Go's non-standard incremental GIF extension. Standard SSDV
+	// packets remain byte-for-byte unchanged when GIFMode is false.
+	GIFMode  bool
+	Keyframe bool
 }
 
 // EncodeImage converts an image into canonical 256-byte SSDV packets. It
@@ -135,6 +140,12 @@ func EncodeImage(src image.Image, cfg EncodeConfig) ([][]byte, error) {
 		binary.BigEndian.PutUint16(packet[7:9], uint16(i))
 		packet[9], packet[10] = byte(width/16), byte(height/16)
 		packet[11] = ((cfg.Quality - 4) & 7) << 3 // MCU mode 0 = 4:2:0.
+		if cfg.GIFMode {
+			packet[11] |= 0x80 // reserved SSDV flag: SATSSDV-Go GIF extension
+			if cfg.Keyframe {
+				packet[11] |= 0x40
+			}
+		}
 		if i == count-1 {
 			packet[11] |= 0x04 // EOI
 		}
@@ -859,7 +870,38 @@ func decodeMCUStrip(templateBytes []byte, templateFrame *jpegFrame, headerEnd in
 // of forcing the image to wait for a contiguous top-to-bottom byte stream.
 // Returned block count is the number of complete MCUs decoded into the canvas.
 func DecodePacketsToPreview(rawPackets [][]byte) (*image.RGBA, Packet, int, error) {
-	return decodePacketsToPreviewInto(nil, rawPackets, true)
+	if len(rawPackets) == 0 {
+		return nil, Packet{}, 0, errors.New("SSDV packet set is empty")
+	}
+	// Older SSDV senders may provide a continuous JPEG entropy stream without
+	// per-packet MCU restart metadata. A GIF recovery keyframe can deliberately
+	// fall back to that standard full-image format; decode it as a complete
+	// JPEG rather than trying to interpret it as sparse MCU segments.
+	legacyStream := true
+	for _, raw := range rawPackets {
+		packet, err := ParsePacket(raw)
+		if err != nil {
+			return nil, Packet{}, 0, err
+		}
+		if packet.MCUOffset != 0xff && packet.MCUIndex != 0xffff {
+			legacyStream = false
+			break
+		}
+	}
+	if legacyStream {
+		jpegData, metadata, err := DecodePacketsToJPEG(rawPackets)
+		if err != nil {
+			return nil, Packet{}, 0, err
+		}
+		decoded, err := jpeg.Decode(bytes.NewReader(jpegData))
+		if err != nil {
+			return nil, Packet{}, 0, fmt.Errorf("decode legacy SSDV JPEG preview: %w", err)
+		}
+		canvas := image.NewRGBA(image.Rect(0, 0, metadata.Width, metadata.Height))
+		draw.Draw(canvas, canvas.Bounds(), decoded, decoded.Bounds().Min, draw.Src)
+		return canvas, metadata, int(metadata.MCUCount), nil
+	}
+	return decodePacketsToPreviewInto(nil, rawPackets, true, false)
 }
 
 // UpdatePacketsPreview overlays only the MCU blocks made newly decodable by
@@ -870,10 +912,21 @@ func UpdatePacketsPreview(canvas *image.RGBA, rawPackets [][]byte) (*image.RGBA,
 	if canvas == nil {
 		return nil, Packet{}, 0, errors.New("SSDV incremental preview canvas is nil")
 	}
-	return decodePacketsToPreviewInto(canvas, rawPackets, false)
+	return decodePacketsToPreviewInto(canvas, rawPackets, false, false)
 }
 
-func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMissing bool) (*image.RGBA, Packet, int, error) {
+// UpdatePacketsPreviewSparse applies only MCU segments delimited by adjacent
+// SSDV packet restart points. It is intended for the GIF extension, where
+// packet IDs may be sparse because unchanged image segments are omitted.
+// An isolated non-EOI packet is not decoded without an explicit end boundary.
+func UpdatePacketsPreviewSparse(canvas *image.RGBA, rawPackets [][]byte) (*image.RGBA, Packet, int, error) {
+	if canvas == nil {
+		return nil, Packet{}, 0, errors.New("SSDV sparse preview canvas is nil")
+	}
+	return decodePacketsToPreviewInto(canvas, rawPackets, false, true)
+}
+
+func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMissing, sparseOnly bool) (*image.RGBA, Packet, int, error) {
 	if len(rawPackets) == 0 {
 		return nil, Packet{}, 0, errors.New("SSDV packet set is empty")
 	}
@@ -954,6 +1007,92 @@ func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMis
 			}
 		}
 	}
+	if sparseOnly {
+		// Sparse GIF frames can omit arbitrary packet ranges. Decode only a
+		// fully present entropy segment bounded by two MCU restart points, or
+		// the final segment from its restart point through the EOI packet. The
+		// latter explicitly handles an EOI tail packet that has no new MCU start.
+		for _, id := range ids {
+			current, ok := byID[uint16(id)]
+			if !ok || current.MCUOffset == 0xff || current.MCUIndex == 0xffff {
+				continue
+			}
+			startID := uint16(id)
+			endID := uint16(0)
+			endOffset := 0
+			endMCU := totalMCUs
+			bounded := false
+			for _, candidateID := range ids {
+				if candidateID <= id {
+					continue
+				}
+				candidate := byID[uint16(candidateID)]
+				if candidate.MCUOffset != 0xff && candidate.MCUIndex != 0xffff && candidate.MCUIndex > current.MCUIndex {
+					endID, endOffset, endMCU, bounded = uint16(candidateID), int(candidate.MCUOffset), int(candidate.MCUIndex), true
+					break
+				}
+			}
+			if !bounded {
+				foundEOI := false
+				for _, candidateID := range ids {
+					if candidateID < id {
+						continue
+					}
+					candidate := byID[uint16(candidateID)]
+					if candidate.EOI {
+						endID, foundEOI = uint16(candidateID), true
+						break
+					}
+				}
+				if !foundEOI {
+					continue
+				}
+			}
+			// Do not bridge omitted packet IDs: the entropy bytes would be
+			// discontinuous and could decode as plausible but incorrect pixels.
+			contiguous := true
+			for packetID := startID; packetID <= endID; packetID++ {
+				if _, exists := byID[packetID]; !exists {
+					contiguous = false
+					break
+				}
+			}
+			if !contiguous {
+				continue
+			}
+			segment := make([]byte, 0, int(endID-startID+1)*payloadSize)
+			for packetID := startID; packetID <= endID; packetID++ {
+				part := byID[packetID]
+				from, to := 0, payloadSize
+				if packetID == startID {
+					from = 15 + int(current.MCUOffset) - 15
+				}
+				if bounded && packetID == endID {
+					to = endOffset
+				}
+				if from < 0 || from > payloadSize || to < from || to > payloadSize {
+					segment = nil
+					break
+				}
+				segment = append(segment, part.Raw[15+from:15+to]...)
+			}
+			if len(segment) == 0 {
+				continue
+			}
+			count := endMCU - int(current.MCUIndex)
+			if count <= 0 {
+				continue
+			}
+			strip, stripErr := decodeMCUStrip(templateBytes, templateFrame, headerEnd, quant, first.Quality, segment, count)
+			if stripErr == nil {
+				placeStrip(strip, int(current.MCUIndex), count)
+			}
+		}
+		if decodedTotal == 0 {
+			return nil, first, 0, errors.New("no complete SSDV MCU update segments are currently decodable")
+		}
+		return canvas, first, decodedTotal, nil
+	}
 	for _, id := range ids {
 		packet := byID[uint16(id)]
 		if packet.MCUOffset == 0xff || packet.MCUIndex == 0xffff {
@@ -961,6 +1100,9 @@ func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMis
 		}
 		if next, ok := byID[uint16(id+1)]; ok && next.MCUOffset != 0xff && next.MCUIndex != 0xffff && next.MCUIndex > packet.MCUIndex {
 			continue // the adjacent-packet strip below can decode this range exactly
+		}
+		if sparseOnly && !packet.EOI {
+			continue // sparse GIF deltas need a following restart point for a bounded segment
 		}
 		start := 15 + int(packet.MCUOffset)
 		end := 15 + payloadSize
@@ -1457,4 +1599,74 @@ func patchJPEGHeader(header []byte, width, height int, tables [2][64]byte) error
 		off += length
 	}
 	return errors.New("JPEG SOS marker missing while patching header")
+}
+
+// NewGIFControlPacket is the legacy frame-close constructor retained for
+// compatibility with early SATSSDV-Go GIF prototypes.
+func NewGIFControlPacket(callsign string, imageID uint8, width, height int, quality uint8, delayCS uint16, keyframe, streamStart, streamEnd bool) ([]byte, error) {
+	return NewGIFFrameControlPacket(callsign, imageID, width, height, quality, delayCS, 0, false, true, streamStart, streamEnd, keyframe)
+}
+
+// NewGIFFrameControlPacket creates a versioned frame-boundary packet. A frame
+// open marker (PacketID 0xfffe) carries the expected number of image-data
+// packets, allowing RX to show an accurate live packet counter before frame
+// close. A frame close marker (PacketID 0xffff) commits the composed frame.
+// Repeated copies are identical and are removed by the transport deduplicator.
+func NewGIFFrameControlPacket(callsign string, imageID uint8, width, height int, quality uint8, delayCS uint16, dataPackets uint16, frameStart, frameEnd, streamStart, streamEnd, keyframe bool) ([]byte, error) {
+	if width < 16 || height < 16 || width > 4080 || height > 4080 || width%16 != 0 || height%16 != 0 {
+		return nil, errors.New("GIF control packet dimensions must be SSDV-aligned multiples of 16")
+	}
+	if quality > 7 {
+		return nil, errors.New("GIF control packet quality must be 0..7")
+	}
+	if frameStart == frameEnd {
+		return nil, errors.New("GIF frame control must be exactly one of frame-start or frame-end")
+	}
+	call, err := EncodeBase40(callsign)
+	if err != nil {
+		return nil, err
+	}
+	packet := make([]byte, PacketSize)
+	packet[0], packet[1] = SyncWord, TypeFEC
+	binary.BigEndian.PutUint32(packet[2:6], call)
+	packet[6] = imageID
+	if frameStart {
+		binary.BigEndian.PutUint16(packet[7:9], 0xfffe)
+	} else {
+		binary.BigEndian.PutUint16(packet[7:9], 0xffff)
+	}
+	packet[9], packet[10] = byte(width/16), byte(height/16)
+	packet[11] = (((quality - 4) & 7) << 3) | 0x04 | 0x80
+	if keyframe {
+		packet[11] |= 0x40
+	}
+	packet[12] = 0xff
+	binary.BigEndian.PutUint16(packet[13:15], 0xffff)
+	binary.BigEndian.PutUint16(packet[15:17], delayCS)
+	fillSSDVNoise(packet[17:220])
+	copy(packet[17:21], []byte("SGV1"))
+	// This byte is protocol metadata, not opaque padding. Clear it before
+	// setting flags; otherwise the random filler would spuriously assert
+	// GIFStart/GIFEnd/frame-boundary bits and reset RX sessions unpredictably.
+	packet[21] = 0
+	if streamStart {
+		packet[21] |= 0x01
+	}
+	if streamEnd {
+		packet[21] |= 0x02
+	}
+	if frameStart {
+		packet[21] |= 0x04
+	}
+	if frameEnd {
+		packet[21] |= 0x08
+	}
+	binary.BigEndian.PutUint16(packet[22:24], dataPackets)
+	binary.BigEndian.PutUint32(packet[220:224], crc32.ChecksumIEEE(packet[1:220]))
+	parity, err := fec.RS8Parity(packet[1:224])
+	if err != nil {
+		return nil, err
+	}
+	copy(packet[224:], parity)
+	return packet, nil
 }

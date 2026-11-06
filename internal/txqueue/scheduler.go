@@ -23,12 +23,13 @@ type Config struct {
 	MaxCycles int           `json:"maxCycles"`
 }
 type Event struct {
-	Job   Job    `json:"job"`
-	Index int    `json:"index"`
-	Total int    `json:"total"`
-	Cycle int    `json:"cycle"`
-	Phase string `json:"phase"`
-	Error string `json:"error,omitempty"`
+	Job              Job    `json:"job"`
+	Index            int    `json:"index"`
+	Total            int    `json:"total"`
+	Cycle            int    `json:"cycle"`
+	Phase            string `json:"phase"`
+	RemainingSeconds int    `json:"remainingSeconds,omitempty"`
+	Error            string `json:"error,omitempty"`
 }
 type Sender func(context.Context, Job) error
 type Observer func(Event)
@@ -63,7 +64,7 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 			}
 			emit(observe, Event{
 				Job: j, Index: index, Total: len(jobs), Cycle: cycleNumber,
-				Phase: "countdown", Error: fmt.Sprintf("%d", seconds),
+				Phase: "countdown", RemainingSeconds: seconds, Error: fmt.Sprintf("%d", seconds),
 			})
 		})
 	}

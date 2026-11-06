@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 #include <QSizePolicy>
 #include <QResizeEvent>
 #include <QSignalBlocker>
@@ -113,8 +114,29 @@ public:
     explicit SpectrumWaterfallWidget(QWidget *parent = nullptr)
         : QWidget(parent), m_waterfall(640, 220, QImage::Format_RGB32) {
         m_waterfall.fill(m_backgroundColor);
+        m_decayTimer.setTimerType(Qt::PreciseTimer);
+        m_decayTimer.setInterval(1000 / m_rowsPerSecond);
+        connect(&m_decayTimer, &QTimer::timeout, this, [this] { appendBlankRow(); });
         setMinimumHeight(95);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    }
+
+    // TX audio stops between repeat bursts. Continue inserting empty rows at
+    // the configured waterfall rate so the final burst scrolls upward and
+    // naturally disappears instead of remaining frozen on screen.
+    void setStreaming(bool active) {
+        if (active) {
+            m_streaming = true;
+            m_decayTimer.stop();
+            m_decayRowsRemaining = 0;
+            return;
+        }
+        m_streaming = false;
+        if (m_hasData && !m_decayTimer.isActive()) {
+            m_decayRowsRemaining = m_waterfall.height();
+            m_decayTimer.setInterval(qMax(25, 1000 / qMax(1, m_rowsPerSecond)));
+            m_decayTimer.start();
+        }
     }
 
     void setDisplaySettings(const QJsonObject &settings) {
@@ -139,6 +161,10 @@ public:
         m_waterfall = QImage(640, historyRows, QImage::Format_RGB32);
         m_waterfall.fill(m_backgroundColor);
         m_lastUpdateMs = 0;
+        m_decayTimer.setInterval(qMax(25, 1000 / qMax(1, m_rowsPerSecond)));
+        m_decayTimer.stop();
+        m_decayRowsRemaining = 0;
+        m_hasData = false;
         update();
     }
 
@@ -148,6 +174,10 @@ public:
         const qint64 interval = qMax<qint64>(1, 1000 / qMax(1, m_rowsPerSecond));
         if (m_lastUpdateMs > 0 && now - m_lastUpdateMs < interval) return;
         m_lastUpdateMs = now;
+        m_hasData = true;
+        m_streaming = true;
+        m_decayTimer.stop();
+        m_decayRowsRemaining = 0;
         QVector<double> values;
         values.reserve(bins.size());
         double firstHz = bins.first().toObject().value(QStringLiteral("frequencyHz")).toDouble(0.0);
@@ -223,6 +253,27 @@ protected:
     }
 
 private:
+    void appendBlankRow() {
+        if (m_streaming || !m_hasData || m_waterfall.isNull()) {
+            m_decayTimer.stop();
+            return;
+        }
+        const qsizetype stride = m_waterfall.bytesPerLine();
+        const qsizetype moveBytes = stride * qMax(0, m_waterfall.height() - 1);
+        if (moveBytes > 0) {
+            std::memmove(m_waterfall.bits(), m_waterfall.constBits() + stride, size_t(moveBytes));
+        }
+        QRgb *newest = reinterpret_cast<QRgb *>(m_waterfall.scanLine(m_waterfall.height() - 1));
+        std::fill(newest, newest + m_waterfall.width(), m_backgroundColor.rgb());
+        if (m_decayRowsRemaining > 0) --m_decayRowsRemaining;
+        if (m_decayRowsRemaining <= 0) {
+            m_decayTimer.stop();
+            m_waterfall.fill(m_backgroundColor);
+            m_hasData = false;
+        }
+        update();
+    }
+
     QColor colorFor(double value) const {
         const QList<QColor> stops{m_backgroundColor, m_lowColor, m_midColor, m_highColor, m_peakColor};
         const double scaled = qBound(0.0, value, 1.0) * (stops.size() - 1);
@@ -235,6 +286,10 @@ private:
     }
 
     QImage m_waterfall;
+    QTimer m_decayTimer;
+    int m_decayRowsRemaining = 0;
+    bool m_hasData = false;
+    bool m_streaming = false;
     int m_minFrequencyHz = 0;
     int m_maxFrequencyHz = 5000;
     int m_minDbfs = -110;
@@ -1312,6 +1367,17 @@ void MainWindow::refreshInlineTemplateEditor() {
     const bool isText = valid && type == QStringLiteral("text");
     const bool isImage = valid && type == QStringLiteral("image");
     const bool isImageLayer = isImage || (valid && type == QStringLiteral("last-rx-image"));
+    bool isGIFImage = false;
+    if (isImage) {
+        const QString assetId = component.value(QStringLiteral("assetId")).toString();
+        for (const QJsonValue &assetValue : m_gallery) {
+            const QJsonObject asset = assetValue.toObject();
+            if (asset.value(QStringLiteral("id")).toString() == assetId) {
+                isGIFImage = asset.value(QStringLiteral("name")).toString().endsWith(QStringLiteral(".gif"), Qt::CaseInsensitive);
+                break;
+            }
+        }
+    }
     const QSignalBlocker b1(m_componentTextEdit), b2(m_componentAssetCombo), b3(m_componentScaleSlider),
         b4(m_componentFontSlider), b5(m_componentOutlineSlider), b6(m_componentBoldCheck),
         b7(m_componentVisibleCheck), b8(m_componentOutlineCheck);
@@ -1334,7 +1400,7 @@ void MainWindow::refreshInlineTemplateEditor() {
     if (m_componentOutlineSlider) { m_componentOutlineSlider->setValue(qBound(0, component.value(QStringLiteral("outlineWidth")).toInt(2), 20)); m_componentOutlineSlider->setEnabled(valid); }
     if (m_componentBoldCheck) { m_componentBoldCheck->setChecked(component.value(QStringLiteral("bold")).toBool()); m_componentBoldCheck->setEnabled(isText); }
     if (m_componentVisibleCheck) { m_componentVisibleCheck->setChecked(component.value(QStringLiteral("visible")).toBool(true)); m_componentVisibleCheck->setEnabled(valid); }
-    if (m_componentOutlineCheck) { m_componentOutlineCheck->setChecked(component.value(QStringLiteral("outline")).toBool(true)); m_componentOutlineCheck->setEnabled(valid); }
+    if (m_componentOutlineCheck) { m_componentOutlineCheck->setChecked(!isGIFImage && component.value(QStringLiteral("outline")).toBool(true)); m_componentOutlineCheck->setEnabled(valid && !isGIFImage); }
     const QString color = valueOr(component, QStringLiteral("color"), QStringLiteral("#ffffff"));
     const QString outline = valueOr(component, QStringLiteral("outlineColor"), QStringLiteral("#000000"));
     if (m_componentColorButton) {
@@ -1347,7 +1413,7 @@ void MainWindow::refreshInlineTemplateEditor() {
         m_componentOutlineColorButton->setProperty("color", outline);
         m_componentOutlineColorButton->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(outline, QColor(outline).lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
     }
-    if (m_componentEditorHint) m_componentEditorHint->setText(!valid ? uiText(QStringLiteral("选择一个组件后即可修改属性。")) : isText ? uiText(QStringLiteral("文字组件：支持变量替换、字号、颜色、粗体和描边。拖动画布可移动位置。")) : uiText(QStringLiteral("图像组件：可调整等比例缩放、可见性和描边。拖动画布可移动位置。")));
+    if (m_componentEditorHint) m_componentEditorHint->setText(!valid ? uiText(QStringLiteral("选择一个组件后即可修改属性。")) : isText ? uiText(QStringLiteral("文字组件：支持变量替换、字号、颜色、粗体和描边。拖动画布可移动位置。")) : isGIFImage ? uiText(QStringLiteral("GIF 图像组件：支持增量动画发射；不支持软件描边。拖动画布可移动位置。")) : uiText(QStringLiteral("图像组件：可调整等比例缩放、可见性和描边。拖动画布可移动位置。")));
 }
 
 void MainWindow::applyInlineTemplateProperties() {
@@ -1824,6 +1890,7 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         m_txProgress->setValue(static_cast<int>(payloadValue.toDouble()*1000.0));
     } else if(name==QStringLiteral("tx:state")){
         m_txActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
+        if (m_txSpectrum) m_txSpectrum->setStreaming(m_txActive);
         if (!m_txActive) m_txCountdownActive = false;
         updateRepeatControls();
         updateTXToggle();
@@ -1837,14 +1904,15 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         if (phase == QStringLiteral("countdown") && m_repeat && m_repeat->isChecked()) {
             m_txCountdownActive = true;
             updateRepeatControls();
-            const int remaining = qMax(0, p.value(QStringLiteral("error")).toInt());
+            const int remaining = qMax(0, p.value(QStringLiteral("remainingSeconds")).toInt());
             m_repeatInterval->setValue(remaining);
             statusBar()->showMessage(uiText(QStringLiteral("循环发射倒计时：%1 秒")).arg(remaining));
         } else if (phase == QStringLiteral("sending") || phase == QStringLiteral("completed")) {
-            // Keep the display at zero during the actual transmission. The
-            // next countdown event restores the configured interval only
-            // after the current image has completed.
+            // Keep the display at zero during transmission. When a burst
+            // finishes, TX waterfall enters idle-scroll mode and clears old
+            // rows during the inter-cycle countdown.
             m_txCountdownActive = false;
+            if (m_txSpectrum) m_txSpectrum->setStreaming(phase == QStringLiteral("sending"));
             updateRepeatControls();
         } else if (phase == QStringLiteral("cancelled")) {
             m_txCountdownActive = false;
@@ -1927,6 +1995,205 @@ QImage MainWindow::renderTemplate(QString *errorMessage) {
     painter.end();if(errorMessage)errorMessage->clear();return image;
 }
 
+QJsonObject MainWindow::buildRenderedTXPayload(const QImage &preview, QString *errorMessage) {
+    QJsonObject rendered;
+    if (preview.isNull()) {
+        if (errorMessage) *errorMessage = uiText(QStringLiteral("无法生成发送图像"));
+        return rendered;
+    }
+    QByteArray previewPNG;
+    QBuffer previewBuffer(&previewPNG);
+    if (!previewBuffer.open(QIODevice::WriteOnly) || !preview.save(&previewBuffer, "PNG")) {
+        if (errorMessage) *errorMessage = uiText(QStringLiteral("无法将发送模板编码为 PNG"));
+        return rendered;
+    }
+    rendered.insert(QStringLiteral("id"), QStringLiteral("qt-%1").arg(QDateTime::currentMSecsSinceEpoch()));
+    rendered.insert(QStringLiteral("name"), valueOr(selectedTemplate(), QStringLiteral("name"), QStringLiteral("Qt Native Template")));
+    rendered.insert(QStringLiteral("pngBase64"), QString::fromLatin1(previewPNG.toBase64()));
+
+    struct TXLayer {
+        QJsonObject component;
+        QString type;
+        QString dataUrl;
+        QImage image;
+        bool gif = false;
+    };
+    const QSize size = preview.size();
+    const QJsonObject templateObject = selectedTemplate();
+    const QJsonArray components = templateObject.value(QStringLiteral("components")).toArray();
+    QVector<TXLayer> layers;
+    layers.reserve(components.size());
+    int gifCount = 0;
+    int gifLayerIndex = -1;
+
+    for (const QJsonValue &value : components) {
+        const QJsonObject component = value.toObject();
+        if (component.contains(QStringLiteral("visible")) && !component.value(QStringLiteral("visible")).toBool()) continue;
+        const QString type = component.value(QStringLiteral("type")).toString();
+        if (type != QStringLiteral("text") && type != QStringLiteral("image") && type != QStringLiteral("last-rx-image")) continue;
+        TXLayer layer;
+        layer.component = component;
+        layer.type = type;
+        if (type == QStringLiteral("image") || type == QStringLiteral("last-rx-image")) {
+            QString loadError;
+            layer.dataUrl = type == QStringLiteral("image")
+                ? m_backend->callSync(QStringLiteral("GetGalleryImageData"), QJsonArray{component.value(QStringLiteral("assetId")).toString()}, &loadError, 10000).toString()
+                : m_backend->callSync(QStringLiteral("GetLatestRXImageData"), {}, &loadError, 10000).toString();
+            if (!loadError.isEmpty()) {
+                if (errorMessage) *errorMessage = loadError;
+                return {};
+            }
+            layer.image = imageFromDataUrl(layer.dataUrl);
+            layer.gif = type == QStringLiteral("image") && layer.dataUrl.startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive);
+            if (layer.gif) {
+                ++gifCount;
+                gifLayerIndex = layers.size();
+                if (layer.image.isNull()) {
+                    if (errorMessage) *errorMessage = uiText(QStringLiteral("无法解码模板中的 GIF 图像，请重新导入 GIF 文件"));
+                    return {};
+                }
+            }
+        }
+        layers.push_back(std::move(layer));
+    }
+
+    if (gifCount == 0) {
+        if (errorMessage) errorMessage->clear();
+        return rendered;
+    }
+    if (gifCount > 1) {
+        if (errorMessage) *errorMessage = uiText(QStringLiteral("当前 GIF 增量发射每个模板只支持一个可见 GIF 图像组件"));
+        return {};
+    }
+
+    QImage base(size, QImage::Format_ARGB32_Premultiplied);
+    base.fill(QColor(QStringLiteral("#17232d")));
+    QImage overlay(size, QImage::Format_ARGB32_Premultiplied);
+    overlay.fill(Qt::transparent);
+
+    const QString backgroundId = valueOr(m_settings, QStringLiteral("templateBackgroundAssetId"), templateObject.value(QStringLiteral("backgroundAssetId")).toString());
+    if (!backgroundId.isEmpty()) {
+        QString backgroundError;
+        const QString data = m_backend->callSync(QStringLiteral("GetGalleryImageData"), QJsonArray{backgroundId}, &backgroundError, 10000).toString();
+        if (!backgroundError.isEmpty()) {
+            if (errorMessage) *errorMessage = backgroundError;
+            return {};
+        }
+        const QImage background = imageFromDataUrl(data);
+        if (!background.isNull()) {
+            QPainter painter(&base);
+            painter.setRenderHint(QPainter::SmoothPixmapTransform);
+            const qreal factor = qMax(size.width() / qreal(background.width()), size.height() / qreal(background.height()));
+            const QSizeF scaled(background.width() * factor, background.height() * factor);
+            painter.drawImage(QRectF((size.width() - scaled.width()) / 2.0, (size.height() - scaled.height()) / 2.0, scaled.width(), scaled.height()), background);
+        }
+    }
+
+    auto drawLayer = [this, &size](QPainter &painter, const TXLayer &layer) {
+        const QJsonObject &component = layer.component;
+        const qreal x = size.width() * component.value(QStringLiteral("x")).toDouble() / 100.0;
+        const qreal y = size.height() * component.value(QStringLiteral("y")).toDouble() / 100.0;
+        if (layer.type == QStringLiteral("text")) {
+            const qreal scale = size.height() / 480.0;
+            const qreal fontSize = qMax(6.0, component.value(QStringLiteral("fontSize")).toDouble(24.0) * scale);
+            QFont font(QStringLiteral("Segoe UI"));
+            font.setPixelSize(qRound(fontSize));
+            font.setBold(component.value(QStringLiteral("bold")).toBool());
+            painter.setFont(font);
+            const QString text = resolveTemplateText(component.value(QStringLiteral("text")).toString());
+            const QColor fill(valueOr(component, QStringLiteral("color"), QStringLiteral("#ffffff")));
+            const QColor outlineColor(valueOr(component, QStringLiteral("outlineColor"), QStringLiteral("#000000")));
+            const qreal outlineWidth = component.value(QStringLiteral("outlineWidth")).toDouble(2.0) * scale;
+            qreal baseline = y + fontSize;
+            for (const QString &line : text.split(QLatin1Char('\n'))) {
+                if (component.value(QStringLiteral("outline")).toBool(true) && outlineWidth > 0) {
+                    QPainterPath path;
+                    path.addText(QPointF(x, baseline), font, line);
+                    painter.strokePath(path, QPen(outlineColor, outlineWidth * 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+                    painter.fillPath(path, fill);
+                } else {
+                    painter.setPen(fill);
+                    painter.drawText(QPointF(x, baseline), line);
+                }
+                baseline += fontSize * 1.22;
+            }
+            return;
+        }
+        if (layer.image.isNull()) {
+            if (layer.type == QStringLiteral("last-rx-image")) {
+                const QRectF frame(x, y, size.width() * 0.35, size.height() * 0.35 * 0.75);
+                painter.fillRect(frame, QColor(18, 30, 40, 220));
+                painter.setPen(QColor(QStringLiteral("#d8e0e5")));
+                painter.drawText(frame, Qt::AlignCenter, QStringLiteral("LAST RX"));
+            }
+            return;
+        }
+        const qreal fit = qMin(size.width() / qreal(layer.image.width()), size.height() / qreal(layer.image.height()));
+        const qreal factor = fit * qBound(0.01, component.value(QStringLiteral("scale")).toDouble(35.0) / 100.0, 1.0);
+        const QRectF rect(x, y, layer.image.width() * factor, layer.image.height() * factor);
+        if (!layer.gif && component.value(QStringLiteral("outline")).toBool(true) && component.value(QStringLiteral("outlineWidth")).toDouble(2.0) > 0) {
+            drawAlphaContourOutline(painter, layer.image, rect,
+                QColor(valueOr(component, QStringLiteral("outlineColor"), QStringLiteral("#000000"))),
+                component.value(QStringLiteral("outlineWidth")).toDouble(2.0) * size.height() / 480.0);
+        } else if (!layer.gif) {
+            painter.drawImage(rect, layer.image);
+        }
+    };
+
+    QPainter basePainter(&base);
+    basePainter.setRenderHint(QPainter::Antialiasing);
+    basePainter.setRenderHint(QPainter::TextAntialiasing);
+    basePainter.setRenderHint(QPainter::SmoothPixmapTransform);
+    QPainter overlayPainter(&overlay);
+    overlayPainter.setRenderHint(QPainter::Antialiasing);
+    overlayPainter.setRenderHint(QPainter::TextAntialiasing);
+    overlayPainter.setRenderHint(QPainter::SmoothPixmapTransform);
+
+    bool drawAboveGIF = false;
+    QRect gifRect;
+    QByteArray gifBytes;
+    for (int i = 0; i < layers.size(); ++i) {
+        const TXLayer &layer = layers.at(i);
+        if (i == gifLayerIndex) {
+            const QJsonObject component = layer.component;
+            const qreal x = size.width() * component.value(QStringLiteral("x")).toDouble() / 100.0;
+            const qreal y = size.height() * component.value(QStringLiteral("y")).toDouble() / 100.0;
+            const qreal fit = qMin(size.width() / qreal(layer.image.width()), size.height() / qreal(layer.image.height()));
+            const qreal factor = fit * qBound(0.01, component.value(QStringLiteral("scale")).toDouble(35.0) / 100.0, 1.0);
+            const QRectF destination(x, y, layer.image.width() * factor, layer.image.height() * factor);
+            gifRect = QRect(qRound(destination.x()), qRound(destination.y()), qMax(1, qRound(destination.width())), qMax(1, qRound(destination.height())));
+            gifBytes = imageDataUrlBytes(layer.dataUrl);
+            drawAboveGIF = true;
+            continue;
+        }
+        drawLayer(drawAboveGIF ? overlayPainter : basePainter, layer);
+    }
+    basePainter.end();
+    overlayPainter.end();
+
+    if (gifBytes.isEmpty() || gifRect.isEmpty()) {
+        if (errorMessage) *errorMessage = uiText(QStringLiteral("无法提取模板 GIF 原始数据或显示区域"));
+        return {};
+    }
+    QByteArray basePNG;
+    QByteArray overlayPNG;
+    QBuffer baseBuffer(&basePNG), overlayBuffer(&overlayPNG);
+    if (!baseBuffer.open(QIODevice::WriteOnly) || !base.save(&baseBuffer, "PNG") ||
+        !overlayBuffer.open(QIODevice::WriteOnly) || !overlay.save(&overlayBuffer, "PNG")) {
+        if (errorMessage) *errorMessage = uiText(QStringLiteral("无法编码 GIF 模板的静态图层"));
+        return {};
+    }
+    rendered.insert(QStringLiteral("gifBase64"), QString::fromLatin1(gifBytes.toBase64()));
+    rendered.insert(QStringLiteral("overlayPNGBase64"), QString::fromLatin1(overlayPNG.toBase64()));
+    rendered.insert(QStringLiteral("pngBase64"), QString::fromLatin1(basePNG.toBase64()));
+    rendered.insert(QStringLiteral("gifRect"), QJsonObject{
+        {QStringLiteral("x"), gifRect.x()}, {QStringLiteral("y"), gifRect.y()},
+        {QStringLiteral("width"), gifRect.width()}, {QStringLiteral("height"), gifRect.height()}
+    });
+    if (errorMessage) errorMessage->clear();
+    return rendered;
+}
+
 void MainWindow::startTX() {
     if (m_txPreparing || m_txActive || !m_backend || !m_backend->isRunning()) return;
     if (!m_audioConnected) { showError(uiText(QStringLiteral("音频后端异常"))); return; }
@@ -1966,20 +2233,16 @@ void MainWindow::startTX() {
         showError(renderError.isEmpty() ? uiText(QStringLiteral("无法生成发送图像")) : renderError);
         return;
     }
-    QByteArray png;
-    QBuffer buffer(&png);
-    if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "PNG")) {
+    m_txPreview->setSourceImage(image);
+    QString payloadError;
+    QJsonObject rendered = buildRenderedTXPayload(image, &payloadError);
+    if (rendered.isEmpty()) {
         m_txPreparing = false;
+        updateRepeatControls();
         updateTXToggle();
-        showError(uiText(QStringLiteral("无法将发送模板编码为 PNG")));
+        showError(payloadError.isEmpty() ? uiText(QStringLiteral("无法准备发送模板")) : payloadError);
         return;
     }
-    m_txPreview->setSourceImage(image);
-
-    QJsonObject rendered;
-    rendered.insert(QStringLiteral("id"), QStringLiteral("qt-%1").arg(QDateTime::currentMSecsSinceEpoch()));
-    rendered.insert(QStringLiteral("name"), QStringLiteral("Qt Native Template"));
-    rendered.insert(QStringLiteral("pngBase64"), QString::fromLatin1(png.toBase64()));
     const int repeatInterval = m_repeat->isChecked() ? m_repeatIntervalSeconds : m_repeatInterval->value();
     const QJsonArray args{rendered, m_repeat->isChecked(), repeatInterval, ax25To};
     m_backend->call(QStringLiteral("StartTXRendered"), args, [this](bool ok, const QJsonValue &, const QString &error) {

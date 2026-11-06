@@ -202,6 +202,12 @@ func parseImagePacket(profile domain.Profile, raw []byte) (ReceivedPacket, error
 		item.ImageWidth, item.ImageHeight, item.Quality = parsed.Width, parsed.Height, parsed.Quality
 		item.EOI, item.Subsampling = parsed.EOI, parsed.Subsampling
 		item.MCUOffset, item.MCUIndex, item.FEC = parsed.MCUOffset, parsed.MCUIndex, parsed.FEC
+		item.GIFMode, item.GIFKeyframe, item.GIFControl, item.GIFDelayCS = parsed.GIFMode, parsed.GIFKeyframe, parsed.GIFControl, parsed.GIFDelayCS
+		item.GIFFrameStart, item.GIFFrameEnd, item.GIFDataPackets = parsed.GIFFrameStart, parsed.GIFFrameEnd, parsed.GIFDataPackets
+		item.GIFStart, item.GIFEnd = parsed.GIFStart, parsed.GIFEnd
+		if parsed.GIFMode {
+			item.Codec = "SSDV-GIF"
+		}
 		item.Raw = append([]byte(nil), parsed.Raw[:]...)
 		return item, nil
 	}
@@ -224,6 +230,11 @@ func (d *StreamDecoder) markNew(packet ReceivedPacket) bool {
 	}
 	key := fmt.Sprintf("%s|%s|%03d", packet.Profile, packet.Callsign, packet.ImageID)
 	state := d.imageStates[key]
+	if state != nil && packet.GIFMode && state.complete && !packet.GIFControl {
+		// GIF frame IDs are 8-bit. A completed frame ID can be reused after
+		// wraparound; the next packet starts a fresh deduplication state.
+		state = nil
+	}
 	if state != nil && packet.PacketID == 0 {
 		hasPacketZero := len(state.packetZero) > 0
 		samePacketZero := hasPacketZero && bytes.Equal(state.packetZero, packet.Raw)
@@ -250,11 +261,13 @@ func (d *StreamDecoder) markNew(packet ReceivedPacket) bool {
 	if packet.PacketID == 0 {
 		state.packetZero = append(state.packetZero[:0], packet.Raw...)
 	}
-	if packet.EOI {
+	if packet.GIFControl {
+		state.complete = true
+	} else if packet.EOI && !packet.GIFMode {
 		state.eoiPacketID = packet.PacketID
 		state.hasEOI = true
 	}
-	if state.hasEOI {
+	if state.hasEOI && !packet.GIFMode {
 		state.complete = true
 		for id := uint16(0); id <= state.eoiPacketID; id++ {
 			if _, exists := state.seen[id]; !exists {
