@@ -43,7 +43,7 @@ TemplateCanvas::TemplateCanvas(QWidget *parent) : QWidget(parent) {
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
-    setToolTip(uiText(QStringLiteral("拖动组件移动；拖动右下角控制点调整字号或图像比例；选中后按 Delete 删除")));
+
 }
 
 void TemplateCanvas::setDocument(const QJsonArray &components,
@@ -224,9 +224,7 @@ void TemplateCanvas::paintEvent(QPaintEvent *) {
     }
     painter.restore();
 
-    painter.setPen(QColor(QStringLiteral("#718896")));
-    painter.drawText(QRectF(8, height() - 22, width() - 16, 16), Qt::AlignRight | Qt::AlignVCenter,
-                     uiText(QStringLiteral("640 × 480")));
+
 }
 
 void TemplateCanvas::mousePressEvent(QMouseEvent *event) {

@@ -29,6 +29,8 @@ checks = {
     "text hint is borderless": 'background:transparent; border:0;' in text["cpp"],
     "horizontal slider has no frame": "QSlider { border:0; background:transparent; padding:0; }" in text["cpp"] and "QSlider::groove:horizontal" in text["cpp"],
     "canvas no longer displays drag/resize caption": "拖动以移动" not in text["canvas"] and "右下角调整大小" not in text["canvas"],
+    "canvas has no hover tooltip": "setToolTip(" not in text["canvas"],
+    "canvas has no resolution label": "640 × 480" not in text["canvas"],
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
