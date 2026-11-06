@@ -1187,7 +1187,6 @@ void MainWindow::refreshTemplates() {
         }
     }
     const QString current=m_template->currentData().toString(); m_template->clear();
-    const QString current=m_template->currentData().toString(); m_template->clear();
     for(const auto &item:m_templates){const auto tpl=item.toObject();m_template->addItem(tpl.value(QStringLiteral("name")).toString(),tpl.value(QStringLiteral("id")).toString());}
     int index = m_template->findData(current);
     if (index < 0 && m_template->count() > 0) index = 0;

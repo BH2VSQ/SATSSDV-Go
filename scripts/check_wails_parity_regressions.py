@@ -8,6 +8,7 @@ header = (root / "qt6/mainwindow.h").read_text(encoding="utf-8")
 canvas = (root / "qt6/template_canvas.cpp").read_text(encoding="utf-8")
 
 assert "m_ax25To" not in cpp + header, "AX.25 To must not be shown as a user-facing field"
+assert cpp.count('    const QString current=m_template->currentData().toString(); m_template->clear();') == 1, "refreshTemplates must declare current exactly once"
 assert 'addQsoField(0, 1, uiText(QStringLiteral("对方呼号")), &m_hisCall);' in cpp
 assert "m_ax25SSIDField->setVisible(ax25)" in cpp
 assert "m_txPreparing" in cpp and 'QStringLiteral("tx.preparing")' in cpp

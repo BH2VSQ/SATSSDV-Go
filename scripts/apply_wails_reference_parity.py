@@ -226,7 +226,7 @@ cpp = replace_once(
             if (!settingsError.isEmpty()) appendLog(QStringLiteral("Unable to save image-outline migration state: ") + settingsError);
         }
     }
-    const QString current=m_template->currentData().toString(); m_template->clear();""",
+""",
     "migrate existing image layers to Wails contour outline default",
 )
 
