@@ -50,6 +50,8 @@ private:
     void selectInlineGalleryAsset();
     void updateRXToggle();
     void updateTXToggle();
+    void updateTXProfileControls();
+    void clearHisCallForCQTemplate();
     void toggleRX();
     void toggleTX();
     void applyLanguage(const QString &locale);
@@ -86,6 +88,9 @@ private:
     bool m_rxActive = false;
     bool m_txActive = false;
     bool m_txToneActive = false;
+    bool m_txPreparing = false;
+    bool m_audioConnected = false;
+    bool m_hisCallManuallyEdited = false;
     int m_repeatIntervalSeconds = 120;
     QJsonObject m_settings;
     QJsonObject m_localeDictionary;
@@ -104,7 +109,7 @@ private:
     QLineEdit *m_report = nullptr;
     QLineEdit *m_qth = nullptr;
     QLineEdit *m_message = nullptr;
-    QLineEdit *m_ax25To = nullptr;
+    QWidget *m_ax25SSIDField = nullptr;
     QSpinBox *m_ax25SSID = nullptr;
     QCheckBox *m_repeat = nullptr;
     QSpinBox *m_repeatInterval = nullptr;

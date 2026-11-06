@@ -1,0 +1,14 @@
+Command:
+  node --test frontend/ui_structure.test.cjs
+
+Result:
+  1 test passed, 0 failed.
+
+The test output covered Wails UI structure, TX settings and preset behavior,
+localization/alignment, preview/background logic, waterfall/component behavior,
+alpha-contour image outlines, RX callsign auto-fill, and RX preview/waterfall behavior.
+
+Qt 6 validation status:
+  The modified Qt client has not been compiled or run in this environment.
+  Qt 6 development libraries/tools were not available here, and GitHub branch
+  creation was denied by the connected GitHub integration (HTTP 403).

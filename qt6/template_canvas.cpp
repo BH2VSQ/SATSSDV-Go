@@ -1,4 +1,6 @@
 #include "template_canvas.h"
+#include "alpha_outline.h"
+#include "ui_i18n.h"
 
 #include <QFont>
 #include <QFontMetricsF>
@@ -21,11 +23,11 @@ QString componentType(const QJsonObject &component) {
 }
 
 qreal componentX(const QJsonObject &component) {
-    return qBound(0.0, component.value(QStringLiteral("x")).toDouble(), 100.0) * kCanvasWidth / 100.0;
+    return component.value(QStringLiteral("x")).toDouble() * kCanvasWidth / 100.0;
 }
 
 qreal componentY(const QJsonObject &component) {
-    return qBound(0.0, component.value(QStringLiteral("y")).toDouble(), 100.0) * kCanvasHeight / 100.0;
+    return component.value(QStringLiteral("y")).toDouble() * kCanvasHeight / 100.0;
 }
 
 QFont componentFont(const QJsonObject &component) {
@@ -41,7 +43,7 @@ TemplateCanvas::TemplateCanvas(QWidget *parent) : QWidget(parent) {
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
-    setToolTip(QStringLiteral("拖动组件移动；拖动右下角控制点调整字号或图像比例；选中后按 Delete 删除"));
+    setToolTip(uiText(QStringLiteral("拖动组件移动；拖动右下角控制点调整字号或图像比例；选中后按 Delete 删除")));
 }
 
 void TemplateCanvas::setDocument(const QJsonArray &components,
@@ -198,7 +200,14 @@ void TemplateCanvas::paintEvent(QPaintEvent *) {
             } else {
                 const qreal fit = qMin(kCanvasWidth / image.width(), kCanvasHeight / image.height());
                 const qreal factor = fit * qBound(0.01, component.value(QStringLiteral("scale")).toDouble(35.0) / 100.0, 1.0);
-                painter.drawImage(QRectF(x, y, image.width() * factor, image.height() * factor), image);
+                const QRectF imageRect(x, y, image.width() * factor, image.height() * factor);
+                const QColor imageOutline(component.value(QStringLiteral("outlineColor")).toString(QStringLiteral("#000000")));
+                const qreal imageOutlineWidth = qBound(0.0, component.value(QStringLiteral("outlineWidth")).toDouble(2.0), 20.0);
+                if (component.value(QStringLiteral("outline")).toBool(true) && imageOutlineWidth > 0) {
+                    drawAlphaContourOutline(painter, image, imageRect, imageOutline, imageOutlineWidth);
+                } else {
+                    painter.drawImage(imageRect, image);
+                }
             }
         }
 
@@ -217,7 +226,7 @@ void TemplateCanvas::paintEvent(QPaintEvent *) {
 
     painter.setPen(QColor(QStringLiteral("#718896")));
     painter.drawText(QRectF(8, height() - 22, width() - 16, 16), Qt::AlignRight | Qt::AlignVCenter,
-                     QStringLiteral("640 × 480 · 拖动以移动 · 右下角调整大小"));
+                     uiText(QStringLiteral("640 × 480 · 拖动以移动 · 右下角调整大小")));
 }
 
 void TemplateCanvas::mousePressEvent(QMouseEvent *event) {
@@ -270,8 +279,8 @@ void TemplateCanvas::mouseMoveEvent(QMouseEvent *event) {
             x = qRound(x / 5.0) * 5.0;
             y = qRound(y / 5.0) * 5.0;
         }
-        component.insert(QStringLiteral("x"), qBound(0.0, x, 100.0));
-        component.insert(QStringLiteral("y"), qBound(0.0, y, 100.0));
+        component.insert(QStringLiteral("x"), x);
+        component.insert(QStringLiteral("y"), y);
     } else {
         const QString type = componentType(component);
         if (type == QStringLiteral("text")) {

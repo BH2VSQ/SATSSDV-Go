@@ -80,6 +80,10 @@ if(NOT SATSSDV_BUILD_BACKEND_ONLY)
         qt6/backend_client.h
         qt6/template_canvas.cpp
         qt6/template_canvas.h
+        qt6/alpha_outline.cpp
+        qt6/alpha_outline.h
+        qt6/ui_i18n.cpp
+        qt6/ui_i18n.h
     )
     if(APPLE)
         add_executable(SATSSDV-Go MACOSX_BUNDLE ${SATSSDV_QT_SOURCES})
