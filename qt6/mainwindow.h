@@ -50,6 +50,7 @@ private:
     void selectInlineGalleryAsset();
     void updateRXToggle();
     void updateTXToggle();
+    void updateRepeatControls();
     void updateTXProfileControls();
     void clearHisCallForCQTemplate();
     void toggleRX();
@@ -91,6 +92,7 @@ private:
     bool m_txPreparing = false;
     bool m_audioConnected = false;
     bool m_hisCallManuallyEdited = false;
+    bool m_txCountdownActive = false;
     int m_repeatIntervalSeconds = 120;
     QJsonObject m_settings;
     QJsonObject m_localeDictionary;

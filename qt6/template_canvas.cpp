@@ -226,7 +226,7 @@ void TemplateCanvas::paintEvent(QPaintEvent *) {
 
     painter.setPen(QColor(QStringLiteral("#718896")));
     painter.drawText(QRectF(8, height() - 22, width() - 16, 16), Qt::AlignRight | Qt::AlignVCenter,
-                     uiText(QStringLiteral("640 × 480 · 拖动以移动 · 右下角调整大小")));
+                     uiText(QStringLiteral("640 × 480")));
 }
 
 void TemplateCanvas::mousePressEvent(QMouseEvent *event) {

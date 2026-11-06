@@ -359,10 +359,20 @@ func (a *App) GetAudioState() AudioState {
 	audioErr := a.audioError
 	ready := a.audioRuntime != nil
 	a.mu.Unlock()
+
+	// txReserved remains true for the full TX task, including the scheduler's
+	// inter-cycle countdown when Duplex.State().TXActive is temporarily false.
+	a.txGate.Lock()
+	txReserved := a.txReserved
+	a.txGate.Unlock()
+
 	state := AudioState{Connected: ready, SampleRate: rate, Error: audioErr}
 	if d != nil {
 		s := d.State()
-		state.RXActive, state.TXActive = s.RXActive, s.TXActive
+		state.RXActive = s.RXActive
+		state.TXActive = s.TXActive || txReserved
+	} else {
+		state.TXActive = txReserved
 	}
 	return state
 }
@@ -446,7 +456,7 @@ func (a *App) Start1500HzTestTone() error {
 		a.txGate.Unlock()
 		return fmt.Errorf("invalid TX sample rate %d", rate)
 	}
-	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 75*time.Second)
 	done := make(chan struct{})
 	a.txReserved = true
 	a.mu.Lock()
@@ -475,7 +485,8 @@ func (a *App) Start1500HzTestTone() error {
 		const frequency = 1500.0
 		ramp := int(float64(rate) * 0.01)
 		for i := range samples {
-			gain := 0.30
+			// Higher level improves VOX-trigger margin while retaining 3 dBFS headroom.
+			gain := 0.70
 			if ramp > 0 && i < ramp {
 				gain *= float64(i) / float64(ramp)
 			}

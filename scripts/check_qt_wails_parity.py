@@ -65,9 +65,16 @@ for token in (
 ):
     assert token in CPP or token in HEADER, f"missing Wails behavior: {token}"
 
-# Repeat interval locks during repeat mode and supports the backend countdown phase.
-assert "m_repeatInterval->setEnabled(!enabled)" in CPP
+# Repeat controls follow the native repeat state machine. The interval field is
+# display-only while repeat is enabled; the checkbox can only cancel an active
+# inter-cycle countdown, never an image burst already in progress.
+assert "const bool canToggleRepeat = !m_txPreparing && (!m_txActive || m_txCountdownActive);" in CPP
+assert "m_repeatInterval->setEnabled(!repeatChecked && !m_txCountdownActive)" in CPP
+assert "m_txCountdownActive = true;" in CPP
+assert "cancelRepeatCountdown" in CPP and 'QStringLiteral("StopTX")' in CPP
+assert "m_repeatIntervalSeconds" in CPP
 assert 'phase == QStringLiteral("countdown")' in CPP
+assert 'phase == QStringLiteral("cancelled")' in CPP
 assert "tx.testTone" in CPP
 
 print("Qt/Wails UI parity static checks passed.")

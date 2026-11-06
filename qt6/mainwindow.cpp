@@ -321,6 +321,11 @@ void MainWindow::buildUi() {
         "QPushButton[role='danger'] { background:linear-gradient(#faeeee,#f0d8db); border-color:#d1a4aa; color:#98545c; }"
         "QComboBox,QLineEdit,QSpinBox,QTextEdit { background:#ffffff; border:1px solid #b9c1c7; border-radius:2px; padding:4px 6px; color:#37434c; selection-background-color:#b9dce9; }"
         "QComboBox,QLineEdit,QSpinBox { min-height:22px; }"
+        "QSlider { border:0; background:transparent; padding:0; }"
+        "QSlider::groove:horizontal { height:5px; background:#d3dbe0; border:0; border-radius:2px; }"
+        "QSlider::handle:horizontal { width:12px; background:#6fa5ba; border:0; border-radius:6px; margin:-4px 0; }"
+        "QSlider::groove:vertical { width:5px; background:#d3dbe0; border:0; border-radius:2px; }"
+        "QSlider::handle:vertical { height:12px; background:#6fa5ba; border:0; border-radius:6px; margin:0 -4px; }"
         "QHeaderView::section { background:#e2e6e9; color:#4b5b66; padding:6px; border:0; border-bottom:1px solid #c4cbd0; }"
         "QTableWidget { background:#ffffff; alternate-background-color:#f3f5f6; gridline-color:#d6dce0; border:1px solid #c4cbd0; }"
         "QProgressBar { border:1px solid #c4cbd0; background:#dfe3e6; height:7px; text-align:center; }"
@@ -544,10 +549,28 @@ void MainWindow::buildUi() {
     });
     connect(m_repeat, &QCheckBox::toggled, this, [this](bool enabled) {
         if (!m_repeatInterval) return;
-        if (enabled) m_repeatIntervalSeconds = m_repeatInterval->value();
-        else m_repeatInterval->setValue(m_repeatIntervalSeconds);
-        m_repeatInterval->setEnabled(!enabled);
+        if (enabled) {
+            m_repeatIntervalSeconds = m_repeatInterval->value();
+            updateRepeatControls();
+            return;
+        }
+
+        // Repeat can be toggled off only while the scheduler is in its
+        // inter-cycle countdown. The current image burst is never interrupted.
+        const bool cancelRepeatCountdown = m_txActive && m_txCountdownActive;
+        m_txCountdownActive = false;
+        m_repeatInterval->setValue(m_repeatIntervalSeconds);
+        updateRepeatControls();
+        if (cancelRepeatCountdown && m_backend && m_backend->isRunning()) {
+            m_backend->call(QStringLiteral("StopTX"), {}, [this](bool ok, const QJsonValue &, const QString &error) {
+                if (!ok) showError(error);
+            });
+        }
     });
+    connect(m_repeatInterval, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (!m_repeat || !m_repeat->isChecked()) m_repeatIntervalSeconds = value;
+    });
+    updateRepeatControls();
 
     auto *templateStrip = new QWidget(txPane);
     auto *templateStripLayout = new QGridLayout(templateStrip);
@@ -825,7 +848,7 @@ void MainWindow::buildUi() {
     editorLayout->addLayout(flagsRow);
     m_componentEditorHint = new QLabel(uiText(QStringLiteral("可直接拖动画布中的组件移动位置，拖动右下角控制点调整字号或图像比例。")), templateEditor);
     m_componentEditorHint->setWordWrap(true);
-    m_componentEditorHint->setStyleSheet(QStringLiteral("color:#687780; font-size:8pt; padding:4px; background:#e9eef1; border:1px solid #cbd3d8;"));
+    m_componentEditorHint->setStyleSheet(QStringLiteral("color:#687780; font-size:8pt; padding:4px; background:transparent; border:0;"));
     editorLayout->addWidget(m_componentEditorHint);
 
     connect(m_templateComponentList, &QListWidget::currentRowChanged, this, [this](int row) {
@@ -1125,6 +1148,7 @@ void MainWindow::refreshStatus() {
         m_audioConnected = connected;
         m_rxActive = state.value(QStringLiteral("rxActive")).toBool();
         m_txActive = state.value(QStringLiteral("txActive")).toBool();
+        updateRepeatControls();
         const int rate = state.value(QStringLiteral("sampleRate")).toInt();
         m_audioStatus->setText(uiText(QStringLiteral("音频：%1 · %2 Hz · RX %3 / TX %4"))
             .arg(connected ? uiText(QStringLiteral("已连接")) : uiText(QStringLiteral("未初始化")))
@@ -1530,7 +1554,19 @@ void MainWindow::updateTXToggle() {
         m_txToneToggle->setText(m_txToneActive
             ? m_localeDictionary.value(QStringLiteral("tx.testToneActive")).toString(uiText(QStringLiteral("停止测试音")))
             : m_localeDictionary.value(QStringLiteral("tx.testTone")).toString(uiText(QStringLiteral("1500 Hz 测试音"))));
-        m_txToneToggle->setEnabled(m_txToneActive || (!m_txActive && m_audioConnected && m_backend && m_backend->isRunning()));
+        m_txToneToggle->setEnabled(m_txToneActive || (!m_txActive && !m_txPreparing && m_audioConnected && m_backend && m_backend->isRunning()));
+    }
+}
+
+void MainWindow::updateRepeatControls() {
+    const bool repeatChecked = m_repeat && m_repeat->isChecked();
+    const bool canToggleRepeat = !m_txPreparing && (!m_txActive || m_txCountdownActive);
+    if (m_repeat) m_repeat->setEnabled(canToggleRepeat);
+    if (m_repeatInterval) {
+        // The spin box is a display-only countdown while repeat is enabled.
+        m_repeatInterval->setEnabled(!repeatChecked && !m_txCountdownActive);
+        if (!repeatChecked && !m_txCountdownActive)
+            m_repeatInterval->setValue(m_repeatIntervalSeconds);
     }
 }
 
@@ -1786,6 +1822,8 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         m_txProgress->setValue(static_cast<int>(payloadValue.toDouble()*1000.0));
     } else if(name==QStringLiteral("tx:state")){
         m_txActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
+        if (!m_txActive) m_txCountdownActive = false;
+        updateRepeatControls();
         updateTXToggle();
         if(!m_txActive){m_txProgress->setValue(0);refreshAlbum();}
     } else if(name==QStringLiteral("tx:tone-state")){
@@ -1795,13 +1833,19 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         const auto p=payloadValue.toObject();
         const QString phase=p.value(QStringLiteral("phase")).toString();
         if (phase == QStringLiteral("countdown") && m_repeat && m_repeat->isChecked()) {
+            m_txCountdownActive = true;
+            updateRepeatControls();
             const int remaining = qMax(0, p.value(QStringLiteral("error")).toInt());
-            m_repeatInterval->setEnabled(false);
             m_repeatInterval->setValue(remaining);
             statusBar()->showMessage(uiText(QStringLiteral("下一次循环发射：%1 秒")).arg(remaining));
         } else if (phase == QStringLiteral("sending") || phase == QStringLiteral("completed")) {
+            m_txCountdownActive = false;
             m_repeatInterval->setValue(m_repeatIntervalSeconds);
-            m_repeatInterval->setEnabled(!m_repeat->isChecked());
+            updateRepeatControls();
+        } else if (phase == QStringLiteral("cancelled")) {
+            m_txCountdownActive = false;
+            m_repeatInterval->setValue(m_repeatIntervalSeconds);
+            updateRepeatControls();
         }
         appendLog(QStringLiteral("TX: ")+QJsonDocument(p).toJson(QJsonDocument::Compact));
     } else if(name.endsWith(QStringLiteral(":error"))||name==QStringLiteral("ptt:error")||name==QStringLiteral("audio:error")){
@@ -1883,6 +1927,7 @@ void MainWindow::startTX() {
     if (m_txPreparing || m_txActive || !m_backend || !m_backend->isRunning()) return;
     if (!m_audioConnected) { showError(uiText(QStringLiteral("音频后端异常"))); return; }
     m_txPreparing = true;
+    updateRepeatControls();
     updateTXToggle();
 
     m_settings.insert(QStringLiteral("callsign"), m_callsign->text().trimmed());
@@ -1931,11 +1976,14 @@ void MainWindow::startTX() {
     rendered.insert(QStringLiteral("id"), QStringLiteral("qt-%1").arg(QDateTime::currentMSecsSinceEpoch()));
     rendered.insert(QStringLiteral("name"), QStringLiteral("Qt Native Template"));
     rendered.insert(QStringLiteral("pngBase64"), QString::fromLatin1(png.toBase64()));
-    const QJsonArray args{rendered, m_repeat->isChecked(), m_repeatInterval->value(), ax25To};
+    const int repeatInterval = m_repeat->isChecked() ? m_repeatIntervalSeconds : m_repeatInterval->value();
+    const QJsonArray args{rendered, m_repeat->isChecked(), repeatInterval, ax25To};
     m_backend->call(QStringLiteral("StartTXRendered"), args, [this](bool ok, const QJsonValue &, const QString &error) {
         m_txPreparing = false;
+        updateRepeatControls();
         if (ok) {
             m_txActive = true;
+            updateRepeatControls();
             updateTXToggle();
             m_txProgress->setValue(0);
             appendLog(uiText(QStringLiteral("已提交图像发射任务")));
