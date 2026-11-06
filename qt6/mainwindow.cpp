@@ -158,7 +158,6 @@ public:
             lastHz = bin.value(QStringLiteral("frequencyHz")).toDouble(lastHz);
         }
         if (values.size() < 2) return;
-        m_latest = values;
         m_dataMinFrequencyHz = firstHz;
         m_dataMaxFrequencyHz = lastHz;
         if (m_waterfall.width() != 640 || m_waterfall.height() != qBound(30, m_rowsPerSecond * m_historySeconds, 2400)) {
@@ -188,34 +187,39 @@ protected:
     void paintEvent(QPaintEvent *) override {
         QPainter painter(this);
         painter.fillRect(rect(), m_backgroundColor);
-        const QRectF waterfallRect(0, height() * 0.30, width(), height() * 0.70);
+
+        const double minHz = m_visibleMaxFrequencyHz > m_visibleMinFrequencyHz
+            ? m_visibleMinFrequencyHz : double(m_minFrequencyHz);
+        const double maxHz = m_visibleMaxFrequencyHz > m_visibleMinFrequencyHz
+            ? m_visibleMaxFrequencyHz : double(m_maxFrequencyHz);
+        const qreal axisHeight = qMin<qreal>(22.0, qMax<qreal>(18.0, height() * 0.22));
+        const QRectF waterfallRect(0, axisHeight, width(), qMax<qreal>(1.0, height() - axisHeight));
         painter.drawImage(waterfallRect, m_waterfall);
-        painter.setPen(QPen(QColor(QStringLiteral("#294252")), 1));
-        for (int i = 1; i < 5; ++i) {
-            const qreal x = width() * i / 5.0;
-            painter.drawLine(QPointF(x, 0), QPointF(x, height()));
+
+        // The waterfall is the only plot. Frequency labels are anchored to
+        // the same visible range used to map incoming FFT bins into the image.
+        painter.setFont(QFont(font().family(), 7));
+        painter.setPen(QColor(QStringLiteral("#9fb3c0")));
+        if (maxHz > minHz && width() > 0) {
+            const int firstTickHz = qMax(1, int(std::ceil(minHz / 500.0 - 1e-9))) * 500;
+            const int lastTickHz = int(std::floor(maxHz / 500.0 + 1e-9)) * 500;
+            for (int frequencyHz = firstTickHz; frequencyHz <= lastTickHz; frequencyHz += 500) {
+                const qreal x = (frequencyHz - minHz) / (maxHz - minHz) * qMax(0, width() - 1);
+                QRectF labelRect(x - 28.0, 1.0, 56.0, axisHeight - 3.0);
+                if (labelRect.left() < 0) labelRect.moveLeft(0);
+                if (labelRect.right() > width()) labelRect.moveRight(width());
+                painter.drawText(labelRect, Qt::AlignHCenter | Qt::AlignVCenter, QString::number(frequencyHz));
+                painter.setPen(QPen(QColor(QStringLiteral("#365365")), 1));
+                painter.drawLine(QPointF(x, axisHeight - 2.0), QPointF(x, height()));
+                painter.setPen(QColor(QStringLiteral("#9fb3c0")));
+            }
         }
+
+        painter.setPen(QPen(QColor(QStringLiteral("#294252")), 1));
         for (int i = 1; i < 4; ++i) {
-            const qreal y = height() * (0.30 + 0.70 * i / 4.0);
+            const qreal y = waterfallRect.top() + waterfallRect.height() * i / 4.0;
             painter.drawLine(QPointF(0, y), QPointF(width(), y));
         }
-        if (m_latest.size() > 1) {
-            QPainterPath path;
-            for (int i = 0; i < m_latest.size(); ++i) {
-                const qreal x = width() * qreal(i) / qMax(1, int(m_latest.size()) - 1);
-                const qreal level = qBound(0.0, (m_latest[i] - m_minDbfs) / qMax(1.0, double(m_maxDbfs - m_minDbfs)), 1.0);
-                const qreal y = height() * 0.27 - level * height() * 0.24;
-                if (i == 0) path.moveTo(x, y); else path.lineTo(x, y);
-            }
-            painter.setPen(QPen(QColor(QStringLiteral("#65d8e8")), 1.6));
-            painter.drawPath(path);
-        }
-        painter.setPen(QColor(QStringLiteral("#9fb3c0")));
-        painter.drawText(QRect(8, 5, 160, 20), Qt::AlignLeft | Qt::AlignVCenter, QStringLiteral("SPECTRUM / WATERFALL"));
-        const double minHz = m_visibleMaxFrequencyHz > m_visibleMinFrequencyHz ? m_visibleMinFrequencyHz : m_minFrequencyHz;
-        const double maxHz = m_visibleMaxFrequencyHz > m_visibleMinFrequencyHz ? m_visibleMaxFrequencyHz : m_maxFrequencyHz;
-        const QString range = QStringLiteral("%1–%2 kHz").arg(minHz / 1000.0, 0, 'f', 1).arg(maxHz / 1000.0, 0, 'f', 1);
-        painter.drawText(QRect(width() - 115, 5, 107, 20), Qt::AlignRight | Qt::AlignVCenter, range);
     }
 
 private:
@@ -231,7 +235,6 @@ private:
     }
 
     QImage m_waterfall;
-    QVector<double> m_latest;
     int m_minFrequencyHz = 0;
     int m_maxFrequencyHz = 5000;
     int m_minDbfs = -110;
@@ -308,6 +311,7 @@ void MainWindow::buildUi() {
 
     setStyleSheet(QStringLiteral(
         "QMainWindow,QWidget { background:#e9ecef; color:#35424b; font-family:'Segoe UI','Microsoft YaHei UI','Noto Sans CJK SC'; font-size:9pt; }"
+        "QLabel { background:transparent; border:0; }"
         "QTabWidget::pane { border:1px solid #aeb7be; background:#e9ecef; }"
         "QTabBar::tab { background:#e5e8ea; color:#58636d; min-width:86px; padding:9px 18px; margin-right:3px; border:1px solid #c1c8cd; border-bottom:0; }"
         "QTabBar::tab:selected { background:#f7f9fa; color:#2b596e; font-weight:700; border-bottom:2px solid #5a9db8; }"
@@ -341,8 +345,9 @@ void MainWindow::buildUi() {
 
     // Compact application header matching the original desktop layout.
     auto *header = new QWidget(central);
+    header->setObjectName(QStringLiteral("appHeader"));
     header->setFixedHeight(58);
-    header->setStyleSheet(QStringLiteral("background:linear-gradient(#ffffff,#e7e9eb); border-bottom:1px solid #aeb6bd;"));
+    header->setStyleSheet(QStringLiteral("QWidget#appHeader { background:linear-gradient(#ffffff,#e7e9eb); border-bottom:1px solid #aeb6bd; }"));
     auto *headerLayout = new QHBoxLayout(header);
     headerLayout->setContentsMargins(15, 5, 14, 5);
     headerLayout->setSpacing(12);
@@ -415,7 +420,8 @@ void MainWindow::buildUi() {
     workLayout->setSpacing(5);
 
     auto *profilePanel = new QWidget(workbench);
-    profilePanel->setStyleSheet(QStringLiteral("background:#f1f3f4; border-bottom:1px solid #abb3ba;"));
+    profilePanel->setObjectName(QStringLiteral("profilePanel"));
+    profilePanel->setStyleSheet(QStringLiteral("QWidget#profilePanel { background:#f1f3f4; border-bottom:1px solid #abb3ba; }"));
     auto *profileLayout = new QVBoxLayout(profilePanel);
     profileLayout->setContentsMargins(7, 5, 7, 5);
     profileLayout->setSpacing(4);
@@ -446,7 +452,8 @@ void MainWindow::buildUi() {
     // RX workstation: image reconstruction occupies the main area; its own
     // receive spectrum/waterfall remains at the bottom of the RX column.
     auto *rxPane = new QWidget(split);
-    rxPane->setStyleSheet(QStringLiteral("background:#f2f4f5; border:1px solid #929da5;"));
+    rxPane->setObjectName(QStringLiteral("rxPane"));
+    rxPane->setStyleSheet(QStringLiteral("QWidget#rxPane { background:#f2f4f5; border:1px solid #929da5; }"));
     auto *rxLayout = new QVBoxLayout(rxPane);
     rxLayout->setContentsMargins(8, 7, 8, 7);
     rxLayout->setSpacing(5);
@@ -473,11 +480,8 @@ void MainWindow::buildUi() {
     m_rxMeta->setStyleSheet(QStringLiteral("font-size:8pt; color:#7e8991; padding:2px 1px;"));
     rxLayout->addWidget(m_rxMeta);
     auto *rxSpectrumTitle = new QHBoxLayout();
-    rxSpectrumTitle->addWidget(new QLabel(uiText(QStringLiteral("RX 频谱 / 瀑布图")), rxPane));
+    rxSpectrumTitle->addWidget(new QLabel(uiText(QStringLiteral("RX 瀑布图")), rxPane));
     rxSpectrumTitle->addStretch();
-    auto *rxSpectrumHint = new QLabel(uiText(QStringLiteral("输入 · 音频瀑布图")), rxPane);
-    rxSpectrumHint->setStyleSheet(QStringLiteral("font-size:8pt; color:#919aa1;"));
-    rxSpectrumTitle->addWidget(rxSpectrumHint);
     rxLayout->addLayout(rxSpectrumTitle);
     m_rxSpectrumStatus = new QLabel(uiText(QStringLiteral("等待 RX 音频")), rxPane);
     m_rxSpectrumStatus->setStyleSheet(QStringLiteral("font-size:8pt; color:#77858f;"));
@@ -494,7 +498,8 @@ void MainWindow::buildUi() {
     // TX workstation: all common transmission controls remain in one compact
     // strip, with the image canvas/QSO fields and template tools side-by-side.
     auto *txPane = new QWidget(split);
-    txPane->setStyleSheet(QStringLiteral("background:#f2f4f5; border:1px solid #929da5;"));
+    txPane->setObjectName(QStringLiteral("txPane"));
+    txPane->setStyleSheet(QStringLiteral("QWidget#txPane { background:#f2f4f5; border:1px solid #929da5; }"));
     auto *txLayout = new QVBoxLayout(txPane);
     txLayout->setContentsMargins(8, 7, 8, 7);
     txLayout->setSpacing(5);
@@ -914,11 +919,8 @@ void MainWindow::buildUi() {
     m_txProgress->setTextVisible(false);
     txLayout->addWidget(m_txProgress);
     auto *txSpectrumTitle = new QHBoxLayout();
-    txSpectrumTitle->addWidget(new QLabel(uiText(QStringLiteral("TX 频谱 / 瀑布图")), txPane));
+    txSpectrumTitle->addWidget(new QLabel(uiText(QStringLiteral("TX 瀑布图")), txPane));
     txSpectrumTitle->addStretch();
-    auto *txSpectrumHint = new QLabel(uiText(QStringLiteral("输出 · 音频瀑布图")), txPane);
-    txSpectrumHint->setStyleSheet(QStringLiteral("font-size:8pt; color:#919aa1;"));
-    txSpectrumTitle->addWidget(txSpectrumHint);
     txLayout->addLayout(txSpectrumTitle);
     m_txSpectrumStatus = new QLabel(uiText(QStringLiteral("等待 TX 音频")), txPane);
     m_txSpectrumStatus->setStyleSheet(QStringLiteral("font-size:8pt; color:#77858f;"));
@@ -1837,10 +1839,12 @@ void MainWindow::handleEvent(const QJsonObject &event) {
             updateRepeatControls();
             const int remaining = qMax(0, p.value(QStringLiteral("error")).toInt());
             m_repeatInterval->setValue(remaining);
-            statusBar()->showMessage(uiText(QStringLiteral("下一次循环发射：%1 秒")).arg(remaining));
+            statusBar()->showMessage(uiText(QStringLiteral("循环发射倒计时：%1 秒")).arg(remaining));
         } else if (phase == QStringLiteral("sending") || phase == QStringLiteral("completed")) {
+            // Keep the display at zero during the actual transmission. The
+            // next countdown event restores the configured interval only
+            // after the current image has completed.
             m_txCountdownActive = false;
-            m_repeatInterval->setValue(m_repeatIntervalSeconds);
             updateRepeatControls();
         } else if (phase == QStringLiteral("cancelled")) {
             m_txCountdownActive = false;

@@ -52,8 +52,34 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 		cfg.MaxCycles = -1
 	}
 	cycle := 0
+	waitWithCountdown := func(j Job, index, cycleNumber int) error {
+		return sleepWithCountdown(ctx, cfg.Interval, func(remaining time.Duration) {
+			emit(observe, Event{
+				Job: j, Index: index, Total: len(jobs), Cycle: cycleNumber,
+				Phase: "countdown", Error: fmt.Sprintf("%d", int(remaining.Seconds())),
+			})
+		})
+	}
 	for {
 		cycle++
+
+		// In repeat mode, the configured interval is the wait before a cycle's
+		// transmission. This includes the first cycle after the operator starts
+		// the repeat job, not just the gap after an already completed send.
+		if cfg.Repeat {
+			firstJob := jobs[0]
+			if err := ctx.Err(); err != nil {
+				emit(observe, Event{Job: firstJob, Index: 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
+				return err
+			}
+			if err := waitWithCountdown(firstJob, 1, cycle); err != nil {
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					emit(observe, Event{Job: firstJob, Index: 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
+				}
+				return err
+			}
+		}
+
 		for i, j := range jobs {
 			if err := ctx.Err(); err != nil {
 				emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
@@ -72,10 +98,8 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 				return fmt.Errorf("send queue item %q: %w", j.ID, err)
 			}
 			emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "completed"})
-			if i < len(jobs)-1 || cfg.Repeat {
-				if err := sleepWithCountdown(ctx, cfg.Interval, func(remaining time.Duration) {
-					emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "countdown", Error: fmt.Sprintf("%d", int(remaining.Seconds()))})
-				}); err != nil {
+			if i < len(jobs)-1 {
+				if err := waitWithCountdown(j, i+1, cycle); err != nil {
 					if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
 					}
@@ -83,10 +107,7 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 				}
 			}
 		}
-		if !cfg.Repeat {
-			return nil
-		}
-		if cfg.MaxCycles > 0 && cycle >= cfg.MaxCycles {
+		if !cfg.Repeat || (cfg.MaxCycles > 0 && cycle >= cfg.MaxCycles) {
 			return nil
 		}
 	}
@@ -115,9 +136,20 @@ func sleepWithCountdown(ctx context.Context, d time.Duration, tick func(time.Dur
 	end := time.Now().Add(d)
 	deadline := time.NewTimer(d)
 	defer deadline.Stop()
-	if tick != nil {
-		tick(d)
+	emitRemaining := func(remaining time.Duration) {
+		if tick == nil {
+			return
+		}
+		if remaining <= 0 {
+			tick(0)
+			return
+		}
+		// Round up so a slightly-late ticker callback does not skip a visible
+		// second (for example, 119.999s must still display 120s).
+		roundedSeconds := (remaining + time.Second - 1) / time.Second
+		tick(roundedSeconds * time.Second)
 	}
+	emitRemaining(d)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -125,9 +157,7 @@ func sleepWithCountdown(ctx context.Context, d time.Duration, tick func(time.Dur
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			if tick != nil {
-				tick(0)
-			}
+			emitRemaining(0)
 			return nil
 		case <-ticker.C:
 			if tick != nil {

@@ -63,8 +63,31 @@ func TestRepeatIntervalEmitsCountdownAndCompletes(t *testing.T) {
 	if sent != 2 {
 		t.Fatalf("sent %d cycles, want 2", sent)
 	}
-	if len(countdown) < 2 || countdown[0] != 1 || countdown[len(countdown)-1] != 0 {
-		t.Fatalf("countdown values = %v, want start at 1 and end at 0", countdown)
+	if len(countdown) < 4 || countdown[0] != 2 || countdown[len(countdown)-1] != 0 {
+		t.Fatalf("countdown values = %v, want each 1.1s cycle to begin at 2 and end at 0", countdown)
+	}
+	firstSending, firstCompleted, secondCountdown, secondSending := -1, -1, -1, -1
+	for i, phase := range phases {
+		switch phase {
+		case "sending":
+			if firstSending < 0 {
+				firstSending = i
+			} else if secondSending < 0 {
+				secondSending = i
+			}
+		case "completed":
+			if firstCompleted < 0 {
+				firstCompleted = i
+			}
+		case "countdown":
+			if firstCompleted >= 0 && secondCountdown < 0 {
+				secondCountdown = i
+			}
+		}
+	}
+	if firstSending <= 0 || phases[0] != "countdown" || firstCompleted <= firstSending ||
+		secondCountdown <= firstCompleted || secondSending <= secondCountdown {
+		t.Fatalf("phases = %v, want countdown -> send -> complete -> countdown -> send", phases)
 	}
 }
 
@@ -73,10 +96,11 @@ func TestRunCancellationDuringCountdownEmitsCancelled(t *testing.T) {
 	defer cancel()
 	countdownSeen := make(chan struct{}, 1)
 	cancelledSeen := make(chan struct{}, 1)
+	var sent atomic.Int32
 	done := make(chan error, 1)
 	go func() {
 		done <- Run(ctx, []Job{{ID: "repeat"}}, Config{Repeat: true, Interval: 5 * time.Second},
-			func(context.Context, Job) error { return nil }, func(event Event) {
+			func(context.Context, Job) error { sent.Add(1); return nil }, func(event Event) {
 				switch event.Phase {
 				case "countdown":
 					select {
@@ -104,5 +128,8 @@ func TestRunCancellationDuringCountdownEmitsCancelled(t *testing.T) {
 	case <-cancelledSeen:
 	case <-time.After(time.Second):
 		t.Fatal("cancellation event was not emitted")
+	}
+	if sent.Load() != 0 {
+		t.Fatalf("sent %d jobs after cancellation during the pre-transmission countdown", sent.Load())
 	}
 }
