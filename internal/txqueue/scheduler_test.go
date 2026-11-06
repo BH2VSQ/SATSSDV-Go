@@ -63,10 +63,15 @@ func TestRepeatIntervalEmitsCountdownAndCompletes(t *testing.T) {
 	if sent != 2 {
 		t.Fatalf("sent %d cycles, want 2", sent)
 	}
-	if len(countdown) < 4 || countdown[0] != 2 || countdown[len(countdown)-1] != 0 {
-		t.Fatalf("countdown values = %v, want each 1.1s cycle to begin at 2 and end at 0", countdown)
+	if len(countdown) < 2 || countdown[0] != 2 || countdown[len(countdown)-1] != 0 {
+		t.Fatalf("countdown values = %v, want one post-send interval beginning at 2 and ending at 0", countdown)
 	}
-	firstSending, firstCompleted, secondCountdown, secondSending := -1, -1, -1, -1
+	for i := 1; i < len(countdown); i++ {
+		if countdown[i] > countdown[i-1] {
+			t.Fatalf("countdown increased from %d to %d: %v", countdown[i-1], countdown[i], countdown)
+		}
+	}
+	firstSending, firstCompleted, firstCountdown, secondSending := -1, -1, -1, -1
 	for i, phase := range phases {
 		switch phase {
 		case "sending":
@@ -80,14 +85,16 @@ func TestRepeatIntervalEmitsCountdownAndCompletes(t *testing.T) {
 				firstCompleted = i
 			}
 		case "countdown":
-			if firstCompleted >= 0 && secondCountdown < 0 {
-				secondCountdown = i
+			if firstCountdown < 0 {
+				firstCountdown = i
 			}
 		}
 	}
-	if firstSending <= 0 || phases[0] != "countdown" || firstCompleted <= firstSending ||
-		secondCountdown <= firstCompleted || secondSending <= secondCountdown {
-		t.Fatalf("phases = %v, want countdown -> send -> complete -> countdown -> send", phases)
+	if firstSending != 0 || firstCompleted <= firstSending || firstCountdown <= firstCompleted || secondSending <= firstCountdown {
+		t.Fatalf("phases = %v, want immediate send -> complete -> countdown -> next send", phases)
+	}
+	if phases[len(phases)-1] != "completed" {
+		t.Fatalf("last phase = %q, want completed without an unnecessary final countdown: %v", phases[len(phases)-1], phases)
 	}
 }
 
@@ -129,7 +136,7 @@ func TestRunCancellationDuringCountdownEmitsCancelled(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancellation event was not emitted")
 	}
-	if sent.Load() != 0 {
-		t.Fatalf("sent %d jobs after cancellation during the pre-transmission countdown", sent.Load())
+	if sent.Load() != 1 {
+		t.Fatalf("sent %d jobs before countdown cancellation, want the initial transmission to complete", sent.Load())
 	}
 }

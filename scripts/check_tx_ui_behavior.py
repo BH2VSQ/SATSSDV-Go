@@ -39,13 +39,19 @@ checks = {
     )),
     "waterfall frequency axis uses 500 Hz ticks": "frequencyHz += 500" in text["cpp"] and "QString::number(frequencyHz)" in text["cpp"],
     "waterfall spectrum overlay and banner are removed": "m_latest" not in text["cpp"] and "SPECTRUM / WATERFALL" not in text["cpp"] and "0.0–4.2 kHz" not in text["cpp"],
-    "repeat countdown is emitted before cycle transmission": (
-        text["scheduler"].index("waitWithCountdown(firstJob, 1, cycle)")
-        < text["scheduler"].index('Phase: "sending"')
+    "first repeat transmission starts before any countdown": (
+        text["scheduler"].index('Phase: "sending"')
+        < text["scheduler"].index("waitWithCountdown(j, i+1, cycle)")
+        and "waitWithCountdown(firstJob, 1, cycle)" not in text["scheduler"]
     ),
-    "repeat ordering test requires countdown-send-complete-countdown-send": (
-        'phases[0] != "countdown"' in text["scheduler_tests"]
-        and "secondCountdown <= firstCompleted" in text["scheduler_tests"]
+    "repeat interval begins only after a completed send": (
+        text["scheduler"].index('Phase: "completed"')
+        < text["scheduler"].index("waitWithCountdown(j, i+1, cycle)")
+    ),
+    "repeat ordering test requires immediate-send-complete-countdown-send": (
+        'firstSending != 0' in text["scheduler_tests"]
+        and "firstCountdown <= firstCompleted" in text["scheduler_tests"]
+        and "secondSending <= firstCountdown" in text["scheduler_tests"]
     ),
     "countdown display is not reset while TX is sending": (
         'phase == QStringLiteral("sending") || phase == QStringLiteral("completed")' in text["cpp"]

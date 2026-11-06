@@ -54,32 +54,21 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 	cycle := 0
 	waitWithCountdown := func(j Job, index, cycleNumber int) error {
 		return sleepWithCountdown(ctx, cfg.Interval, func(remaining time.Duration) {
+			seconds := 0
+			if remaining > 0 {
+				seconds = int(remaining / time.Second)
+				if remaining%time.Second != 0 {
+					seconds++
+				}
+			}
 			emit(observe, Event{
 				Job: j, Index: index, Total: len(jobs), Cycle: cycleNumber,
-				Phase: "countdown", Error: fmt.Sprintf("%d", int(remaining.Seconds())),
+				Phase: "countdown", Error: fmt.Sprintf("%d", seconds),
 			})
 		})
 	}
 	for {
 		cycle++
-
-		// In repeat mode, the configured interval is the wait before a cycle's
-		// transmission. This includes the first cycle after the operator starts
-		// the repeat job, not just the gap after an already completed send.
-		if cfg.Repeat {
-			firstJob := jobs[0]
-			if err := ctx.Err(); err != nil {
-				emit(observe, Event{Job: firstJob, Index: 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
-				return err
-			}
-			if err := waitWithCountdown(firstJob, 1, cycle); err != nil {
-				if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					emit(observe, Event{Job: firstJob, Index: 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
-				}
-				return err
-			}
-		}
-
 		for i, j := range jobs {
 			if err := ctx.Err(); err != nil {
 				emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
@@ -98,7 +87,13 @@ func Run(ctx context.Context, jobs []Job, cfg Config, send Sender, observe Obser
 				return fmt.Errorf("send queue item %q: %w", j.ID, err)
 			}
 			emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "completed"})
-			if i < len(jobs)-1 {
+
+			// The operator's first Send action must transmit immediately. In repeat
+			// mode, start the interval only after this item has completed, then
+			// begin the next item/cycle when the countdown reaches zero.
+			moreItems := i < len(jobs)-1
+			moreCycles := cfg.Repeat && (cfg.MaxCycles < 0 || cycle < cfg.MaxCycles)
+			if moreItems || moreCycles {
 				if err := waitWithCountdown(j, i+1, cycle); err != nil {
 					if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						emit(observe, Event{Job: j, Index: i + 1, Total: len(jobs), Cycle: cycle, Phase: "cancelled"})
