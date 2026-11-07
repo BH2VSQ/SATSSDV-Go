@@ -32,6 +32,8 @@ const Translation kTranslations[] = {
     {"音频：正在连接", "Audio: connecting", "オーディオ: 接続中"},
     {"接收 RX", "Receive RX", "受信 RX"}, {"发送 TX", "Transmit TX", "送信 TX"},
     {"RX 待机 · 等待接收音频", "RX idle · waiting for receive audio", "RX 待機 · 受信音声を待機中"},
+    {"RX 解码诊断 · 等待音频", "RX decoder diagnostics · waiting for audio", "RX デコーダ診断 · 音声待機中"},
+    {"RX 解码器发生异常，已重置并继续监听：%1", "RX decoder error; reset and continue listening: %1", "RX デコーダーエラー。リセットして受信を継続します: %1"},
     {"启动 RX", "Start RX", "RX 開始"}, {"停止 RX", "Stop RX", "RX 停止"},
     {"RX 瀑布图", "RX Waterfall", "RX ウォーターフォール"},
     {"TX 瀑布图", "TX Waterfall", "TX ウォーターフォール"},

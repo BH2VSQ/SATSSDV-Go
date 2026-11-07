@@ -54,6 +54,9 @@ type gifFrameBuffer struct {
 	lastPreviewPackets int
 	snapshotIndex      int // index in stream.frames; -1 until first archive snapshot
 	committed          bool
+	decodeAttempts     uint64
+	lastDecodeAt       time.Time
+	lastDecodeError    string
 }
 
 const (
@@ -790,7 +793,16 @@ func decodeGIFSegmentsNearPacket(frame *gifFrameBuffer, packet ssdv.Packet) (int
 	index := sort.Search(len(ids), func(i int) bool { return ids[i] >= packet.PacketID })
 	newlyDecoded := 0
 	try := func(start, end uint16) {
-		decoded, _ := tryDecodeGIFSegment(frame, start, end)
+		frame.decodeAttempts++
+		decoded, err := tryDecodeGIFSegment(frame, start, end)
+		if err != nil {
+			frame.lastDecodeError = err.Error()
+			return
+		}
+		if decoded > 0 {
+			frame.lastDecodeAt = time.Now()
+			frame.lastDecodeError = ""
+		}
 		newlyDecoded += decoded
 	}
 	if packet.MCUOffset != 0xff && packet.MCUIndex != 0xffff {
@@ -838,11 +850,16 @@ func decodeAllReadyGIFSegments(frame *gifFrameBuffer) (int, error) {
 	newlyDecoded := 0
 	ids := frame.boundaryPacketIDs
 	for i := 0; i+1 < len(ids); i++ {
+		frame.decodeAttempts++
 		decoded, err := tryDecodeGIFSegment(frame, ids[i], ids[i+1])
 		if err != nil {
 			return newlyDecoded, err
 		}
 		newlyDecoded += decoded
+		if decoded > 0 {
+			frame.lastDecodeAt = time.Now()
+			frame.lastDecodeError = ""
+		}
 	}
 	// The final entropy tail ends at the SSDV EOI packet. It may have no MCU
 	// restart metadata of its own, so it is handled separately.

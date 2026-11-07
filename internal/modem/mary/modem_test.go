@@ -130,3 +130,35 @@ func TestMAModulationAcquiresAtArbitrarySampleOffsetsAfterIdle(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamModulatorCanRepeatTrainingWithoutResetting(t *testing.T) {
+	for _, bitsPerSymbol := range []int{2, 3, 4} {
+		mod, err := NewStreamModulator(Config{SampleRate: 48000, SymbolRate: 1600, BitsPerSymbol: bitsPerSymbol, CarrierHz: 1600})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, err := mod.Start()
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := mod.WriteBytes([]byte{0x12, 0x34, 0x56, 0x78, 0x9a})
+		if err != nil {
+			t.Fatal(err)
+		}
+		training, err := mod.WriteTraining()
+		if err != nil {
+			t.Fatal(err)
+		}
+		next, err := mod.WriteBytes([]byte{0xde, 0xad, 0xbe, 0xef})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tail, err := mod.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(first) != 96*30 || len(training) < 96*30 || len(payload) == 0 || len(next) == 0 || len(tail) < 0 {
+			t.Fatalf("unexpected repeated training dimensions for %d bits/symbol: first=%d payload=%d training=%d next=%d tail=%d", bitsPerSymbol, len(first), len(payload), len(training), len(next), len(tail))
+		}
+	}
+}

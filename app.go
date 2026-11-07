@@ -18,6 +18,7 @@ import (
 	runtimedebug "runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/album"
@@ -38,6 +39,22 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/tximage"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/txqueue"
 )
+
+type rxRuntimeStats struct {
+	audioBlocks          atomic.Uint64
+	audioSamples         atomic.Uint64
+	inputDiscontinuities atomic.Uint64
+	decoderResets        atomic.Uint64
+	queueDrops           atomic.Uint64
+	decoderBlocks        atomic.Uint64
+	decoderPackets       atomic.Uint64
+	decoderErrors        atomic.Uint64
+	decoderPanics        atomic.Uint64
+	managerSubmitDrops   atomic.Uint64
+	lastErrorMu          sync.RWMutex
+	lastError            string
+	lastErrorAt          time.Time
+}
 
 type App struct {
 	mu                 sync.Mutex
@@ -70,6 +87,7 @@ type App struct {
 	rxCancel           context.CancelFunc
 	rxDone             chan struct{}
 	rxManager          *rxengine.Manager
+	rxStats            rxRuntimeStats
 	events             *EventBroker
 	albumMu            sync.Mutex
 	txCancel           context.CancelFunc
@@ -1193,7 +1211,9 @@ func (a *App) TransmitPCM(samples []float32, waveformSampleRate int) error {
 }
 
 func (a *App) handleRXAudio(samples []float32) {
+	a.rxStats.audioBlocks.Add(1)
 	if samples == nil {
+		a.rxStats.inputDiscontinuities.Add(1)
 		a.rxSpectrumMu.Lock()
 		a.rxSpectrumWindow = nil
 		a.rxSpectrumLastEmit = time.Time{}
@@ -1204,6 +1224,7 @@ func (a *App) handleRXAudio(samples []float32) {
 	if len(samples) == 0 {
 		return
 	}
+	a.rxStats.audioSamples.Add(uint64(len(samples)))
 	a.mu.Lock()
 	rate := a.settings.AudioSampleRate
 	a.mu.Unlock()
@@ -1271,6 +1292,7 @@ func (a *App) enqueueRXSamples(samples []float32) {
 		// Sending only the marker would create a reset on every callback while
 		// continuously dropping the corresponding audio block.
 		if cap(queue)-len(queue) < 2 {
+			a.rxStats.queueDrops.Add(1)
 			return
 		}
 		queue <- nil
@@ -1281,7 +1303,82 @@ func (a *App) enqueueRXSamples(samples []float32) {
 	case queue <- block:
 	default:
 		a.rxGapPending = true
+		a.rxStats.queueDrops.Add(1)
 	}
+}
+
+func safeFeedRXDecoder(decoder interface {
+	Feed([]float32) ([]transport.ReceivedPacket, error)
+}, block []float32) (packets []transport.ReceivedPacket, err error, panicMessage, panicStack string) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicMessage = fmt.Sprintf("%v", recovered)
+			panicStack = string(runtimedebug.Stack())
+			err = fmt.Errorf("RX decoder panic: %v", recovered)
+			packets = nil
+		}
+	}()
+	packets, err = decoder.Feed(block)
+	return
+}
+
+func (a *App) recordRXError(stage string, err error) {
+	if a == nil || err == nil {
+		return
+	}
+	a.rxStats.lastErrorMu.Lock()
+	a.rxStats.lastError = stage + ": " + err.Error()
+	a.rxStats.lastErrorAt = time.Now()
+	a.rxStats.lastErrorMu.Unlock()
+}
+
+func rxDecoderDiagnostics(decoder interface{}) interface{} {
+	switch value := decoder.(type) {
+	case interface {
+		Diagnostics() transport.DecoderDiagnostics
+	}:
+		return value.Diagnostics()
+	case interface {
+		Diagnostics() transport.AutoDecoderDiagnostics
+	}:
+		return value.Diagnostics()
+	default:
+		return nil
+	}
+}
+
+func (a *App) emitRXDiagnostics(decoder interface{}, profile string, rate int, queue <-chan []float32) {
+	if a == nil {
+		return
+	}
+	lastError := ""
+	lastErrorAt := time.Time{}
+	a.rxStats.lastErrorMu.RLock()
+	lastError, lastErrorAt = a.rxStats.lastError, a.rxStats.lastErrorAt
+	a.rxStats.lastErrorMu.RUnlock()
+	payload := map[string]interface{}{
+		"profile": profile, "sampleRate": rate,
+		"audioBlocks":          a.rxStats.audioBlocks.Load(),
+		"audioSamples":         a.rxStats.audioSamples.Load(),
+		"inputDiscontinuities": a.rxStats.inputDiscontinuities.Load(),
+		"decoderResets":        a.rxStats.decoderResets.Load(),
+		"queueDepth":           len(queue), "queueCapacity": cap(queue),
+		"queueDrops":         a.rxStats.queueDrops.Load(),
+		"decoderBlocks":      a.rxStats.decoderBlocks.Load(),
+		"decoderPackets":     a.rxStats.decoderPackets.Load(),
+		"decoderErrors":      a.rxStats.decoderErrors.Load(),
+		"decoderPanics":      a.rxStats.decoderPanics.Load(),
+		"managerSubmitDrops": a.rxStats.managerSubmitDrops.Load(),
+		"decoder":            rxDecoderDiagnostics(decoder),
+		"lastError":          lastError,
+	}
+	if !lastErrorAt.IsZero() {
+		payload["lastErrorAgeMs"] = time.Since(lastErrorAt).Milliseconds()
+	}
+	if a.rxManager != nil {
+		payload["manager"] = a.rxManager.Diagnostics()
+	}
+	a.emit("rx:diagnostics", payload)
 }
 
 func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
@@ -1290,13 +1387,22 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 	}
 	activeProfile := ""
 	activeRate := 0
+	diagnosticsTicker := time.NewTicker(time.Second)
+	defer diagnosticsTicker.Stop()
+	defer func() { a.emitRXDiagnostics(decoder, activeProfile, activeRate, queue) }()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-diagnosticsTicker.C:
+			a.emitRXDiagnostics(decoder, activeProfile, activeRate, queue)
 		case block, ok := <-queue:
 			if !ok {
 				return
+			}
+			a.rxStats.decoderBlocks.Add(1)
+			if block == nil {
+				a.rxStats.decoderResets.Add(1)
 			}
 			a.mu.Lock()
 			profileID, rate := a.settings.RXProfile, a.settings.AudioSampleRate
@@ -1311,24 +1417,43 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 				}
 				if err != nil {
 					a.setAudioError(fmt.Errorf("initialize %s streaming decoder: %w", profileID, err))
+					a.recordRXError("decoder-init", err)
+					a.rxStats.decoderErrors.Add(1)
 					decoder = nil
+					a.emitRXDiagnostics(decoder, activeProfile, activeRate, queue)
 					continue
 				}
 			}
 			if decoder == nil {
 				continue
 			}
-			packets, err := decoder.Feed(block)
-			if err != nil && len(packets) == 0 {
-				// Short acquisition windows and incomplete frame tails are normal
-				// during live RX. A final FEC CRC warning may coexist with valid
-				// packets decoded from the same callback, so still deliver them.
-				continue
-			}
-			for _, packet := range packets {
-				if a.rxManager != nil {
-					a.rxManager.Submit(packet)
+			packets, err, panicMessage, panicStack := safeFeedRXDecoder(decoder, block)
+			if err != nil {
+				a.rxStats.decoderErrors.Add(1)
+				a.recordRXError("decoder-feed", err)
+				if panicMessage != "" {
+					a.rxStats.decoderPanics.Add(1)
+					// The decoder may have partially mutated state before the panic.
+					// Reset it so the worker remains alive and can acquire a later burst.
+					if resetter, ok := decoder.(interface{ Reset() }); ok {
+						resetter.Reset()
+					}
+					a.emit("rx:decoder-error", map[string]interface{}{"stage": "feed", "error": err.Error(), "panic": true, "stack": panicStack})
 				}
+			} else if len(packets) > 0 {
+				a.rxStats.lastErrorMu.Lock()
+				a.rxStats.lastError = ""
+				a.rxStats.lastErrorAt = time.Time{}
+				a.rxStats.lastErrorMu.Unlock()
+			}
+			a.rxStats.decoderPackets.Add(uint64(len(packets)))
+			for _, packet := range packets {
+				if a.rxManager != nil && !a.rxManager.Submit(packet) {
+					a.rxStats.managerSubmitDrops.Add(1)
+				}
+			}
+			if err != nil || len(packets) > 0 {
+				a.emitRXDiagnostics(decoder, activeProfile, activeRate, queue)
 			}
 		}
 	}

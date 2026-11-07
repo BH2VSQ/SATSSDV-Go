@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"time"
@@ -71,11 +72,74 @@ type StreamDecoder struct {
 	maryFECCRC          uint32
 	maryFECFinished     bool
 	maryFECError        error
+	maryPacketHeader    *fec.PacketBurstHeader
+	maryPacketSoft      []float32
+	maryPacketBodyBits  int
+	marySDF3PacketsOK   uint64
+	marySDF3PacketsBad  uint64
+	marySDF3Resyncs     uint64
+	marySDF3LastError   string
+	inputSamples        uint64
+	decodedPackets      uint64
 
 	packetFECRecent        map[string]map[uint16][]byte
 	packetFECRecentOrder   map[string][]uint16
 	packetFECRecentUpdated map[string]time.Time
 	packetFECGroups        map[string]*packetFECGroup
+}
+
+type DecoderDiagnostics struct {
+	Profile             string  `json:"profile"`
+	InputSamples        uint64  `json:"inputSamples"`
+	DecodedPackets      uint64  `json:"decodedPackets"`
+	MARYLocked          bool    `json:"maryLocked"`
+	MARYBufferedSamples int     `json:"maryBufferedSamples"`
+	MARYSignalRMS       float64 `json:"marySignalRms"`
+	MARYSilenceSamples  int     `json:"marySilenceSamples"`
+	MARYPacketizedMode  bool    `json:"maryPacketizedMode"`
+	MARYReacquireCount  uint64  `json:"maryReacquireCount"`
+	FECMode             string  `json:"fecMode"`
+	FECBufferedBits     int     `json:"fecBufferedBits"`
+	FECExpectedBits     int     `json:"fecExpectedBits"`
+	FECChunksOK         uint64  `json:"fecChunksOk"`
+	FECChunksBad        uint64  `json:"fecChunksBad"`
+	FECResyncs          uint64  `json:"fecResyncs"`
+	LastFECError        string  `json:"lastFecError,omitempty"`
+}
+
+func (d *StreamDecoder) Diagnostics() DecoderDiagnostics {
+	if d == nil {
+		return DecoderDiagnostics{}
+	}
+	status := DecoderDiagnostics{Profile: string(d.profile.ID), InputSamples: d.inputSamples, DecodedPackets: d.decodedPackets,
+		FECChunksOK: d.marySDF3PacketsOK, FECChunksBad: d.marySDF3PacketsBad, FECResyncs: d.marySDF3Resyncs,
+		LastFECError: d.marySDF3LastError}
+	if d.mary != nil {
+		modem := d.mary.Diagnostics()
+		status.MARYLocked = modem.Locked
+		status.MARYBufferedSamples = modem.BufferedSamples
+		status.MARYSignalRMS = modem.SignalRMS
+		status.MARYSilenceSamples = modem.SilenceSamples
+		status.MARYPacketizedMode = modem.PacketizedMode
+		status.MARYReacquireCount = modem.ReacquireCount
+	}
+	switch d.maryFECMode {
+	case -1:
+		status.FECMode = "acquiring"
+	case 0:
+		status.FECMode = "legacy-hard"
+	case 1:
+		status.FECMode = "sdf2-image-burst"
+		status.FECBufferedBits = len(d.maryFECSoft) + len(d.maryHeaderSoft)
+		status.FECExpectedBits = int(max(int64(0), d.maryFECHeader.CodedBits()-d.maryFECBitsDone))
+	case 2:
+		status.FECMode = "sdf3-packetized"
+		status.FECBufferedBits = len(d.maryPacketSoft)
+		status.FECExpectedBits = d.maryPacketBodyBits
+	default:
+		status.FECMode = "unknown"
+	}
+	return status
 }
 
 func NewStreamDecoder(profileID domain.TransportMode, inputSampleRate int) (*StreamDecoder, error) {
@@ -172,8 +236,10 @@ func (d *StreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 	var bits []bool
 	var err error
 	if d.mary != nil {
+		d.inputSamples += uint64(len(samples))
 		soft := d.mary.FeedSoft(native)
 		packets := d.consumeMARYSoft(soft)
+		d.decodedPackets += uint64(len(packets))
 		if generation := d.mary.BurstGeneration(); generation != d.maryBurstGeneration {
 			d.maryBurstGeneration = generation
 			d.resetMARYFEC()
@@ -267,6 +333,9 @@ func (d *StreamDecoder) consumeCCSDSBits(bits []bool) []ReceivedPacket {
 }
 
 func (d *StreamDecoder) resetMARYFEC() {
+	if d.mary != nil {
+		d.mary.SetPacketizedMode(false)
+	}
 	d.maryFECMode = -1
 	d.maryHeaderSoft = nil
 	d.maryFECHeader = fec.BurstHeader{}
@@ -281,6 +350,9 @@ func (d *StreamDecoder) resetMARYFEC() {
 	d.maryFECCRC = 0
 	d.maryFECFinished = false
 	d.maryFECError = nil
+	d.maryPacketHeader = nil
+	d.maryPacketSoft = nil
+	d.maryPacketBodyBits = 0
 }
 
 func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
@@ -294,6 +366,25 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 			return nil
 		}
 		headerBytes, combineErr := fec.CombineRepeatedBurstHeader(d.maryHeaderSoft[:headerBits])
+		if combineErr == nil && len(headerBytes) >= 4 && string(headerBytes[:4]) == "SDF3" {
+			packetHeader, parseErr := fec.ParsePacketBurstHeader(headerBytes)
+			d.maryFECMode = 2
+			d.mary.SetPacketizedMode(true)
+			remaining := append([]float32(nil), d.maryHeaderSoft[headerBits:]...)
+			d.maryHeaderSoft = nil
+			if parseErr == nil {
+				d.maryPacketHeader = &packetHeader
+				d.maryPacketBodyBits = int(packetHeader.InterleavedBits())
+			} else {
+				// The first SDF3 packet header may itself be damaged. Enter the
+				// packetized scanner anyway; it will find the next valid per-unit
+				// header rather than interpreting the rest of the GIF as legacy bits.
+				d.maryPacketSoft = append(d.maryPacketSoft, headerBytesToLLRs(remaining)...)
+				d.marySDF3LastError = parseErr.Error()
+			}
+			return d.consumeMARYPacketizedSoft(remaining)
+		}
+
 		var header fec.BurstHeader
 		var err error
 		if combineErr == nil {
@@ -309,7 +400,7 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 			d.maryHeaderSoft = nil
 			return d.consumeMARYFECSoft(remaining)
 		}
-		// A recognizable SGV2 marker with a failed CRC is a damaged new-format
+		// A recognizable SDF2 marker with a failed CRC is a damaged new-format
 		// header, not a legacy burst. Do not silently reinterpret coded payload
 		// bits as old hard-decision CCSDS data.
 		if combineErr == nil && len(headerBytes) >= 4 && string(headerBytes[:4]) == "SDF2" {
@@ -329,7 +420,171 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 	if d.maryFECMode == 0 {
 		return d.consumeCCSDSBits(softToBits(llrs))
 	}
+	if d.maryFECMode == 2 {
+		return d.consumeMARYPacketizedSoft(llrs)
+	}
 	return d.consumeMARYFECSoft(llrs)
+}
+
+// headerBytesToLLRs is intentionally a no-op copy helper used to make ownership
+// explicit when a malformed first SDF3 descriptor is retained for resync.
+func headerBytesToLLRs(values []float32) []float32 { return values }
+
+func (d *StreamDecoder) consumeMARYPacketizedSoft(llrs []float32) []ReceivedPacket {
+	if len(llrs) > 0 {
+		d.maryPacketSoft = append(d.maryPacketSoft, llrs...)
+	}
+	var packets []ReceivedPacket
+	for {
+		if d.maryPacketHeader == nil {
+			offset, header, ok := findSDF3PacketHeader(d.maryPacketSoft)
+			if !ok {
+				keep := fec.BurstHeaderWireBits - 1
+				if len(d.maryPacketSoft) > keep {
+					d.maryPacketSoft = append(d.maryPacketSoft[:0], d.maryPacketSoft[len(d.maryPacketSoft)-keep:]...)
+				}
+				return packets
+			}
+			if offset > 0 {
+				d.marySDF3Resyncs++
+			}
+			d.maryPacketSoft = d.maryPacketSoft[offset+fec.BurstHeaderWireBits:]
+			d.maryPacketHeader = &header
+			d.maryPacketBodyBits = int(header.InterleavedBits())
+		}
+
+		// A valid next SDF3 descriptor before the advertised body length means
+		// the current radio/audio chunk was truncated. Abandon only that one CCSDS
+		// unit and immediately continue at the next independently protected unit.
+		if offset, next, ok := findSDF3PacketHeader(d.maryPacketSoft); ok && offset < d.maryPacketBodyBits {
+			d.marySDF3PacketsBad++
+			d.marySDF3LastError = "previous SDF3 packet burst truncated before next header"
+			d.maryPacketSoft = d.maryPacketSoft[offset+fec.BurstHeaderWireBits:]
+			d.maryPacketHeader = &next
+			d.maryPacketBodyBits = int(next.InterleavedBits())
+			d.marySDF3Resyncs++
+			continue
+		}
+		if len(d.maryPacketSoft) < d.maryPacketBodyBits {
+			return packets
+		}
+
+		header := *d.maryPacketHeader
+		body := d.maryPacketSoft[:d.maryPacketBodyBits]
+		d.maryPacketSoft = d.maryPacketSoft[d.maryPacketBodyBits:]
+		d.maryPacketHeader = nil
+		d.maryPacketBodyBits = 0
+		raw, err := decodeSDF3PacketBody(header, body)
+		if err != nil {
+			d.marySDF3PacketsBad++
+			d.marySDF3LastError = err.Error()
+			continue
+		}
+		d.marySDF3PacketsOK++
+		d.marySDF3LastError = ""
+		packets = append(packets, d.consumeCCSDSBits(softBytesToBits(raw))...)
+	}
+}
+
+func findSDF3PacketHeader(llrs []float32) (int, fec.PacketBurstHeader, bool) {
+	const headerBits = fec.BurstHeaderWireBits
+	for offset := 0; offset+headerBits <= len(llrs); offset++ {
+		if !hasSDF3MagicAt(llrs, offset) {
+			continue
+		}
+		combined, err := fec.CombineRepeatedBurstHeader(llrs[offset : offset+headerBits])
+		if err != nil {
+			continue
+		}
+		header, err := fec.ParsePacketBurstHeader(combined)
+		if err == nil {
+			return offset, header, true
+		}
+	}
+	return -1, fec.PacketBurstHeader{}, false
+}
+
+func hasSDF3MagicAt(llrs []float32, offset int) bool {
+	if offset < 0 || offset+96 > len(llrs) {
+		return false
+	}
+	var magic [4]byte
+	bitPos := 0
+	for byteIndex := 0; byteIndex < len(magic); byteIndex++ {
+		for bit := 0; bit < 8; bit++ {
+			combined := llrs[offset+bitPos] + llrs[offset+bitPos+1] + llrs[offset+bitPos+2]
+			if combined < 0 {
+				magic[byteIndex] |= 1 << uint(7-bit)
+			}
+			bitPos += fec.BurstHeaderRepeat
+		}
+	}
+	return magic == [4]byte{'S', 'D', 'F', '3'}
+}
+
+func decodeSDF3PacketBody(header fec.PacketBurstHeader, body []float32) ([]byte, error) {
+	if len(body) != int(header.InterleavedBits()) {
+		return nil, fmt.Errorf("SDF3 packet has %d interleaved bits, expected %d", len(body), header.InterleavedBits())
+	}
+	decoder := fec.NewViterbiDecoder()
+	codedRemaining := header.CodedBits()
+	var decoded []bool
+	for offset := 0; offset < len(body); offset += fec.InterleaveBlockBits {
+		deinterleaved, err := fec.DeinterleaveSoftBlock(body[offset : offset+fec.InterleaveBlockBits])
+		if err != nil {
+			return nil, err
+		}
+		use := int64(len(deinterleaved))
+		if use > codedRemaining {
+			use = codedRemaining
+		}
+		if use > 0 {
+			part, decodeErr := decoder.Feed(deinterleaved[:int(use)])
+			if decodeErr != nil {
+				return nil, decodeErr
+			}
+			decoded = append(decoded, part...)
+			codedRemaining -= use
+		}
+	}
+	if codedRemaining != 0 {
+		return nil, fmt.Errorf("SDF3 packet is missing %d coded bits", codedRemaining)
+	}
+	tail, err := decoder.Flush()
+	if err != nil {
+		return nil, err
+	}
+	decoded = append(decoded, tail...)
+	expectedBits := int(header.RawBytes) * 8
+	if len(decoded) < expectedBits {
+		return nil, fmt.Errorf("SDF3 decoded %d bits, expected %d", len(decoded), expectedBits)
+	}
+	decoded = decoded[:expectedBits]
+	raw := softBitsToBytes(decoded)
+	if crc32.ChecksumIEEE(raw) != header.CRC32 {
+		return nil, errors.New("SDF3 packet CRC32 mismatch")
+	}
+	return raw, nil
+}
+
+func softBytesToBits(data []byte) []bool {
+	out := make([]bool, 0, len(data)*8)
+	for _, value := range data {
+		for bit := 7; bit >= 0; bit-- {
+			out = append(out, value&(1<<uint(bit)) != 0)
+		}
+	}
+	return out
+}
+
+func softBitsToBytes(bits []bool) []byte {
+	out := make([]byte, len(bits)/8)
+	for i, value := range bits[:len(out)*8] {
+		if value {
+			out[i/8] |= 1 << uint(7-i%8)
+		}
+	}
+	return out
 }
 
 func (d *StreamDecoder) consumeMARYFECSoft(llrs []float32) []ReceivedPacket {

@@ -233,6 +233,12 @@ func RecoverPacketParity(parities []PacketParityPayload, available map[uint16][]
 	base := parities[0]
 	var p0, p1 []byte
 	for _, p := range parities {
+		if len(p.Data) != PacketParityDataSize {
+			return nil, errors.New("packet parity shard has invalid length")
+		}
+		if p.Shard > 1 {
+			return nil, errors.New("packet parity shard index is invalid")
+		}
 		if p.Count != base.Count || p.ImageID != base.ImageID || p.Callsign != base.Callsign || p.IDs != base.IDs {
 			return nil, errors.New("packet parity group metadata mismatch")
 		}
@@ -243,9 +249,11 @@ func RecoverPacketParity(parities []PacketParityPayload, available map[uint16][]
 		}
 	}
 	shards := make([][]byte, int(base.Count))
+	validAvailable := make(map[uint16]bool, len(available))
 	for i := range shards {
 		if raw := available[base.IDs[i]]; len(raw) == 256 && raw[0] == 0x55 && raw[1] == 0x66 && binary.BigEndian.Uint32(raw[2:6]) == base.Callsign && raw[6] == base.ImageID && binary.BigEndian.Uint16(raw[7:9]) == base.IDs[i] {
 			shards[i] = append([]byte(nil), raw[2:224]...)
+			validAvailable[base.IDs[i]] = true
 		}
 	}
 	missing := 0
@@ -263,44 +271,12 @@ func RecoverPacketParity(parities []PacketParityPayload, available map[uint16][]
 	if len(p0) == 0 && len(p1) == 0 {
 		return nil, errors.New("packet parity group has no valid parity shard")
 	}
-	if len(p0) == 0 && missing == 1 {
-		index := -1
-		for i, shard := range shards {
-			if shard == nil {
-				index = i
-				break
-			}
-		}
-		if index >= 0 {
-			residual := append([]byte(nil), p1...)
-			for i, shard := range shards {
-				if shard == nil {
-					continue
-				}
-				for pos, value := range shard {
-					residual[pos] ^= gfMul(alphaTo[i], value)
-				}
-			}
-			coef := alphaTo[index]
-			for pos := range residual {
-				residual[pos] = gfDiv(residual[pos], coef)
-			}
-			shards[index] = residual
-		}
-	} else {
-		if len(p0) == 0 {
-			return nil, errors.New("two missing packets require both parity shards")
-		}
-		if len(p1) == 0 && missing == 2 {
-			return nil, errors.New("two missing packets require both parity shards")
-		}
-		if _, err := RecoverErasureShards(shards, p0, p1); err != nil {
-			return nil, err
-		}
+	if _, err := RecoverErasureShards(shards, p0, p1); err != nil {
+		return nil, err
 	}
 	out := make(map[uint16][]byte, missing)
 	for i, rawBody := range shards {
-		if _, exists := available[base.IDs[i]]; exists {
+		if validAvailable[base.IDs[i]] {
 			continue
 		}
 		if len(rawBody) != PacketParityDataSize {
@@ -328,3 +304,63 @@ func ExpectedInterleavedBytes(rawBytes uint32) (int, error) {
 	blocks := int64(math.Ceil(float64(codedBytes) / InterleaveBlockBytes))
 	return int(blocks * InterleaveBlockBytes), nil
 }
+
+// PacketBurstHeader describes one independently protected CCSDS data unit in
+// the loss-resilient SDF3 M-ary stream. Unlike BurstHeader (SDF2), its length
+// and CRC apply to exactly one 260-byte CCSDS data unit, allowing the receiver
+// to discard a damaged unit and reacquire the next one without losing the
+// remainder of a long image transmission.
+type PacketBurstHeader struct {
+	RawBytes uint32
+	CRC32    uint32
+}
+
+var packetBurstMagic = [4]byte{'S', 'D', 'F', '3'}
+
+func NewPacketBurstHeader(raw []byte) PacketBurstHeader {
+	return PacketBurstHeader{RawBytes: uint32(len(raw)), CRC32: crc32.ChecksumIEEE(raw)}
+}
+
+func (h PacketBurstHeader) MarshalBinary() ([]byte, error) {
+	if h.RawBytes == 0 || h.RawBytes > 4096 {
+		return nil, errors.New("SDF3 packet payload length is outside 1..4096 bytes")
+	}
+	out := make([]byte, BurstHeaderSize)
+	copy(out[:4], packetBurstMagic[:])
+	out[4] = BurstVersion
+	out[5] = 2 // K=7, rate 1/2, generators 171/133; independently terminated per unit.
+	binary.BigEndian.PutUint16(out[6:8], InterleaveBlockBytes)
+	binary.BigEndian.PutUint32(out[8:12], h.RawBytes)
+	binary.BigEndian.PutUint32(out[12:16], h.CRC32)
+	binary.BigEndian.PutUint16(out[16:18], burstHeaderCRC16(out[:16]))
+	return out, nil
+}
+
+func ParsePacketBurstHeader(data []byte) (PacketBurstHeader, error) {
+	if len(data) < BurstHeaderSize || string(data[:4]) != string(packetBurstMagic[:]) {
+		return PacketBurstHeader{}, errors.New("SDF3 packet marker not found")
+	}
+	if data[4] != BurstVersion || data[5] != 2 || binary.BigEndian.Uint16(data[6:8]) != InterleaveBlockBytes {
+		return PacketBurstHeader{}, errors.New("unsupported SDF3 packet FEC profile")
+	}
+	if got, want := binary.BigEndian.Uint16(data[16:18]), burstHeaderCRC16(data[:16]); got != want {
+		return PacketBurstHeader{}, errors.New("SDF3 packet header CRC mismatch")
+	}
+	h := PacketBurstHeader{RawBytes: binary.BigEndian.Uint32(data[8:12]), CRC32: binary.BigEndian.Uint32(data[12:16])}
+	if h.RawBytes == 0 || h.RawBytes > 4096 {
+		return PacketBurstHeader{}, errors.New("SDF3 packet length is invalid")
+	}
+	return h, nil
+}
+
+func (h PacketBurstHeader) CodedBits() int64 {
+	return 2 * (int64(h.RawBytes)*8 + ConvMemory)
+}
+
+func (h PacketBurstHeader) CodedBytes() int64 { return (h.CodedBits() + 7) / 8 }
+
+func (h PacketBurstHeader) InterleavedBytes() int64 {
+	return ((h.CodedBytes() + InterleaveBlockBytes - 1) / InterleaveBlockBytes) * InterleaveBlockBytes
+}
+
+func (h PacketBurstHeader) InterleavedBits() int64 { return h.InterleavedBytes() * 8 }

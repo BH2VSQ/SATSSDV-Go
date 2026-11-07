@@ -36,6 +36,14 @@ type AutoStreamDecoder struct {
 
 	lockedProfile domain.TransportMode
 	lastPacketAt  time.Time
+	lastError     string
+}
+
+type AutoDecoderDiagnostics struct {
+	LockedProfile   string               `json:"lockedProfile"`
+	LastPacketAgeMS int64                `json:"lastPacketAgeMs"`
+	LastError       string               `json:"lastError,omitempty"`
+	MARYCandidates  []DecoderDiagnostics `json:"maryCandidates,omitempty"`
 }
 
 func NewAutoStreamDecoder(inputSampleRate int) (*AutoStreamDecoder, error) {
@@ -89,6 +97,7 @@ func (d *AutoStreamDecoder) Reset() {
 	}
 	d.lockedProfile = ""
 	d.lastPacketAt = time.Time{}
+	d.lastError = ""
 }
 
 func (d *AutoStreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
@@ -149,6 +158,7 @@ func (d *AutoStreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 		if len(native) > 0 {
 			bits, err := d.gmsk2400.Feed(native, 19200)
 			if err != nil {
+				d.lastError = err.Error()
 				return packets, err
 			}
 			if locked == "" || locked == domain.SSDVCCSDS2400 || locked == domain.PCSICCSDS2400 {
@@ -164,6 +174,7 @@ func (d *AutoStreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 			}
 			decoded, err := decoder.Feed(samples)
 			if err != nil {
+				d.lastError = fmt.Sprintf("%s: %v", mode, err)
 				continue
 			}
 			for _, packet := range decoded {
@@ -173,7 +184,28 @@ func (d *AutoStreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 			}
 		}
 	}
+	if len(packets) > 0 {
+		d.lastError = ""
+	}
 	return packets, nil
+}
+
+// Diagnostics snapshots automatic-profile acquisition and all M-ary candidate
+// states. It is called by the RX worker (the same goroutine as Feed).
+func (d *AutoStreamDecoder) Diagnostics() AutoDecoderDiagnostics {
+	if d == nil {
+		return AutoDecoderDiagnostics{}
+	}
+	status := AutoDecoderDiagnostics{LockedProfile: string(d.lockedProfile), LastError: d.lastError}
+	if !d.lastPacketAt.IsZero() {
+		status.LastPacketAgeMS = time.Since(d.lastPacketAt).Milliseconds()
+	}
+	for _, mode := range []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600} {
+		if decoder := d.mary[mode]; decoder != nil {
+			status.MARYCandidates = append(status.MARYCandidates, decoder.Diagnostics())
+		}
+	}
+	return status
 }
 
 func belowAutoNoiseFloor(samples []float32) bool {

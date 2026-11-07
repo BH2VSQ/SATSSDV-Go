@@ -246,6 +246,44 @@ func TestPacketParityCanRecoverOneLossFromSingleParityShard(t *testing.T) {
 	}
 }
 
+func TestPacketParityCanRecoverOneLossFromFirstParityShard(t *testing.T) {
+	packets := make([][]byte, 4)
+	available := make(map[uint16][]byte)
+	for i := range packets {
+		raw := make([]byte, 256)
+		raw[0], raw[1], raw[6] = 0x55, 0x66, 10
+		raw[2] = 1
+		binary.BigEndian.PutUint16(raw[7:9], uint16(i))
+		for j := 15; j < 220; j++ {
+			raw[j] = byte(i*29 + j*3)
+		}
+		binary.BigEndian.PutUint32(raw[220:224], crc32.ChecksumIEEE(raw[1:220]))
+		parity, err := RS8Parity(raw[1:224])
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy(raw[224:], parity)
+		packets[i] = raw
+		available[uint16(i)] = append([]byte(nil), raw...)
+	}
+	payloads, err := BuildPacketParityPayloads(packets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parity, err := ParsePacketParityPayload(payloads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(available, 1)
+	recovered, err := RecoverPacketParity([]PacketParityPayload{parity}, available)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recovered[1], packets[1]) {
+		t.Fatal("first parity shard did not recover packet")
+	}
+}
+
 func TestBurstHeaderSizing(t *testing.T) {
 	raw := bytes.Repeat([]byte{0x5a}, 260*17)
 	header := NewBurstHeader(raw)
@@ -305,5 +343,47 @@ func TestBurstHeaderSoftRepetitionAndCRC(t *testing.T) {
 	combined[17] ^= 1
 	if _, err := ParseBurstHeader(combined); err == nil {
 		t.Fatal("header CRC corruption was accepted")
+	}
+}
+
+func TestSDF3PacketBurstHeaderRoundTrip(t *testing.T) {
+	raw := make([]byte, 260)
+	for i := range raw {
+		raw[i] = byte(i*37 + 11)
+	}
+	header := NewPacketBurstHeader(raw)
+	encoded, err := header.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParsePacketBurstHeader(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed != header {
+		t.Fatalf("SDF3 header round trip got %+v want %+v", parsed, header)
+	}
+	wire, err := RepeatBurstHeader(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	llrs := make([]float32, BurstHeaderWireBits)
+	for bit := 0; bit < BurstHeaderWireBits; bit++ {
+		if wire[bit/8]&(1<<uint(7-bit%8)) != 0 {
+			llrs[bit] = -4
+		} else {
+			llrs[bit] = 4
+		}
+	}
+	combined, err := CombineRepeatedBurstHeader(llrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedSoft, err := ParsePacketBurstHeader(combined)
+	if err != nil || parsedSoft != header {
+		t.Fatalf("SDF3 soft header parse got %+v err=%v", parsedSoft, err)
+	}
+	if header.InterleavedBits() < header.CodedBits() || header.InterleavedBits()%InterleaveBlockBits != 0 {
+		t.Fatalf("invalid SDF3 bit sizing: %+v", header)
 	}
 }

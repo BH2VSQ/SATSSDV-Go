@@ -58,6 +58,38 @@ func (m *StreamModulator) Start() ([]float32, error) {
 	return out, nil
 }
 
+// WriteTraining emits another known 96-symbol BPSK training word without
+// resetting carrier phase. SDF3 inserts one before each independently coded
+// CCSDS unit so a receiver that loses symbol lock during a long image burst can
+// reacquire at the next unit. Any pending M-ary bit carry is zero-padded before
+// the training word; SDF3 receivers search its following header bit-wise.
+func (m *StreamModulator) WriteTraining() ([]float32, error) {
+	if m == nil || m.closed {
+		return nil, errors.New("M-ary stream modulator is closed")
+	}
+	if !m.started {
+		return nil, errors.New("M-ary stream modulator must be started before writing training")
+	}
+	out := make([]float32, 0, (trainingSymbols+1)*m.sps)
+	if m.pendingN > 0 {
+		for m.pendingN < m.cfg.BitsPerSymbol {
+			m.pending[m.pendingN] = false
+			m.pendingN++
+		}
+		base := len(out)
+		out = append(out, make([]float32, m.sps)...)
+		m.writeSymbol(mapBits(m.pending[:m.cfg.BitsPerSymbol], m.cfg.BitsPerSymbol), out, &base)
+		m.pendingN = 0
+	}
+	base := len(out)
+	out = append(out, make([]float32, trainingSymbols*m.sps)...)
+	for _, sign := range trainingSequence {
+		value := complex(float32(sign), 0)
+		m.writeSymbol(value, out, &base)
+	}
+	return out, nil
+}
+
 func (m *StreamModulator) WriteBytes(data []byte) ([]float32, error) {
 	if m == nil || m.closed {
 		return nil, errors.New("M-ary stream modulator is closed")

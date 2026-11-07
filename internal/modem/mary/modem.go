@@ -37,6 +37,8 @@ type StreamDemodulator struct {
 	silenceSamples  int
 	signalRMS       float64
 	burstGeneration uint64
+	reacquireCount  uint64
+	packetizedMode  bool
 	cosLUT          []float64
 	sinLUT          []float64
 }
@@ -153,7 +155,14 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 	// buffered, then release acquisition state so a later training word can
 	// lock the same long-running RX stream again.
 	blockRMS := audioBlockRMS(samples)
-	silenceThreshold := math.Max(0.002, d.signalRMS*0.10)
+	silenceRatio := 0.10
+	if d.packetizedMode {
+		// SDF3 packet boundaries contain a deliberate quiet guard. Use a wider
+		// threshold so ordinary RF/audio noise does not hide the guard and keep
+		// the modem locked across the next training word.
+		silenceRatio = 0.20
+	}
+	silenceThreshold := math.Max(0.002, d.signalRMS*silenceRatio)
 	if d.signalRMS > 0 && blockRMS < silenceThreshold {
 		d.silenceSamples += len(samples)
 		var ready []float32
@@ -190,7 +199,21 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 			return nil
 		}
 	}
+	// SDF3 uses explicit low-energy guards between independent packet units.
+	// Keep the generic symbol slicer on its legacy path here; the guard releases
+	// acquisition and the following 96-symbol word performs a clean re-lock.
 	return d.decodeAvailableSoft()
+}
+
+// SetPacketizedMode raises the low-energy guard threshold for SDF3 packetized
+// bursts. A packet boundary includes an explicit 200 ms quiet interval; after
+// 100 ms below the adaptive threshold the demodulator releases symbol lock so
+// the next per-packet 96-symbol training word can reacquire timing and carrier.
+func (d *StreamDemodulator) SetPacketizedMode(enabled bool) {
+	if d == nil {
+		return
+	}
+	d.packetizedMode = enabled
 }
 
 // BurstGeneration increases whenever a continuous receiver releases its
@@ -360,33 +383,37 @@ func (d *StreamDemodulator) tryAcquire() {
 		if bestStart < 0 || best.score < 0.76 {
 			continue
 		}
-		d.phase = best.phase
-		d.phaseStep = best.phaseStep
-		// The BPSK training word has unit constellation amplitude. Use it as an
-		// AGC reference so all payload constellations (especially 16-QAM outer
-		// points) are sliced independently of sound-card gain and TX filtering.
-		if best.amplitude > 1e-6 {
-			d.amplitudeScale = 1 / best.amplitude
-		} else {
-			d.amplitudeScale = 1
-		}
-		// The full-sample training correlation references carrier phase at
-		// the first sample of the preamble. Advance through all 96 training
-		// symbols and to the center of the first payload symbol before making
-		// its decision. The half-symbol term is important under residual CFO.
-		d.phaseRotation = cmplx.Rect(1, -(d.phase + d.phaseStep*(trainingSymbols+0.5)))
-		d.stepRotation = cmplx.Rect(1, -d.phaseStep)
-		d.cursor = bestStart + window
-		d.symbolIndex = 0
+		d.applyTrainingLock(bestStart, best)
 		d.locked = true
 		return
 	}
 	d.searchPos = last + 1
 }
 
-func (d *StreamDemodulator) decodeAvailableSoft() []float32 {
-	count := (len(d.baseband) - d.cursor) / d.sps
-	if count <= 0 {
+func (d *StreamDemodulator) applyTrainingLock(start int, candidate trainingCandidate) {
+	if candidate.amplitude > 1e-6 {
+		d.amplitudeScale = 1 / candidate.amplitude
+	} else {
+		d.amplitudeScale = 1
+	}
+	d.phase = candidate.phase
+	d.phaseStep = candidate.phaseStep
+	d.phaseRotation = cmplx.Rect(1, -(d.phase + d.phaseStep*(trainingSymbols+0.5)))
+	d.stepRotation = cmplx.Rect(1, -d.phaseStep)
+	d.cursor = start + trainingSymbols*d.sps
+	d.symbolIndex = 0
+	d.reacquireCount++
+}
+
+func (d *StreamDemodulator) compactBaseband() {
+	if d.cursor > len(d.baseband)/2 {
+		d.baseband = append([]complex64(nil), d.baseband[d.cursor:]...)
+		d.cursor = 0
+	}
+}
+
+func (d *StreamDemodulator) decodeSymbolCount(count int) []float32 {
+	if count <= 0 || d.cursor+count*d.sps > len(d.baseband) {
 		return nil
 	}
 	out := make([]float32, 0, count*d.cfg.BitsPerSymbol)
@@ -404,10 +431,13 @@ func (d *StreamDemodulator) decodeAvailableSoft() []float32 {
 		d.symbolIndex++
 	}
 	d.cursor += count * d.sps
-	if d.cursor > len(d.baseband)/2 {
-		d.baseband = append([]complex64(nil), d.baseband[d.cursor:]...)
-		d.cursor = 0
-	}
+	return out
+}
+
+func (d *StreamDemodulator) decodeAvailableSoft() []float32 {
+	count := (len(d.baseband) - d.cursor) / d.sps
+	out := d.decodeSymbolCount(count)
+	d.compactBaseband()
 	return out
 }
 
@@ -655,4 +685,27 @@ func gcd(a, b int) int {
 		return -a
 	}
 	return a
+}
+
+// StreamDiagnostics exposes bounded read-only acquisition telemetry so the RX
+// UI can distinguish a modem that is still receiving samples from one that has
+// lost symbol lock or is waiting for a fresh training word.
+type StreamDiagnostics struct {
+	ReacquireCount  uint64
+	PacketizedMode  bool
+	Locked          bool
+	BufferedSamples int
+	SignalRMS       float64
+	SilenceSamples  int
+	BurstGeneration uint64
+}
+
+func (d *StreamDemodulator) Diagnostics() StreamDiagnostics {
+	if d == nil {
+		return StreamDiagnostics{}
+	}
+	return StreamDiagnostics{
+		ReacquireCount: d.reacquireCount, PacketizedMode: d.packetizedMode, Locked: d.locked, BufferedSamples: len(d.baseband), SignalRMS: d.signalRMS,
+		SilenceSamples: d.silenceSamples, BurstGeneration: d.burstGeneration,
+	}
 }

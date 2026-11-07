@@ -339,6 +339,41 @@ func RecoverErasureShards(data [][]byte, parity0, parity1 []byte) (int, error) {
 	if len(missing) > 2 {
 		return 0, errors.New("two parity shards cannot recover more than two losses")
 	}
+	if len(missing) == 1 {
+		index := missing[0]
+		recovered := make([]byte, shardLen)
+		if len(parity0) > 0 {
+			copy(recovered, parity0)
+			for _, shard := range data {
+				if shard == nil {
+					continue
+				}
+				for pos, value := range shard {
+					recovered[pos] ^= value
+				}
+			}
+		} else {
+			copy(recovered, parity1)
+			for shardIndex, shard := range data {
+				if shard == nil {
+					continue
+				}
+				coefficient := alphaTo[shardIndex]
+				for pos, value := range shard {
+					recovered[pos] ^= gfMul(coefficient, value)
+				}
+			}
+			coefficient := alphaTo[index]
+			for pos, value := range recovered {
+				recovered[pos] = gfDiv(value, coefficient)
+			}
+		}
+		data[index] = recovered
+		return 1, nil
+	}
+	if len(parity0) == 0 || len(parity1) == 0 {
+		return 0, errors.New("two missing shards require both parity shards")
+	}
 	residual0 := append([]byte(nil), parity0...)
 	residual1 := append([]byte(nil), parity1...)
 	for index, shard := range data {
@@ -350,23 +385,6 @@ func RecoverErasureShards(data [][]byte, parity0, parity1 []byte) (int, error) {
 			residual0[pos] ^= value
 			residual1[pos] ^= gfMul(coefficient, value)
 		}
-	}
-	if len(missing) == 1 {
-		index := missing[0]
-		if len(parity0) != 0 {
-			data[index] = residual0
-		} else {
-			coefficient := alphaTo[index]
-			recovered := make([]byte, shardLen)
-			for pos, value := range residual1 {
-				recovered[pos] = gfDiv(value, coefficient)
-			}
-			data[index] = recovered
-		}
-		return 1, nil
-	}
-	if len(parity0) == 0 || len(parity1) == 0 {
-		return 0, errors.New("two missing shards require both parity shards")
 	}
 	first, second := missing[0], missing[1]
 	a, b := alphaTo[first], alphaTo[second]

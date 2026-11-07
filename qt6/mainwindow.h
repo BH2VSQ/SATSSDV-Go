@@ -121,6 +121,7 @@ private:
     QLabel *m_audioStatus = nullptr;
     QLabel *m_rxStatus = nullptr;
     QLabel *m_rxMeta = nullptr;
+    QLabel *m_rxDiagnostics = nullptr;
     ImagePreviewLabel *m_rxPreview = nullptr;
     ImagePreviewLabel *m_txPreview = nullptr;
     TemplateCanvas *m_templateCanvas = nullptr;

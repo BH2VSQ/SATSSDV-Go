@@ -130,13 +130,15 @@ type Manager struct {
 	reconDone   chan struct{}
 	on          func(Update)
 
-	mu             sync.Mutex
-	closed         atomic.Bool
-	droppedPackets atomic.Uint64
-	lastSweep      time.Time
-	sessions       map[string]*imageSession
-	ssdv           map[string]*ssdvSession
-	gifStreams     map[string]*gifStreamSession
+	mu               sync.Mutex
+	closed           atomic.Bool
+	droppedPackets   atomic.Uint64
+	submittedPackets atomic.Uint64
+	processedPackets atomic.Uint64
+	lastSweep        time.Time
+	sessions         map[string]*imageSession
+	ssdv             map[string]*ssdvSession
+	gifStreams       map[string]*gifStreamSession
 }
 
 func NewManager(onUpdate func(Update)) *Manager {
@@ -170,6 +172,7 @@ func (m *Manager) Submit(packet transport.ReceivedPacket) bool {
 	packet.Raw = append([]byte(nil), packet.Raw...)
 	select {
 	case m.queue <- packet:
+		m.submittedPackets.Add(1)
 		// Avoid reporting success if Close won the race after the enqueue.
 		return !m.closed.Load()
 	case <-m.ctx.Done():
@@ -190,6 +193,81 @@ func (m *Manager) DroppedPackets() uint64 {
 	return m.droppedPackets.Load()
 }
 
+type GIFStreamDiagnostics struct {
+	Callsign             string `json:"callsign"`
+	SessionID            string `json:"sessionId"`
+	FrameID              uint8  `json:"frameId"`
+	FrameIndex           uint16 `json:"frameIndex"`
+	FramePacketsReceived int    `json:"framePacketsReceived"`
+	FramePacketsExpected int    `json:"framePacketsExpected"`
+	DecodedMCUs          int    `json:"decodedMcus"`
+	ExpectedMCUs         int    `json:"expectedMcus"`
+	AwaitingKeyframe     bool   `json:"awaitingKeyframe"`
+	Incomplete           bool   `json:"incomplete"`
+	Complete             bool   `json:"complete"`
+	LastPacketAgeMS      int64  `json:"lastPacketAgeMs"`
+	LastDecodeAgeMS      int64  `json:"lastDecodeAgeMs"`
+	DecodeAttempts       uint64 `json:"decodeAttempts"`
+	LastDecodeError      string `json:"lastDecodeError,omitempty"`
+}
+
+type ManagerDiagnostics struct {
+	QueueDepth       int                    `json:"queueDepth"`
+	QueueCapacity    int                    `json:"queueCapacity"`
+	QueueDropped     uint64                 `json:"queueDropped"`
+	SubmittedPackets uint64                 `json:"submittedPackets"`
+	ProcessedPackets uint64                 `json:"processedPackets"`
+	GIFStreams       []GIFStreamDiagnostics `json:"gifStreams,omitempty"`
+}
+
+// Diagnostics returns a bounded snapshot of RX queue and GIF reconstruction
+// progress. It never exposes image buffers or packet payloads.
+func (m *Manager) Diagnostics() ManagerDiagnostics {
+	if m == nil {
+		return ManagerDiagnostics{}
+	}
+	status := ManagerDiagnostics{
+		QueueDepth: len(m.queue), QueueCapacity: cap(m.queue),
+		QueueDropped: m.droppedPackets.Load(), SubmittedPackets: m.submittedPackets.Load(),
+		ProcessedPackets: m.processedPackets.Load(),
+	}
+	now := time.Now()
+	m.mu.Lock()
+	for _, stream := range m.gifStreams {
+		if stream == nil {
+			continue
+		}
+		item := GIFStreamDiagnostics{
+			Callsign: stream.callsign, SessionID: stream.sessionID,
+			FrameID: stream.lastFrameID, AwaitingKeyframe: stream.awaitingKeyframe,
+			Incomplete: stream.incomplete, Complete: stream.complete,
+		}
+		if !stream.lastUpdate.IsZero() {
+			item.LastPacketAgeMS = now.Sub(stream.lastUpdate).Milliseconds()
+		}
+		frame := stream.pending
+		if frame == nil && stream.hasLatestFrame {
+			frame = stream.recentFrames[stream.latestFrameID]
+		}
+		if frame != nil {
+			item.FrameID = frame.imageID
+			item.FrameIndex = frame.frameIndex
+			item.FramePacketsReceived = frame.receivedPackets
+			item.FramePacketsExpected = frame.expectedPackets + frame.controlExpected
+			item.DecodedMCUs = frame.decodedMCUs
+			item.ExpectedMCUs = (frame.width / 16) * (frame.height / 16)
+			item.DecodeAttempts = frame.decodeAttempts
+			item.LastDecodeError = frame.lastDecodeError
+			if !frame.lastDecodeAt.IsZero() {
+				item.LastDecodeAgeMS = now.Sub(frame.lastDecodeAt).Milliseconds()
+			}
+		}
+		status.GIFStreams = append(status.GIFStreams, item)
+	}
+	m.mu.Unlock()
+	return status
+}
+
 func (m *Manager) run() {
 	defer close(m.done)
 	gifArchiveTicker := time.NewTicker(500 * time.Millisecond)
@@ -202,6 +280,7 @@ func (m *Manager) run() {
 			if update, ok := m.process(packet); ok && m.on != nil {
 				m.on(update)
 			}
+			m.processedPackets.Add(1)
 		case result := <-m.reconResult:
 			m.finishReconstruction(result)
 		case now := <-gifArchiveTicker.C:

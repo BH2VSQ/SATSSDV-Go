@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
@@ -114,26 +113,12 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 	if err != nil {
 		return 0, err
 	}
-	randomizer := ccsds.RandomizerSequence()
-	totalRawBytes := e.cfg.PreambleSize + e.cfg.TrailerSize + len(wirePackets)*(4+ccsds.PayloadLength)
-	if totalRawBytes <= 0 || uint64(totalRawBytes) > uint64(^uint32(0)) {
-		return 0, errors.New("soft-FEC burst exceeds 32-bit byte length")
-	}
-	crc := crc32.NewIEEE()
-	_, _ = crc.Write(repeatRandomizer(randomizer, e.cfg.PreambleSize))
-	for _, packet := range wirePackets {
-		unit, buildErr := ccsds.BuildDataUnit(packet)
-		if buildErr != nil {
-			return 0, buildErr
-		}
-		_, _ = crc.Write(unit)
-	}
-	_, _ = crc.Write(repeatRandomizer(randomizer, e.cfg.TrailerSize))
-	header, err := (fec.BurstHeader{RawBytes: uint32(totalRawBytes), CRC32: crc.Sum32()}).MarshalBinary()
-	if err != nil {
-		return 0, err
-	}
 
+	// SDF3 protects each CCSDS data unit independently. Every unit receives a
+	// fresh convolutional encoder/interleaver, a repeated CRC-protected header,
+	// and a new training word. This bounds the damage from a radio fade or lost
+	// audio block to one unit and gives the receiver a fresh symbol-acquisition
+	// point before the next one. The receiver retains SDF2 and legacy support.
 	training, err := mod.Start()
 	if err != nil {
 		return 0, err
@@ -141,68 +126,76 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 	if err := sink.write(training); err != nil {
 		return 0, err
 	}
-	// The triplicated descriptor is the enhanced-burst bootstrap for new receivers.
-	// New receivers still accept legacy bursts; legacy receivers do not decode SGV2.
-	wireHeader, err := fec.RepeatBurstHeader(header)
-	if err != nil {
-		return 0, err
-	}
-	if err := sink.writeMARYBytes(mod, wireHeader); err != nil {
-		return 0, err
-	}
 
-	conv := fec.NewConvStreamEncoder()
-	interleaver := fec.NewBlockInterleaver()
-	writeFECBytes := func(data []byte) error {
-		if len(data) == 0 {
-			return nil
-		}
-		coded, encodeErr := conv.WriteBytes(data)
-		if encodeErr != nil {
-			return encodeErr
-		}
-		interleaved, interleaveErr := interleaver.Write(coded)
-		if interleaveErr != nil {
-			return interleaveErr
-		}
-		return sink.writeMARYBytes(mod, interleaved)
-	}
-	if err := writeFECBytes(repeatRandomizer(randomizer, e.cfg.PreambleSize)); err != nil {
-		return 0, err
-	}
-	for i, packet := range wirePackets {
+	for index, packet := range wirePackets {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
+		if index > 0 {
+			// The 200 ms guard leaves at least 100 ms of complete low-energy
+			// callback blocks even when the audio API splits the stream into
+			// arbitrary blocks up to 40 ms. The receiver needs 100 ms to release
+			// carrier lock before the next independent training word.
+			if err := sink.writeMARYSilence(profile.SampleRate / 5); err != nil {
+				return 0, err
+			}
+			reacquire, trainingErr := mod.WriteTraining()
+			if trainingErr != nil {
+				return 0, trainingErr
+			}
+			if err := sink.write(reacquire); err != nil {
+				return 0, err
+			}
+		}
 		unit, buildErr := ccsds.BuildDataUnit(packet)
 		if buildErr != nil {
-			return 0, fmt.Errorf("build CCSDS data unit %d: %w", i, buildErr)
+			return 0, fmt.Errorf("build CCSDS data unit %d: %w", index, buildErr)
 		}
-		if err := writeFECBytes(unit); err != nil {
+		header, headerErr := fec.NewPacketBurstHeader(unit).MarshalBinary()
+		if headerErr != nil {
+			return 0, headerErr
+		}
+		wireHeader, headerErr := fec.RepeatBurstHeader(header)
+		if headerErr != nil {
+			return 0, headerErr
+		}
+		headerPCM, modErr := mod.WriteBytes(wireHeader)
+		if modErr != nil {
+			return 0, modErr
+		}
+		if err := sink.write(headerPCM); err != nil {
+			return 0, err
+		}
+
+		conv := fec.NewConvStreamEncoder()
+		interleaver := fec.NewBlockInterleaver()
+		coded, encodeErr := conv.WriteBytes(unit)
+		if encodeErr != nil {
+			return 0, encodeErr
+		}
+		tail, encodeErr := conv.Close()
+		if encodeErr != nil {
+			return 0, encodeErr
+		}
+		coded = append(coded, tail...)
+		interleaved, interleaveErr := interleaver.Write(coded)
+		if interleaveErr != nil {
+			return 0, interleaveErr
+		}
+		interleaveTail, interleaveErr := interleaver.Close()
+		if interleaveErr != nil {
+			return 0, interleaveErr
+		}
+		interleaved = append(interleaved, interleaveTail...)
+		codedPCM, modErr := mod.WriteBytes(interleaved)
+		if modErr != nil {
+			return 0, modErr
+		}
+		if err := sink.write(codedPCM); err != nil {
 			return 0, err
 		}
 	}
-	if err := writeFECBytes(repeatRandomizer(randomizer, e.cfg.TrailerSize)); err != nil {
-		return 0, err
-	}
-	tail, err := conv.Close()
-	if err != nil {
-		return 0, err
-	}
-	interleavedTail, err := interleaver.Write(tail)
-	if err != nil {
-		return 0, err
-	}
-	if err := sink.writeMARYBytes(mod, interleavedTail); err != nil {
-		return 0, err
-	}
-	lastBlock, err := interleaver.Close()
-	if err != nil {
-		return 0, err
-	}
-	if err := sink.writeMARYBytes(mod, lastBlock); err != nil {
-		return 0, err
-	}
+
 	modTail, err := mod.Close()
 	if err != nil {
 		return 0, err
@@ -259,6 +252,22 @@ func buildMARYWirePackets(packets [][]byte) ([][]byte, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (sink *pcmStreamSink) writeMARYSilence(samples int) error {
+	if samples <= 0 {
+		return nil
+	}
+	const chunk = 2048
+	zero := make([]float32, min(chunk, samples))
+	for samples > 0 {
+		count := min(len(zero), samples)
+		if err := sink.write(zero[:count]); err != nil {
+			return err
+		}
+		samples -= count
+	}
+	return nil
 }
 
 func (sink *pcmStreamSink) writeMARYBytes(mod *mary.StreamModulator, data []byte) error {
@@ -381,13 +390,17 @@ func (e *Encoder) EstimateOutputSamplesForPackets(packets [][]byte) (int64, erro
 		if wireErr != nil {
 			return 0, wireErr
 		}
-		rawBytes := int64(e.cfg.PreambleSize + e.cfg.TrailerSize + len(wirePackets)*(4+ccsds.PayloadLength))
-		codeBits := 2 * (rawBytes*8 + fec.ConvMemory)
-		codeBytes := (codeBits + 7) / 8
-		interleavedBytes := ((codeBytes + fec.InterleaveBlockBytes - 1) / fec.InterleaveBlockBytes) * fec.InterleaveBlockBytes
-		modBits := int64(fec.BurstHeaderWireBits) + interleavedBytes*8
-		symbols := int64(maryTrainingSymbols) + (modBits+int64(profile.BitsPerSymbol)-1)/int64(profile.BitsPerSymbol)
-		native := symbols * int64(profile.SampleRate/profile.SymbolRate)
+		interleavedBytes, sizeErr := fec.ExpectedInterleavedBytes(4 + ccsds.PayloadLength)
+		if sizeErr != nil {
+			return 0, sizeErr
+		}
+		modBits := int64(fec.BurstHeaderWireBits + interleavedBytes*8)
+		symbolsPerUnit := (modBits + int64(profile.BitsPerSymbol) - 1) / int64(profile.BitsPerSymbol)
+		samplesPerUnit := (symbolsPerUnit + maryTrainingSymbols) * int64(profile.SampleRate/profile.SymbolRate)
+		native := int64(len(wirePackets)) * samplesPerUnit
+		if len(wirePackets) > 1 {
+			native += int64(len(wirePackets)-1) * int64(profile.SampleRate/5)
+		}
 		targetRate := e.cfg.AudioSampleRate
 		if targetRate <= 0 {
 			targetRate = profile.SampleRate

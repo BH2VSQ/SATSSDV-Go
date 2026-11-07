@@ -588,3 +588,28 @@ func TestGIFPacketsAreRoutedIntoDedicatedGIFDecoder(t *testing.T) {
 		t.Fatalf("GIF control packet did not create an isolated animation session: %+v", m.gifStreams)
 	}
 }
+
+func TestManagerDiagnosticsReportsQueueAndProcessingProgress(t *testing.T) {
+	manager := NewManager(nil)
+	defer manager.Close()
+	const count = 32
+	for i := 0; i < count; i++ {
+		if !manager.Submit(transport.ReceivedPacket{Codec: "UNKNOWN", PacketID: uint16(i)}) {
+			t.Fatalf("manager rejected diagnostic test packet %d", i)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for manager.Diagnostics().ProcessedPackets < count && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	status := manager.Diagnostics()
+	if status.QueueCapacity == 0 || status.QueueCapacity < queueCapacity {
+		t.Fatalf("invalid queue capacity in diagnostics: %+v", status)
+	}
+	if status.SubmittedPackets != count || status.ProcessedPackets != count {
+		t.Fatalf("manager counters did not advance: %+v", status)
+	}
+	if status.QueueDropped != 0 {
+		t.Fatalf("unexpected queue drops: %+v", status)
+	}
+}

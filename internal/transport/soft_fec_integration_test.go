@@ -89,7 +89,6 @@ func TestSoftFECMARYStreamRoundTripAllConstellations(t *testing.T) {
 					// interpolation sample(s) before checking the declared FEC length.
 					waveform = append(waveform, make([]float32, audioRate/10)...)
 					var got []ReceivedPacket
-					finished := false
 					for offset := 0; offset < len(waveform); offset += 1920 {
 						end := min(len(waveform), offset+1920)
 						decoded, feedErr := dec.Feed(waveform[offset:end])
@@ -97,20 +96,23 @@ func TestSoftFECMARYStreamRoundTripAllConstellations(t *testing.T) {
 							t.Fatalf("RX feed: %v", feedErr)
 						}
 						got = append(got, decoded...)
-						if dec.maryFECFinished {
-							finished = true
-							break // leave the completed burst state intact for assertions
-						}
 					}
-					if dec.maryFECMode != 1 || !finished || dec.maryFECError != nil {
-						t.Fatalf("soft-FEC receiver state mode=%d finished=%v bits=%d/%d decoded=%d bytes=%d/%d err=%v", dec.maryFECMode, dec.maryFECFinished, dec.maryFECBitsDone, dec.maryFECHeader.CodedBits(), dec.maryFECDecodedBits, dec.maryFECDecodedBytes, dec.maryFECHeader.RawBytes, dec.maryFECError)
+					if dec.marySDF3PacketsOK < uint64(len(packets)) || dec.marySDF3PacketsBad != 0 {
+						t.Fatalf("SDF3 receiver state mode=%d chunks=%d/%d resync=%d error=%q diag=%+v", dec.maryFECMode, dec.marySDF3PacketsOK, dec.marySDF3PacketsBad, dec.marySDF3Resyncs, dec.marySDF3LastError, dec.Diagnostics())
 					}
 					if len(got) != len(packets) {
 						t.Fatalf("decoded %d/%d image packets", len(got), len(packets))
 					}
-					for i, packet := range got {
-						if packet.PacketID != uint16(100+i) || packet.ImageID != 0x31 {
-							t.Fatalf("packet %d metadata mismatch: %+v", i, packet)
+					seenIDs := make(map[uint16]bool, len(got))
+					for _, packet := range got {
+						if packet.ImageID != 0x31 {
+							t.Fatalf("image ID mismatch: %+v", packet)
+						}
+						seenIDs[packet.PacketID] = true
+					}
+					for id := uint16(100); id < 100+uint16(len(packets)); id++ {
+						if !seenIDs[id] {
+							t.Fatalf("decoded packets missing packet ID %d (seen=%v)", id, seenIDs)
 						}
 					}
 				})
@@ -165,9 +167,103 @@ func TestSoftFECMARYStreamRoundTripWithAWGN(t *testing.T) {
 				t.Fatalf("soft-FEC decoder: %v", dec.maryFECError)
 			}
 			if len(got) != len(packets) {
-				t.Fatalf("at %.1f dB SNR decoded %d/%d packets", snrDB, len(got), len(packets))
+				t.Fatalf("at %.1f dB SNR decoded %d/%d packets: diag=%+v", snrDB, len(got), len(packets), dec.Diagnostics())
 			}
 		})
+	}
+}
+
+func TestSDF3MARYReacquiresAfterDroppedPacketAndUsesPacketFEC(t *testing.T) {
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	cases := []struct {
+		name       string
+		dropUnits  []int
+		wantRepair int
+	}{
+		{name: "one-loss-first-parity-only", dropUnits: []int{1, 9}, wantRepair: 1},
+		{name: "one-loss-second-parity-only", dropUnits: []int{1, 8}, wantRepair: 1},
+		{name: "two-losses-both-parities", dropUnits: []int{1, 2}, wantRepair: 2},
+	}
+	for _, profile := range profiles {
+		profile := profile
+		for _, tc := range cases {
+			t.Run(string(profile)+"/"+tc.name, func(t *testing.T) {
+				packets := makeSoftFECTestPackets(t, 8)
+				enc, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var waveform []float32
+				if _, err := enc.StreamPackets(context.Background(), packets, func(block []float32) error {
+					waveform = append(waveform, block...)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				wirePackets, err := buildMARYWirePackets(packets)
+				if err != nil {
+					t.Fatal(err)
+				}
+				interleavedBytes, err := fec.ExpectedInterleavedBytes(4 + ccsds.PayloadLength)
+				if err != nil {
+					t.Fatal(err)
+				}
+				profileInfo, _ := domain.ParseProfile(string(profile))
+				bits := int64(fec.BurstHeaderWireBits + interleavedBytes*8)
+				symbols := int64(maryTrainingSymbols) + (bits+int64(profileInfo.BitsPerSymbol)-1)/int64(profileInfo.BitsPerSymbol)
+				unitSamples := (symbols * int64(profileInfo.SampleRate/profileInfo.SymbolRate))
+				guardSamples := int64(profileInfo.SampleRate / 5)
+				for _, unitIndex := range tc.dropUnits {
+					if unitIndex < 0 || unitIndex >= len(wirePackets) {
+						t.Fatalf("invalid dropped unit index %d", unitIndex)
+					}
+					start := int64(unitIndex) * (unitSamples + guardSamples)
+					end := start + unitSamples
+					if end > int64(len(waveform)) {
+						t.Fatalf("drop range %d..%d exceeds waveform %d", start, end, len(waveform))
+					}
+					for i := int(start); i < int(end); i++ {
+						waveform[i] = 0
+					}
+				}
+
+				dec, err := NewStreamDecoder(profile, 48000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got []ReceivedPacket
+				for offset := 0; offset < len(waveform); offset += 1920 {
+					part, feedErr := dec.Feed(waveform[offset:min(offset+1920, len(waveform))])
+					if feedErr != nil {
+						t.Fatalf("RX feed: %v", feedErr)
+					}
+					got = append(got, part...)
+				}
+				if len(got) != len(packets) {
+					t.Fatalf("received %d/%d SSDV packets after losses %v: diag=%+v", len(got), len(packets), tc.dropUnits, dec.Diagnostics())
+				}
+				recovered := 0
+				seen := make(map[uint16]bool)
+				for _, packet := range got {
+					seen[packet.PacketID] = true
+					if packet.FECRecovered {
+						recovered++
+					}
+				}
+				if recovered != tc.wantRepair {
+					t.Fatalf("recovered %d packets, want %d; diag=%+v", recovered, tc.wantRepair, dec.Diagnostics())
+				}
+				for _, original := range packets {
+					id := binary.BigEndian.Uint16(original[7:9])
+					if !seen[id] {
+						t.Fatalf("packet %d missing after recovery", id)
+					}
+				}
+				if dec.Diagnostics().MARYReacquireCount < 8 {
+					t.Fatalf("receiver did not repeatedly reacquire packet preambles: %+v", dec.Diagnostics())
+				}
+			})
+		}
 	}
 }
 
@@ -265,8 +361,8 @@ func TestSoftFECMARYDecoderReacquiresAfterSilence(t *testing.T) {
 		}
 	}
 	feed(firstWave)
-	if !dec.maryFECFinished {
-		t.Fatal("first burst did not finish")
+	if dec.marySDF3PacketsOK != 10 {
+		t.Fatalf("first SDF3 burst decoded %d/10 physical units: %+v", dec.marySDF3PacketsOK, dec.Diagnostics())
 	}
 	noise := make([]float32, 7200)
 	noiseSource := rand.New(rand.NewSource(0xface))
@@ -278,8 +374,8 @@ func TestSoftFECMARYDecoderReacquiresAfterSilence(t *testing.T) {
 		t.Fatalf("decoder was not re-armed after silence: mode=%d", dec.maryFECMode)
 	}
 	feed(secondWave)
-	if !dec.maryFECFinished || dec.maryFECError != nil {
-		t.Fatalf("second burst state: finished=%v error=%v", dec.maryFECFinished, dec.maryFECError)
+	if dec.marySDF3PacketsOK != 20 || dec.marySDF3LastError != "" {
+		t.Fatalf("second burst state: chunks=%d error=%q diag=%+v", dec.marySDF3PacketsOK, dec.marySDF3LastError, dec.Diagnostics())
 	}
 	if len(got) != 16 {
 		t.Fatalf("received %d packets across two bursts, want 16", len(got))

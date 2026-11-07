@@ -674,6 +674,11 @@ void MainWindow::buildUi() {
     m_rxMeta = new QLabel(QStringLiteral("CALL  ---   SSID  --   IMAGE ID  --   PACKETS  0 / 0   MODE  ---"), rxPane);
     m_rxMeta->setStyleSheet(QStringLiteral("font-size:8pt; color:#7e8991; padding:2px 1px;"));
     rxLayout->addWidget(m_rxMeta);
+    m_rxDiagnostics = new QLabel(uiText(QStringLiteral("RX 解码诊断 · 等待音频")), rxPane);
+    m_rxDiagnostics->setStyleSheet(QStringLiteral("font-size:7pt; color:#6b7881; padding:1px 1px;"));
+    m_rxDiagnostics->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_rxDiagnostics->setWordWrap(true);
+    rxLayout->addWidget(m_rxDiagnostics);
     auto *rxSpectrumTitle = new QHBoxLayout();
     rxSpectrumTitle->addWidget(new QLabel(uiText(QStringLiteral("RX 瀑布图")), rxPane));
     rxSpectrumTitle->addStretch();
@@ -2130,6 +2135,81 @@ void MainWindow::handleEvent(const QJsonObject &event) {
             statusBar()->showMessage(uiText(QStringLiteral("GIF 部分接收内容已自动保存到相册")), 3500);
         }
         if (gifMode ? gifSaved || gifEnd : complete) refreshAlbum();
+    } else if(name==QStringLiteral("rx:diagnostics")){
+        const auto p=payloadValue.toObject();
+        const auto manager=p.value(QStringLiteral("manager")).toObject();
+        const auto decoder=p.value(QStringLiteral("decoder")).toObject();
+        QString modemState=QStringLiteral("N/A");
+        QString profile=decoder.value(QStringLiteral("profile")).toString();
+        bool locked=decoder.value(QStringLiteral("maryLocked")).toBool();
+        int buffered=decoder.value(QStringLiteral("maryBufferedSamples")).toInt();
+        quint64 reacquires=decoder.value(QStringLiteral("maryReacquireCount")).toInteger();
+        QString fecMode=decoder.value(QStringLiteral("fecMode")).toString();
+        qint64 fecOK=decoder.value(QStringLiteral("fecChunksOk")).toInteger();
+        qint64 fecBad=decoder.value(QStringLiteral("fecChunksBad")).toInteger();
+        QString fecError=decoder.value(QStringLiteral("lastFecError")).toString();
+        const QString autoLocked=decoder.value(QStringLiteral("lockedProfile")).toString();
+        if(!autoLocked.isEmpty()) profile=autoLocked;
+        const auto candidates=decoder.value(QStringLiteral("maryCandidates")).toArray();
+        for(const auto &entry:candidates){
+            const auto candidate=entry.toObject();
+            const QString candidateProfile=candidate.value(QStringLiteral("profile")).toString();
+            if((!profile.isEmpty()&&candidateProfile==profile)||candidate.value(QStringLiteral("maryLocked")).toBool()){
+                locked=candidate.value(QStringLiteral("maryLocked")).toBool();
+                buffered=candidate.value(QStringLiteral("maryBufferedSamples")).toInt();
+                reacquires=candidate.value(QStringLiteral("maryReacquireCount")).toInteger();
+                fecMode=candidate.value(QStringLiteral("fecMode")).toString();
+                fecOK=candidate.value(QStringLiteral("fecChunksOk")).toInteger();
+                fecBad=candidate.value(QStringLiteral("fecChunksBad")).toInteger();
+                fecError=candidate.value(QStringLiteral("lastFecError")).toString();
+                break;
+            }
+        }
+        if(!profile.isEmpty() && profile.contains(QStringLiteral("1600")))
+            modemState=locked?QStringLiteral("LOCK"):QStringLiteral("SEARCH");
+        const QJsonArray streams=manager.value(QStringLiteral("gifStreams")).toArray();
+        QString gifState=QStringLiteral("GIF --");
+        QString gifDetails;
+        if(!streams.isEmpty()){
+            const auto gif=streams.first().toObject();
+            gifState=QStringLiteral("GIF F%1 %2/%3 MCU %4/%5%6")
+                .arg(gif.value(QStringLiteral("frameIndex")).toInt())
+                .arg(gif.value(QStringLiteral("framePacketsReceived")).toInt())
+                .arg(gif.value(QStringLiteral("framePacketsExpected")).toInt())
+                .arg(gif.value(QStringLiteral("decodedMcus")).toInt())
+                .arg(gif.value(QStringLiteral("expectedMcus")).toInt())
+                .arg(gif.value(QStringLiteral("awaitingKeyframe")).toBool()?QStringLiteral(" KEY"):QString());
+            gifDetails=QStringLiteral("GIF callsign=%1 frame=%2 lastPacket=%3ms lastDecode=%4ms attempts=%5 error=%6")
+                .arg(gif.value(QStringLiteral("callsign")).toString())
+                .arg(gif.value(QStringLiteral("frameId")).toInt())
+                .arg(gif.value(QStringLiteral("lastPacketAgeMs")).toInteger())
+                .arg(gif.value(QStringLiteral("lastDecodeAgeMs")).toInteger())
+                .arg(gif.value(QStringLiteral("decodeAttempts")).toInteger())
+                .arg(gif.value(QStringLiteral("lastDecodeError")).toString());
+        }
+        const qint64 queueDrops=p.value(QStringLiteral("queueDrops")).toInteger()+manager.value(QStringLiteral("queueDropped")).toInteger()+p.value(QStringLiteral("managerSubmitDrops")).toInteger();
+        m_rxDiagnostics->setText(QStringLiteral("AUD %1 blk · DEC %2 blk / %3 pkt · Q %4/%5 · DROP %6 · %7 %8 · FEC %9 %10/%11 · %12")
+            .arg(p.value(QStringLiteral("audioBlocks")).toInteger())
+            .arg(p.value(QStringLiteral("decoderBlocks")).toInteger())
+            .arg(p.value(QStringLiteral("decoderPackets")).toInteger())
+            .arg(p.value(QStringLiteral("queueDepth")).toInt()).arg(p.value(QStringLiteral("queueCapacity")).toInt())
+            .arg(queueDrops).arg(profile).arg(modemState).arg(fecMode).arg(fecOK).arg(fecBad).arg(gifState));
+        const QString tip=QStringLiteral("Input samples=%1; input discontinuities=%2; decoder resets=%3; decoder errors=%4; panics=%5; RX manager=%6/%7 dropped=%8 processed=%9; MARY buffered=%10 samples, reacquires=%11; %12; FEC error=%13; last error=%14")
+            .arg(p.value(QStringLiteral("audioSamples")).toInteger())
+            .arg(p.value(QStringLiteral("inputDiscontinuities")).toInteger())
+            .arg(p.value(QStringLiteral("decoderResets")).toInteger())
+            .arg(p.value(QStringLiteral("decoderErrors")).toInteger())
+            .arg(p.value(QStringLiteral("decoderPanics")).toInteger())
+            .arg(manager.value(QStringLiteral("queueDepth")).toInt()).arg(manager.value(QStringLiteral("queueCapacity")).toInt())
+            .arg(manager.value(QStringLiteral("queueDropped")).toInteger())
+            .arg(manager.value(QStringLiteral("processedPackets")).toInteger())
+            .arg(buffered).arg(reacquires).arg(gifDetails).arg(fecError).arg(p.value(QStringLiteral("lastError")).toString());
+        m_rxDiagnostics->setToolTip(tip);
+    } else if(name==QStringLiteral("rx:decoder-error")){
+        const auto p=payloadValue.toObject();
+        const QString error=p.value(QStringLiteral("error")).toString();
+        statusBar()->showMessage(uiText(QStringLiteral("RX 解码器发生异常，已重置并继续监听：%1")).arg(error),10000);
+        appendLog(uiText(QStringLiteral("RX decoder recovered from error: %1")).arg(error));
     } else if(name==QStringLiteral("rx:level")){
         const auto p=payloadValue.toObject();m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
     } else if(name==QStringLiteral("rx:spectrum")||name==QStringLiteral("tx:spectrum")){
@@ -2192,6 +2272,7 @@ void MainWindow::startRX() {
     if (!m_audioConnected) { showError(uiText(QStringLiteral("音频后端异常"))); return; }
     if (m_rxPreview) m_rxPreview->clearSourceImage();
     if (m_rxMeta) m_rxMeta->setText(QStringLiteral("CALL  ---   IMAGE ID  --   PACKETS  0 / 0   MODE  ---"));
+    if (m_rxDiagnostics) m_rxDiagnostics->setText(uiText(QStringLiteral("RX 解码诊断 · 等待音频")));
     m_settings.insert(QStringLiteral("rxProfile"), m_rxProfile->currentData().toString());
     QString saveError;
     m_backend->callSync(QStringLiteral("SaveSettings"), QJsonArray{m_settings}, &saveError, 15000);
