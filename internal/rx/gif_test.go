@@ -9,7 +9,9 @@ import (
 	"image/draw"
 	"image/gif"
 	"image/png"
+	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/gifmode"
@@ -357,8 +359,8 @@ func TestGIFTemplateFrameSetRoundTripsThrough16QAMAndRXManager(t *testing.T) {
 	if len(completed) != 2 || !completed[len(completed)-1].GIFEnd {
 		t.Fatalf("16QAM GIF RX returned %d completed frames (%d partial refreshes)", len(completed), partialRefreshes)
 	}
-	if partialRefreshes < 2 {
-		t.Fatalf("16QAM GIF RX published only %d partial updates; want multiple MCU refreshes", partialRefreshes)
+	if partialRefreshes < 1 {
+		t.Fatalf("16QAM GIF RX did not publish a progressive MCU preview")
 	}
 	output, callsign, frameCount, err := manager.ExportGIF(completed[len(completed)-1].SessionID)
 	if err != nil {
@@ -521,6 +523,211 @@ func absIntRX(v int) int {
 	return v
 }
 
+func TestGIFRXContinuesAfterDroppedPacketAndRepairsWhenLateFECPacketArrives(t *testing.T) {
+	const width, height = 640, 480
+	const imageID = uint8(201)
+	rng := rand.New(rand.NewSource(20261107))
+	frameImage := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			frameImage.SetRGBA(x, y, color.RGBA{R: uint8(rng.Intn(256)), G: uint8(rng.Intn(256)), B: uint8(rng.Intn(256)), A: 255})
+		}
+	}
+	packets, _, err := gifmode.EncodeContextV2(context.Background(), []gifmode.Frame{{Image: frameImage, DelayCS: 10}}, "N0CALL", imageID, 4)
+	if err != nil {
+		t.Fatalf("encode high-entropy GIF keyframe: %v", err)
+	}
+	var dataPackets []int
+	for index, raw := range packets {
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if !parsed.GIFControl {
+			dataPackets = append(dataPackets, index)
+		}
+	}
+	if len(dataPackets) < 8 {
+		t.Fatalf("fixture has only %d image data packets; want at least 8", len(dataPackets))
+	}
+	// Prefer dropping a packet inside a multi-packet MCU entropy segment. This
+	// reproduces the real failure mode more accurately than losing a whole
+	// packet that also happens to be a restart boundary.
+	var lostPacketIndex int = -1
+	var lostMCUIndex int
+	var previousBoundary *ssdv.Packet
+	for _, index := range dataPackets {
+		parsed, parseErr := ssdv.ParsePacket(packets[index])
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if parsed.MCUOffset == 0xff || parsed.MCUIndex == 0xffff {
+			continue
+		}
+		if previousBoundary != nil && int(parsed.PacketID)-int(previousBoundary.PacketID) >= 3 {
+			wantID := previousBoundary.PacketID + 1
+			for _, candidateIndex := range dataPackets {
+				candidate, candidateErr := ssdv.ParsePacket(packets[candidateIndex])
+				if candidateErr == nil && candidate.PacketID == wantID {
+					lostPacketIndex = candidateIndex
+					lostMCUIndex = int(previousBoundary.MCUIndex)
+					break
+				}
+			}
+			if lostPacketIndex >= 0 {
+				break
+			}
+		}
+		copyOfBoundary := parsed
+		previousBoundary = &copyOfBoundary
+	}
+	if lostPacketIndex < 0 {
+		lostPacketIndex = dataPackets[len(dataPackets)/2]
+		parsed, parseErr := ssdv.ParsePacket(packets[lostPacketIndex])
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		lostMCUIndex = int(parsed.MCUIndex)
+	}
+	manager := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+	var closeUpdate Update
+	for index, raw := range packets {
+		if index == lostPacketIndex {
+			continue
+		}
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		update, ok := manager.processGIFPacket(transport.ReceivedPacket{Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Callsign: "N0CALL", Raw: raw})
+		if ok && update.GIFEnd {
+			closeUpdate = update
+		}
+		_ = parsed
+	}
+	manager.mu.Lock()
+	var stream *gifStreamSession
+	for _, candidate := range manager.gifStreams {
+		stream = candidate
+	}
+	if stream == nil {
+		manager.mu.Unlock()
+		t.Fatal("GIF RX stream was not created")
+	}
+	partial := stream.recentFrames[imageID]
+	if partial == nil || !partial.committed {
+		manager.mu.Unlock()
+		t.Fatal("closed keyframe was not retained for late packet recovery")
+	}
+	partialMCUs := partial.decodedMCUs
+	partialPreview := len(partial.previewPNG) > 0
+	partialIncomplete := stream.incomplete && stream.awaitingKeyframe
+	laterMCUsDecoded := false
+	for mcu := lostMCUIndex + 1; mcu < len(partial.coveredMCUs); mcu++ {
+		if partial.coveredMCUs[mcu] {
+			laterMCUsDecoded = true
+			break
+		}
+	}
+	manager.mu.Unlock()
+	if partialMCUs == 0 || partialMCUs >= width/16*(height/16) {
+		t.Fatalf("expected partial MCU decode after one lost packet, got %d", partialMCUs)
+	}
+	if !partialPreview || !partialIncomplete {
+		t.Fatalf("partial keyframe state invalid: preview=%v incomplete=%v close=%+v", partialPreview, partialIncomplete, closeUpdate)
+	}
+	if !laterMCUsDecoded {
+		t.Fatalf("decoder stopped after lost packet near MCU %d; no later MCU region was decoded", lostMCUIndex)
+	}
+
+	// Deliver the previously missing data packet after the frame-close marker,
+	// as can happen when the packet-level erasure decoder repairs it late.
+	lateRaw := packets[lostPacketIndex]
+	lateUpdate, ok := manager.processGIFPacket(transport.ReceivedPacket{Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Callsign: "N0CALL", Raw: lateRaw})
+	if !ok {
+		t.Fatal("late recovered packet was discarded instead of repairing the closed frame")
+	}
+	if !lateUpdate.GIFPartialArchive || lateUpdate.PNGBase64 == "" {
+		t.Fatalf("late repair did not refresh preview/archive: %+v", lateUpdate)
+	}
+	manager.mu.Lock()
+	full := stream.recentFrames[imageID]
+	fullMCUs := 0
+	if full != nil {
+		fullMCUs = full.decodedMCUs
+	}
+	incomplete := stream.incomplete
+	awaiting := stream.awaitingKeyframe
+	manager.mu.Unlock()
+	if fullMCUs != width/16*(height/16) || incomplete || awaiting {
+		t.Fatalf("late packet did not restore complete keyframe: MCUs=%d incomplete=%v awaiting=%v", fullMCUs, incomplete, awaiting)
+	}
+	data, _, count, complete, exportErr := manager.ExportGIFSnapshot(lateUpdate.SessionID)
+	if exportErr != nil {
+		t.Fatalf("export repaired GIF: %v", exportErr)
+	}
+	decoded, decodeErr := gif.DecodeAll(bytes.NewReader(data))
+	if decodeErr != nil || count != 1 || len(decoded.Image) != 1 || !complete {
+		t.Fatalf("repaired GIF archive invalid: count=%d decoded=%d complete=%v err=%v", count, len(decoded.Image), complete, decodeErr)
+	}
+}
+
+func TestGIFManagerDrainsHighEntropyBurstWithoutDroppingPackets(t *testing.T) {
+	const width, height = 640, 480
+	rng := rand.New(rand.NewSource(20261108))
+	frames := make([]gifmode.Frame, 2)
+	for frameIndex := range frames {
+		frame := image.NewRGBA(image.Rect(0, 0, width, height))
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				frame.SetRGBA(x, y, color.RGBA{R: uint8(rng.Intn(256)), G: uint8(rng.Intn(256)), B: uint8(rng.Intn(256)), A: 255})
+			}
+		}
+		frames[frameIndex] = gifmode.Frame{Image: frame, DelayCS: 10}
+	}
+	packets, _, err := gifmode.EncodeContextV2(context.Background(), frames, "N0CALL", 211, 4)
+	if err != nil {
+		t.Fatalf("encode high-entropy queue stress GIF: %v", err)
+	}
+	if len(packets) <= 512 {
+		t.Fatalf("stress fixture has only %d packets; want to exceed the former 512-packet RX queue", len(packets))
+	}
+	updates := make(chan Update, len(packets)+32)
+	manager := NewManager(func(update Update) { updates <- update })
+	defer manager.Close()
+	for index, raw := range packets {
+		if !manager.Submit(transport.ReceivedPacket{Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Callsign: "N0CALL", Raw: raw}) {
+			t.Fatalf("RX manager rejected packet %d/%d; dropped=%d", index+1, len(packets), manager.DroppedPackets())
+		}
+	}
+	deadline := time.NewTimer(90 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case update := <-updates:
+			if update.Error != "" {
+				t.Fatalf("RX manager reported GIF decode error: %s", update.Error)
+			}
+			if update.GIFEnd {
+				if got := manager.DroppedPackets(); got != 0 {
+					t.Fatalf("RX manager dropped %d packets during high-entropy GIF burst", got)
+				}
+				data, _, count, complete, exportErr := manager.ExportGIFSnapshot(update.SessionID)
+				if exportErr != nil {
+					t.Fatalf("export high-entropy RX GIF: %v", exportErr)
+				}
+				decoded, decodeErr := gif.DecodeAll(bytes.NewReader(data))
+				if decodeErr != nil || count != 2 || len(decoded.Image) != 2 || !complete {
+					t.Fatalf("high-entropy GIF archive incomplete: count=%d decoded=%d complete=%v err=%v", count, len(decoded.Image), complete, decodeErr)
+				}
+				return
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out draining %d-packet GIF burst; dropped=%d", len(packets), manager.DroppedPackets())
+		}
+	}
+}
+
 func TestGIFRXResynchronizesAfterIncompleteKeyframeAndContinuesDeltaFrames(t *testing.T) {
 	const width, height = 320, 240
 	const baseImageID = uint8(70)
@@ -655,6 +862,110 @@ func TestGIFRXKeepsDecodingWhenOneKeyframeDataPacketIsLost(t *testing.T) {
 	}
 	if !deltaPreview || final.SessionID == "" || !final.GIFFrameComplete || !final.GIFStreamIncomplete || !final.GIFAwaitingKeyframe {
 		t.Fatalf("RX did not continue while preserving keyframe resync state after packet loss: deltaPreview=%v final=%+v", deltaPreview, final)
+	}
+}
+
+func TestGIFRXKeepsDecodingDeltaFramesAfterMidStreamKeyframeLoss(t *testing.T) {
+	const width, height = 320, 240
+	const baseImageID = uint8(32)
+	frames := make([]gifmode.Frame, 25)
+	sprite := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			sprite.SetRGBA(x, y, color.RGBA{R: uint8((x*7 + y*3 + 11) % 255), G: uint8((x*5 + y*13 + 29) % 255), B: uint8((x*17 + y*2 + 47) % 255), A: 255})
+		}
+	}
+	for index := range frames {
+		frame := image.NewRGBA(image.Rect(0, 0, width, height))
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				frame.SetRGBA(x, y, color.RGBA{R: 18, G: 32, B: 48, A: 255})
+			}
+		}
+		x := 16 + (index%12)*16
+		draw.Draw(frame, image.Rect(x, 64, x+64, 128), sprite, sprite.Bounds().Min, draw.Src)
+		// A small changing tile creates actual residual data even when the main
+		// sprite motion is predicted perfectly by SGV2.
+		tile := image.NewRGBA(image.Rect(0, 0, 32, 32))
+		for ty := 0; ty < 32; ty++ {
+			for tx := 0; tx < 32; tx++ {
+				tile.SetRGBA(tx, ty, color.RGBA{R: uint8(index*23 + tx*5), G: uint8(index*11 + ty*7), B: uint8(index*17 + tx*ty), A: 255})
+			}
+		}
+		draw.Draw(frame, image.Rect(256, 176, 288, 208), tile, tile.Bounds().Min, draw.Src)
+		frames[index] = gifmode.Frame{Image: frame, DelayCS: 8}
+	}
+	packets, stats, err := gifmode.EncodeContextV2(context.Background(), frames, "N0CALL", baseImageID, 4)
+	if err != nil {
+		t.Fatalf("encode 25-frame recovery GIF: %v", err)
+	}
+	if stats.Keyframes < 3 {
+		t.Fatalf("fixture needs keyframes at frames 0, 12 and 24; stats=%+v", stats)
+	}
+	// Lose one ordinary delta packet and one packet from the following
+	// periodic keyframe. RX must keep advancing through both damaged regions.
+	lostPacketIDs := make(map[uint8]uint16)
+	for _, lostFrame := range []uint8{baseImageID + 5, baseImageID + 12} {
+		var candidates []uint16
+		for _, raw := range packets {
+			parsed, parseErr := ssdv.ParsePacket(raw)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if parsed.ImageID == lostFrame && !parsed.GIFControl {
+				candidates = append(candidates, parsed.PacketID)
+			}
+		}
+		if len(candidates) == 0 {
+			t.Fatalf("frame %d has no data packets; cannot create a realistic loss", lostFrame)
+		}
+		lostPacketIDs[lostFrame] = candidates[len(candidates)/2]
+	}
+	manager := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+	deltaAfterDeltaLoss := 0
+	deltaAfterKeyframeLoss := 0
+	var final Update
+	for _, raw := range packets {
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if lostPacketID, losingFrame := lostPacketIDs[parsed.ImageID]; losingFrame && parsed.PacketID == lostPacketID && !parsed.GIFControl {
+			continue
+		}
+		update, ok := manager.processGIFPacket(transport.ReceivedPacket{Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Callsign: "N0CALL", Raw: raw})
+		if !ok {
+			continue
+		}
+		if parsed.GIFFrameEnd && update.GIFFrameComplete {
+			if parsed.ImageID > baseImageID+5 && parsed.ImageID < baseImageID+12 {
+				if update.GIFAwaitingKeyframe {
+					t.Fatalf("delta frame %d incorrectly entered keyframe wait after only a delta packet loss", parsed.ImageID)
+				}
+				deltaAfterDeltaLoss++
+			}
+			if parsed.ImageID > baseImageID+12 && parsed.ImageID < baseImageID+24 {
+				if !update.GIFAwaitingKeyframe {
+					t.Fatalf("delta frame %d cleared keyframe wait before a complete recovery keyframe", parsed.ImageID)
+				}
+				deltaAfterKeyframeLoss++
+			}
+		}
+		if update.GIFEnd {
+			final = update
+		}
+	}
+	if deltaAfterDeltaLoss < 6 {
+		t.Fatalf("RX stopped after a lost delta packet: completed %d later delta frames, want at least 6", deltaAfterDeltaLoss)
+	}
+	if deltaAfterKeyframeLoss < 11 {
+		t.Fatalf("RX stopped after a lost periodic keyframe packet: completed %d later delta frames, want at least 11", deltaAfterKeyframeLoss)
+	}
+	if final.ImageID != baseImageID+24 || !final.GIFFrameComplete || final.GIFAwaitingKeyframe {
+		t.Fatalf("next periodic keyframe did not restore synchronization: %+v", final)
+	}
+	if !final.GIFStreamIncomplete {
+		t.Fatal("album must remain partial because frames 5 and 12 lost packets")
 	}
 }
 

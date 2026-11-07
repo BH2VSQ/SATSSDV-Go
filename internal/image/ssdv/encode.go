@@ -13,6 +13,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 )
@@ -61,6 +62,41 @@ type EncodeConfig struct {
 // first complete MCU in each payload, resets destination DC predictors at
 // those boundaries, and writes the standard MCU offset/index fields. This
 // makes each packet independently useful to progressive and loss-tolerant RX.
+// sparsePreviewTemplate caches the immutable 16x16 JPEG scaffold used when
+// reconstructing SSDV MCU strips. GIF RX may decode hundreds or thousands of
+// short sparse segments per animation; rebuilding and reparsing this template
+// for every segment needlessly burns CPU and can let the RX packet queue lag.
+type sparsePreviewTemplateCache struct {
+	once      sync.Once
+	data      []byte
+	frame     *jpegFrame
+	headerEnd int
+	err       error
+}
+
+var sharedSparsePreviewTemplate sparsePreviewTemplateCache
+
+func getSparsePreviewTemplate() ([]byte, *jpegFrame, int, error) {
+	sharedSparsePreviewTemplate.once.Do(func() {
+		var template bytes.Buffer
+		if err := jpeg.Encode(&template, image.NewRGBA(image.Rect(0, 0, 16, 16)), &jpeg.Options{Quality: 100}); err != nil {
+			sharedSparsePreviewTemplate.err = fmt.Errorf("create SSDV block JPEG template: %w", err)
+			return
+		}
+		sharedSparsePreviewTemplate.data = append([]byte(nil), template.Bytes()...)
+		sharedSparsePreviewTemplate.frame, sharedSparsePreviewTemplate.err = parseBaselineJPEG(sharedSparsePreviewTemplate.data)
+		if sharedSparsePreviewTemplate.err != nil {
+			sharedSparsePreviewTemplate.err = fmt.Errorf("parse SSDV block JPEG template: %w", sharedSparsePreviewTemplate.err)
+			return
+		}
+		sharedSparsePreviewTemplate.headerEnd, sharedSparsePreviewTemplate.err = jpegHeaderEnd(sharedSparsePreviewTemplate.data)
+		if sharedSparsePreviewTemplate.err != nil {
+			sharedSparsePreviewTemplate.err = fmt.Errorf("read SSDV block JPEG template header: %w", sharedSparsePreviewTemplate.err)
+		}
+	})
+	return sharedSparsePreviewTemplate.data, sharedSparsePreviewTemplate.frame, sharedSparsePreviewTemplate.headerEnd, sharedSparsePreviewTemplate.err
+}
+
 func EncodeImage(src image.Image, cfg EncodeConfig) ([][]byte, error) {
 	if src == nil {
 		return nil, errors.New("SSDV source image is nil")
@@ -963,16 +999,7 @@ func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMis
 	totalMCUs := widthMCUs * (first.Height / 16)
 	covered := make([]bool, totalMCUs)
 
-	var template bytes.Buffer
-	if err := jpeg.Encode(&template, image.NewRGBA(image.Rect(0, 0, 16, 16)), &jpeg.Options{Quality: 100}); err != nil {
-		return nil, Packet{}, 0, fmt.Errorf("create SSDV block JPEG template: %w", err)
-	}
-	templateBytes := template.Bytes()
-	templateFrame, err := parseBaselineJPEG(templateBytes)
-	if err != nil {
-		return nil, Packet{}, 0, fmt.Errorf("parse SSDV block JPEG template: %w", err)
-	}
-	headerEnd, err := jpegHeaderEnd(templateBytes)
+	templateBytes, templateFrame, headerEnd, err := getSparsePreviewTemplate()
 	if err != nil {
 		return nil, Packet{}, 0, err
 	}

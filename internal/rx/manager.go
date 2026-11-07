@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	queueCapacity         = 512
+	queueCapacity         = 8192
 	pcsiPreviewInterval   = 16
 	pcsiPreviewIterations = 16
 	pcsiFinalIterations   = 96

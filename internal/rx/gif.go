@@ -19,31 +19,51 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/transport"
 )
 
+type gifSegmentKey struct {
+	startPacket uint16
+	endPacket   uint16
+}
+
 type gifFrameBuffer struct {
-	imageID         uint8
-	packets         map[uint16][256]byte
-	keyframe        bool
-	width           int
-	height          int
-	quality         uint8
-	fec             bool
-	delayCS         uint16
-	frameIndex      uint16
-	expectedPackets int
-	controlExpected int
-	startSeen       bool
-	endSeen         bool
-	receivedPackets int // unique frame-open, data and frame-close packets
-	startedAt       time.Time
-	baseCanvas      *image.RGBA // SGV2 motion-compensated base for this frame
-	previewPNG      []byte      // latest independently decodable partial frame snapshot
-	decodedMCUs     int
+	imageID            uint8
+	packets            map[uint16][256]byte
+	keyframe           bool
+	width              int
+	height             int
+	quality            uint8
+	fec                bool
+	delayCS            uint16
+	frameIndex         uint16
+	expectedPackets    int
+	controlExpected    int
+	startSeen          bool
+	endSeen            bool
+	receivedPackets    int // unique frame-open, data and frame-close packets
+	startedAt          time.Time
+	completedAt        time.Time
+	baseCanvas         *image.RGBA // SGV2 motion-compensated base for this frame
+	previewCanvas      *image.RGBA // mutated only by the RX manager worker
+	previewPNG         []byte      // latest independently decodable partial frame snapshot
+	decodedMCUs        int         // cumulative unique MCU coverage, not per-update coverage
+	decodedSegments    map[gifSegmentKey]struct{}
+	boundaryPacketIDs  []uint16
+	eoiPacketID        uint16
+	hasEOI             bool
+	coveredMCUs        []bool
+	lastPreviewAt      time.Time
+	lastPreviewPackets int
+	snapshotIndex      int // index in stream.frames; -1 until first archive snapshot
+	committed          bool
 }
 
 const (
-	maxGIFStreams       = 4
-	maxGIFExportFrames  = 120
-	maxGIFExportPNGSize = 32 << 20
+	maxGIFStreams             = 4
+	maxGIFExportFrames        = 120
+	maxGIFExportPNGSize       = 32 << 20
+	maxGIFRecentFrames        = 3
+	gifLatePacketWindow       = 12 * time.Second
+	gifPreviewPacketStride    = 8
+	gifPreviewPublishInterval = 250 * time.Millisecond
 )
 
 type gifStreamSession struct {
@@ -75,6 +95,8 @@ type gifStreamSession struct {
 	framesSeen         uint16
 	latestFrameID      uint8
 	hasLatestFrame     bool
+	recentFrames       map[uint8]*gifFrameBuffer // bounded late-FEC repair window
+	incompleteFrames   map[uint8]bool
 }
 
 func gifStreamKey(packet transport.ReceivedPacket) string {
@@ -115,6 +137,7 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 			profile: packet.Profile, callsign: packet.Callsign,
 			ssid: packet.AX25SourceSSID, hasSSID: packet.HasAX25SSID,
 			sessionID: fmt.Sprintf("%d", now.UnixNano()), lastUpdate: now,
+			recentFrames: make(map[uint8]*gifFrameBuffer), incompleteFrames: make(map[uint8]bool),
 		}
 		if len(m.gifStreams) >= maxGIFStreams {
 			oldestKey := ""
@@ -130,6 +153,13 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 		}
 		m.gifStreams[key] = stream
 	}
+	if stream.recentFrames == nil {
+		stream.recentFrames = make(map[uint8]*gifFrameBuffer)
+	}
+	if stream.incompleteFrames == nil {
+		stream.incompleteFrames = make(map[uint8]bool)
+	}
+	pruneRecentGIFFramesLocked(stream, now)
 
 	// GIFStart is repeated on the first frame-open marker. A completed or
 	// expired stream starts a new album session; duplicate physical copies of
@@ -155,6 +185,8 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 			stream.lastPartialArchive = time.Time{}
 			stream.framesSeen = 0
 			stream.hasLatestFrame = false
+			stream.recentFrames = make(map[uint8]*gifFrameBuffer)
+			stream.incompleteFrames = make(map[uint8]bool)
 			stream.startControlID = parsed.ImageID
 			stream.hasStartControl = true
 		} else if stream.pending != nil && stream.pending.imageID == parsed.ImageID && stream.pending.startSeen {
@@ -210,28 +242,31 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 	}
 
 	if !parsed.GIFControl {
-		if stream.pending == nil && stream.hasFrame && parsed.ImageID == stream.lastFrameID {
-			stream.lastUpdate = now
-			m.mu.Unlock()
-			return Update{}, false // late duplicate payload after a committed/abandoned frame
-		}
-		if stream.pending != nil && stream.pending.imageID != parsed.ImageID {
-			if !isNewerGIFFrame(parsed.ImageID, stream.pending.imageID) {
-				stream.lastUpdate = now
-				m.mu.Unlock()
-				return Update{}, false // late packet from an older frame must not replace the active one
+		var frame *gifFrameBuffer
+		lateFrame := false
+		if recent := stream.recentFrames[parsed.ImageID]; recent != nil && recent.committed && now.Sub(recent.completedAt) <= gifLatePacketWindow {
+			frame = recent
+			lateFrame = true
+		} else {
+			if stream.pending != nil && stream.pending.imageID != parsed.ImageID {
+				if !isNewerGIFFrame(parsed.ImageID, stream.pending.imageID) {
+					stream.lastUpdate = now
+					m.mu.Unlock()
+					return Update{}, false // late packet from an older frame outside the repair window
+				}
+				abandonGIFFrameLocked(stream, stream.pending)
 			}
-			abandonGIFFrameLocked(stream, stream.pending)
-		}
-		if stream.pending == nil {
-			if stream.hasLatestFrame && parsed.ImageID != stream.latestFrameID && !isNewerGIFFrame(parsed.ImageID, stream.latestFrameID) {
-				stream.lastUpdate = now
-				m.mu.Unlock()
-				return Update{}, false
+			if stream.pending == nil {
+				if stream.hasLatestFrame && parsed.ImageID != stream.latestFrameID && !isNewerGIFFrame(parsed.ImageID, stream.latestFrameID) {
+					stream.lastUpdate = now
+					m.mu.Unlock()
+					return Update{}, false
+				}
+				stream.pending = beginGIFFrameLocked(stream, parsed, now)
 			}
-			stream.pending = beginGIFFrameLocked(stream, parsed, now)
+			frame = stream.pending
 		}
-		frame := stream.pending
+
 		var raw [256]byte
 		copy(raw[:], parsed.Raw[:])
 		if previous, exists := frame.packets[parsed.PacketID]; exists {
@@ -250,59 +285,89 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 		frame.quality, frame.fec = parsed.Quality, parsed.FEC
 		stream.packetsReceived++
 		stream.lastUpdate = now
-		rawPackets := orderedGIFPackets(frame.packets)
-		canvas := cloneRGBA(frame.baseCanvas)
-		if canvas == nil {
-			canvas = cloneRGBA(stream.canvas)
-		}
-		if canvas == nil && !frame.keyframe {
-			canvas = newGIFPlaceholder(frame.width, frame.height)
-		}
-		frameCopy := *frame
-		frameCopy.packets = nil
-		update := gifProgressUpdate(stream, frame, packet, false, nil, 0)
-		update.GIFAwaitingKeyframe = stream.awaitingKeyframe
-		m.mu.Unlock()
 
-		preview, metadata, decodedMCUs, previewErr := decodeGIFFramePreview(canvas, &frameCopy, rawPackets)
-		if previewErr == nil && preview != nil {
-			pngBytes, encodeErr := encodeGIFPreviewPNG(preview)
-			if encodeErr == nil {
-				m.mu.Lock()
-				if current := m.gifStreams[key]; current == stream && current.pending == frame {
-					frame.previewPNG = append(frame.previewPNG[:0], pngBytes...)
-					frame.decodedMCUs = decodedMCUs
-					current.canvas = cloneRGBA(preview)
-					current.lastUpdate = time.Now()
-					current.archiveDirty = true
-					if frame.keyframe {
-						keyframeComplete := frame.expectedPackets > 0 && len(frame.packets) >= frame.expectedPackets &&
-							metadata.MCUCount > 0 && decodedMCUs >= int(metadata.MCUCount)
-						current.awaitingKeyframe = !keyframeComplete
-					}
-				}
-				update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBytes)
-				update.ImageWidth, update.ImageHeight = preview.Bounds().Dx(), preview.Bounds().Dy()
-				if metadata.Width > 0 {
-					update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
-				}
-				update.Coverage = gifFrameCoverage(decodedMCUs, metadata.MCUCount)
-				m.mu.Unlock()
-			}
+		decodedNow, decodeErr := decodeGIFSegmentsNearPacket(frame, parsed)
+		if decodeErr != nil {
+			stream.incompleteFrames[frame.imageID] = true
+			stream.incomplete = true
 		}
-		// A missing keyframe does not poison the stream. Delta frames are decoded
-		// over a neutral placeholder until a later periodic keyframe can restore
-		// the complete reference canvas.
-		m.mu.Lock()
+		if decodedNow > 0 && !lateFrame && stream.pending == frame && frame.previewCanvas != nil {
+			stream.canvas = cloneRGBA(frame.previewCanvas)
+		}
+
+		if frame.committed {
+			frameDataComplete := frame.expectedPackets == 0 || len(frame.packets) >= frame.expectedPackets
+			framePixelsComplete := !frame.keyframe || frame.decodedMCUs >= (frame.width/16)*(frame.height/16)
+			if frameDataComplete && framePixelsComplete {
+				delete(stream.incompleteFrames, frame.imageID)
+			} else {
+				stream.incompleteFrames[frame.imageID] = true
+			}
+			if frame.keyframe {
+				stream.awaitingKeyframe = !(frameDataComplete && framePixelsComplete)
+			}
+			stream.incomplete = len(stream.incompleteFrames) > 0
+		}
+
+		shouldPublish := decodedNow > 0 && shouldPublishGIFPreview(frame, now, lateFrame)
+		update := gifProgressUpdate(stream, frame, packet, frame.committed, frame.previewCanvas, frame.decodedMCUs)
 		update.GIFAwaitingKeyframe = stream.awaitingKeyframe
 		update.GIFStreamIncomplete = stream.incomplete
+		update.GIFFrameComplete = frame.committed
+		update.GIFPartialArchive = lateFrame && frame.committed
+		update.GIFEnd = stream.complete
+		update.Complete = stream.complete && !stream.incomplete
+		if !shouldPublish {
+			// Keep lightweight progress callbacks sparse. The audio RX worker can
+			// now drain bursts without PNG encoding and Base64 allocation per packet.
+			if !lateFrame && !parsed.EOI && frame.receivedPackets%4 != 0 {
+				m.mu.Unlock()
+				return Update{}, false
+			}
+			m.mu.Unlock()
+			return update, true
+		}
+		preview := cloneRGBA(frame.previewCanvas)
+		frame.lastPreviewPackets = frame.receivedPackets
+		frame.lastPreviewAt = now
+		m.mu.Unlock()
+
+		pngBytes, encodeErr := encodeGIFPreviewPNG(preview)
+		if encodeErr != nil {
+			update.Error = fmt.Errorf("encode GIF frame preview: %w", encodeErr).Error()
+			return update, true
+		}
+		m.mu.Lock()
+		if current := m.gifStreams[key]; current == stream {
+			frame.previewPNG = append(frame.previewPNG[:0], pngBytes...)
+			if frame.committed {
+				storeGIFFrameSnapshotLocked(stream, frame)
+			} else {
+				stream.archiveDirty = true
+			}
+			if !lateFrame && stream.pending == frame {
+				stream.canvas = cloneRGBA(preview)
+			} else if lateFrame && stream.latestFrameID == frame.imageID && stream.pending == nil {
+				stream.canvas = cloneRGBA(preview)
+			}
+			stream.lastUpdate = time.Now()
+		}
+		update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBytes)
+		update.ImageWidth, update.ImageHeight = preview.Bounds().Dx(), preview.Bounds().Dy()
+		update.Coverage = gifFrameCoverage(frame.decodedMCUs, parsed.MCUCount)
+		update.GIFFrameComplete = frame.committed
+		update.GIFAwaitingKeyframe = stream.awaitingKeyframe
+		update.GIFStreamIncomplete = stream.incomplete
+		update.GIFPartialArchive = lateFrame && frame.committed
+		update.GIFEnd = stream.complete
+		update.Complete = stream.complete && !stream.incomplete
 		m.mu.Unlock()
 		return update, true
 	}
 
-	// Frame-close marker. A close for an older frame is ignored; a newer close
-	// without its open marker is still accepted as a legacy/partially received
-	// frame so that later keyframes can re-synchronize the stream.
+	// Frame-close marker. The close packet finalizes only the current frame;
+	// a missing data packet is recorded as an incomplete frame and must never
+	// stop later frame IDs from entering the RX pipeline.
 	if stream.pending != nil && stream.pending.imageID != parsed.ImageID {
 		if !isNewerGIFFrame(parsed.ImageID, stream.pending.imageID) {
 			stream.lastUpdate = now
@@ -312,10 +377,10 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 		abandonGIFFrameLocked(stream, stream.pending)
 	}
 	if stream.pending == nil {
-		if stream.hasLastEnd && stream.lastEndImageID == parsed.ImageID {
+		if recent := stream.recentFrames[parsed.ImageID]; recent != nil && recent.committed {
 			stream.lastUpdate = now
 			m.mu.Unlock()
-			return Update{}, false
+			return Update{}, false // duplicate close marker for a frame kept only for late FEC repair
 		}
 		if stream.hasLatestFrame && parsed.ImageID != stream.latestFrameID && !isNewerGIFFrame(parsed.ImageID, stream.latestFrameID) {
 			stream.lastUpdate = now
@@ -343,54 +408,20 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 	}
 	frame.receivedPackets++
 	stream.packetsReceived++
-	rawPackets := orderedGIFPackets(frame.packets)
-	canvas := cloneRGBA(frame.baseCanvas)
-	if canvas == nil {
-		canvas = cloneRGBA(stream.canvas)
-	}
-	if canvas == nil && !frame.keyframe {
-		canvas = newGIFPlaceholder(frame.width, frame.height)
-	}
-	frameDataPacketCount := len(frame.packets)
-	frameCopy := *frame
-	frameCopy.packets = nil
-	stream.pending = nil
-	stream.lastUpdate = now
-	m.mu.Unlock()
 
-	var preview *image.RGBA
-	var metadata ssdv.Packet
-	decodedMCUs := 0
-	if len(rawPackets) > 0 {
-		preview, metadata, decodedMCUs, err = decodeGIFFramePreview(canvas, &frameCopy, rawPackets)
-	} else if canvas != nil && !frameCopy.keyframe {
-		preview = canvas
-		metadata = ssdv.Packet{Width: canvas.Bounds().Dx(), Height: canvas.Bounds().Dy(), MCUCount: uint32((canvas.Bounds().Dx() / 16) * (canvas.Bounds().Dy() / 16))}
-	} else {
-		err = fmt.Errorf("GIF keyframe arrived without image packets")
-	}
-	if err != nil || preview == nil {
-		if err == nil {
-			err = fmt.Errorf("GIF frame has no decodable canvas")
+	if err := ensureGIFFramePreviewCanvas(frame); err != nil {
+		stream.pending = nil
+		stream.incompleteFrames[frame.imageID] = true
+		stream.incomplete = true
+		stream.lastFrameID, stream.hasFrame = frame.imageID, true
+		stream.lastEndImageID, stream.hasLastEnd = frame.imageID, true
+		rememberRecentGIFFrameLocked(stream, frame, now)
+		if frame.keyframe {
+			stream.awaitingKeyframe = true
 		}
-		m.mu.Lock()
-		if current := m.gifStreams[key]; current == stream {
-			abandonGIFFrameLocked(stream, &frameCopy)
-			stream.lastFrameID, stream.hasFrame = parsed.ImageID, true
-			stream.lastEndImageID, stream.hasLastEnd = parsed.ImageID, true
-			// A failed keyframe invalidates the reference image even when an older
-			// canvas exists. Keep accepting later delta frames over that best-known
-			// canvas/placeholder until a complete periodic keyframe arrives.
-			if frameCopy.keyframe {
-				stream.awaitingKeyframe = true
-			}
-			stream.incomplete = true
-			stream.complete = parsed.GIFEnd
-			stream.lastUpdate = time.Now()
-		}
-		update := gifProgressUpdate(stream, &frameCopy, packet, false, nil, 0)
-		update.Complete = false
-		update.GIFFrameComplete = false
+		stream.complete = parsed.GIFEnd
+		stream.lastUpdate = now
+		update := gifProgressUpdate(stream, frame, packet, false, nil, 0)
 		update.GIFFrameAbandoned = true
 		update.GIFEnd = parsed.GIFEnd
 		update.GIFAwaitingKeyframe = stream.awaitingKeyframe
@@ -399,46 +430,76 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 		m.mu.Unlock()
 		return update, true
 	}
-	pngBytes, err := encodeGIFPreviewPNG(preview)
-	if err != nil {
+	if _, err := decodeAllReadyGIFSegments(frame); err != nil {
+		stream.incompleteFrames[frame.imageID] = true
+		stream.incomplete = true
+	}
+
+	frameDataPacketCount := len(frame.packets)
+	packetsComplete := frame.expectedPackets == 0 || frameDataPacketCount >= frame.expectedPackets
+	keyframeCoverageComplete := !frame.keyframe || frame.decodedMCUs >= int(parsed.MCUCount)
+	frameComplete := packetsComplete && keyframeCoverageComplete
+	if frameComplete {
+		delete(stream.incompleteFrames, frame.imageID)
+	} else {
+		stream.incompleteFrames[frame.imageID] = true
+	}
+	stream.incomplete = len(stream.incompleteFrames) > 0
+	if frame.keyframe {
+		stream.awaitingKeyframe = !frameComplete
+	}
+
+	hasDecodableCanvas := frame.decodedMCUs > 0 || (!frame.keyframe && frame.baseCanvas != nil)
+	if !hasDecodableCanvas {
+		stream.pending = nil
+		stream.lastFrameID, stream.hasFrame = frame.imageID, true
+		stream.lastEndImageID, stream.hasLastEnd = frame.imageID, true
+		stream.complete = parsed.GIFEnd
+		stream.lastUpdate = now
+		rememberRecentGIFFrameLocked(stream, frame, now)
+		if frame.keyframe {
+			stream.awaitingKeyframe = true
+		}
+		update := gifProgressUpdate(stream, frame, packet, false, nil, frame.decodedMCUs)
+		update.GIFFrameAbandoned = true
+		update.GIFEnd = parsed.GIFEnd
+		update.GIFAwaitingKeyframe = stream.awaitingKeyframe
+		update.GIFStreamIncomplete = true
+		update.Complete = false
+		m.mu.Unlock()
+		return update, true
+	}
+
+	preview := cloneRGBA(frame.previewCanvas)
+	stream.pending = nil
+	stream.canvas = cloneRGBA(preview)
+	stream.lastFrameID, stream.hasFrame = frame.imageID, true
+	stream.lastEndImageID, stream.hasLastEnd = frame.imageID, true
+	stream.complete = parsed.GIFEnd
+	stream.lastUpdate = now
+	rememberRecentGIFFrameLocked(stream, frame, now)
+	m.mu.Unlock()
+
+	pngBytes, encodeErr := encodeGIFPreviewPNG(preview)
+	if encodeErr != nil {
 		return Update{Profile: packet.Profile, Codec: "SSDV-GIF", Callsign: packet.Callsign, ImageID: packet.ImageID,
-			Error: fmt.Errorf("encode GIF frame preview: %w", err).Error(), GIFMode: true}, true
+			Error: fmt.Errorf("encode GIF frame preview: %w", encodeErr).Error(), GIFMode: true}, true
 	}
 
 	m.mu.Lock()
 	if current := m.gifStreams[key]; current == stream {
-		stream.canvas = cloneRGBA(preview)
-		stream.lastFrameID, stream.hasFrame, stream.lastUpdate = parsed.ImageID, true, time.Now()
-		stream.lastEndImageID, stream.hasLastEnd = parsed.ImageID, true
-		// A frame-close can arrive even when one or more data packets were lost.
-		// Keep its partially decoded canvas and continue the stream, but remember
-		// that the final album item cannot be reported as a complete animation.
-		framePacketsComplete := frameCopy.expectedPackets == 0 || frameDataPacketCount >= frameCopy.expectedPackets
-		keyframeCoverageComplete := !frameCopy.keyframe || metadata.MCUCount == 0 || decodedMCUs >= int(metadata.MCUCount)
-		if !framePacketsComplete || !keyframeCoverageComplete {
-			stream.incomplete = true
-		}
-		if !appendGIFFrameSnapshotLocked(stream, pngBytes, frameCopy.delayCS) {
-			// exportErr is surfaced by ExportGIFSnapshot; keep decoding even when
-			// the album export budget has been reached.
-		}
-		if frameCopy.keyframe {
-			// Do not treat a decodable preview as a valid reference keyframe
-			// unless all advertised packets and the expected MCU coverage arrived.
-			stream.awaitingKeyframe = !(framePacketsComplete && keyframeCoverageComplete)
-		}
-		if parsed.GIFEnd {
-			stream.complete = true
-		}
+		frame.previewPNG = append(frame.previewPNG[:0], pngBytes...)
+		frame.lastPreviewAt = time.Now()
+		frame.lastPreviewPackets = frame.receivedPackets
+		storeGIFFrameSnapshotLocked(stream, frame)
+		stream.archiveDirty = true
+		stream.lastUpdate = time.Now()
 	}
-	update := gifProgressUpdate(stream, &frameCopy, packet, true, preview, decodedMCUs)
+	update := gifProgressUpdate(stream, frame, packet, true, preview, frame.decodedMCUs)
 	update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBytes)
 	update.ImageWidth, update.ImageHeight = preview.Bounds().Dx(), preview.Bounds().Dy()
-	if metadata.Width > 0 {
-		update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
-	}
-	update.Coverage = gifFrameCoverage(decodedMCUs, metadata.MCUCount)
-	update.GIFFrameComplete = true
+	update.Coverage = gifFrameCoverage(frame.decodedMCUs, parsed.MCUCount)
+	update.GIFFrameComplete = true // frame boundary arrived; completeness is reported separately
 	update.Complete = parsed.GIFEnd && !stream.incomplete
 	update.GIFEnd = parsed.GIFEnd
 	update.GIFAwaitingKeyframe = stream.awaitingKeyframe
@@ -479,6 +540,11 @@ func beginGIFFrameLocked(stream *gifStreamSession, packet ssdv.Packet, now time.
 			stream.awaitingKeyframe = true
 		}
 	}
+	if frame.baseCanvas != nil {
+		frame.previewCanvas = cloneRGBA(frame.baseCanvas)
+	} else {
+		frame.previewCanvas = newGIFPlaceholder(frame.width, frame.height)
+	}
 	stream.latestFrameID, stream.hasLatestFrame = packet.ImageID, true
 	return frame
 }
@@ -510,9 +576,16 @@ func abandonGIFFrameLocked(stream *gifStreamSession, frame *gifFrameBuffer) {
 	if stream == nil || frame == nil {
 		return
 	}
+	if stream.incompleteFrames == nil {
+		stream.incompleteFrames = make(map[uint8]bool)
+	}
+	stream.incompleteFrames[frame.imageID] = true
 	stream.incomplete = true
 	if len(frame.previewPNG) > 0 {
-		appendGIFFrameSnapshotLocked(stream, frame.previewPNG, frame.delayCS)
+		storeGIFFrameSnapshotLocked(stream, frame)
+	}
+	if frame.previewCanvas != nil {
+		stream.canvas = cloneRGBA(frame.previewCanvas)
 	}
 	stream.lastFrameID, stream.hasFrame = frame.imageID, true
 	stream.lastEndImageID, stream.hasLastEnd = frame.imageID, true
@@ -520,6 +593,7 @@ func abandonGIFFrameLocked(stream *gifStreamSession, frame *gifFrameBuffer) {
 	if frame.keyframe || stream.canvas == nil {
 		stream.awaitingKeyframe = true
 	}
+	rememberRecentGIFFrameLocked(stream, frame, time.Now())
 	stream.lastUpdate = time.Now()
 }
 
@@ -528,6 +602,7 @@ func newGIFFrameBuffer(packet ssdv.Packet, now time.Time) *gifFrameBuffer {
 		imageID: packet.ImageID, packets: make(map[uint16][256]byte),
 		keyframe: packet.GIFKeyframe, width: packet.Width, height: packet.Height,
 		quality: packet.Quality, fec: packet.FEC, delayCS: packet.GIFDelayCS, startedAt: now,
+		decodedSegments: make(map[gifSegmentKey]struct{}), snapshotIndex: -1,
 	}
 }
 
@@ -543,6 +618,282 @@ func orderedGIFPackets(packets map[uint16][256]byte) [][]byte {
 		out = append(out, append([]byte(nil), raw[:]...))
 	}
 	return out
+}
+
+func pruneRecentGIFFramesLocked(stream *gifStreamSession, now time.Time) {
+	if stream == nil || stream.recentFrames == nil {
+		return
+	}
+	for imageID, frame := range stream.recentFrames {
+		if frame == nil || frame.completedAt.IsZero() || now.Sub(frame.completedAt) > gifLatePacketWindow {
+			delete(stream.recentFrames, imageID)
+		}
+	}
+	for len(stream.recentFrames) > maxGIFRecentFrames {
+		var oldestID uint8
+		var oldest time.Time
+		first := true
+		for imageID, frame := range stream.recentFrames {
+			if frame == nil {
+				oldestID, first = imageID, false
+				break
+			}
+			if first || frame.completedAt.Before(oldest) {
+				oldestID, oldest, first = imageID, frame.completedAt, false
+			}
+		}
+		delete(stream.recentFrames, oldestID)
+	}
+}
+
+func rememberRecentGIFFrameLocked(stream *gifStreamSession, frame *gifFrameBuffer, now time.Time) {
+	if stream == nil || frame == nil {
+		return
+	}
+	if stream.recentFrames == nil {
+		stream.recentFrames = make(map[uint8]*gifFrameBuffer)
+	}
+	frame.committed = true
+	frame.completedAt = now
+	stream.recentFrames[frame.imageID] = frame
+	pruneRecentGIFFramesLocked(stream, now)
+}
+
+func ensureGIFFramePreviewCanvas(frame *gifFrameBuffer) error {
+	if frame == nil {
+		return fmt.Errorf("GIF frame is nil")
+	}
+	if frame.previewCanvas != nil {
+		return nil
+	}
+	if frame.baseCanvas != nil {
+		frame.previewCanvas = cloneRGBA(frame.baseCanvas)
+	} else {
+		frame.previewCanvas = newGIFPlaceholder(frame.width, frame.height)
+	}
+	if frame.previewCanvas == nil {
+		return fmt.Errorf("GIF frame has invalid preview dimensions")
+	}
+	if frame.decodedSegments == nil {
+		frame.decodedSegments = make(map[gifSegmentKey]struct{})
+	}
+	return nil
+}
+
+func insertGIFBoundary(frame *gifFrameBuffer, packet ssdv.Packet) {
+	if frame == nil || packet.MCUOffset == 0xff || packet.MCUIndex == 0xffff {
+		return
+	}
+	index := sort.Search(len(frame.boundaryPacketIDs), func(i int) bool {
+		return frame.boundaryPacketIDs[i] >= packet.PacketID
+	})
+	if index < len(frame.boundaryPacketIDs) && frame.boundaryPacketIDs[index] == packet.PacketID {
+		return
+	}
+	frame.boundaryPacketIDs = append(frame.boundaryPacketIDs, 0)
+	copy(frame.boundaryPacketIDs[index+1:], frame.boundaryPacketIDs[index:])
+	frame.boundaryPacketIDs[index] = packet.PacketID
+}
+
+func tryDecodeGIFSegment(frame *gifFrameBuffer, startID, endID uint16) (int, error) {
+	if frame == nil || endID < startID {
+		return 0, nil
+	}
+	key := gifSegmentKey{startPacket: startID, endPacket: endID}
+	if _, done := frame.decodedSegments[key]; done {
+		return 0, nil
+	}
+	if err := ensureGIFFramePreviewCanvas(frame); err != nil {
+		return 0, err
+	}
+	count := int(endID) - int(startID) + 1
+	if count <= 0 || count > len(frame.packets) {
+		return 0, nil
+	}
+	rawPackets := make([][]byte, 0, count)
+	for id := int(startID); id <= int(endID); id++ {
+		raw, ok := frame.packets[uint16(id)]
+		if !ok {
+			return 0, nil // a packet gap blocks only this MCU segment
+		}
+		rawPackets = append(rawPackets, append([]byte(nil), raw[:]...))
+	}
+	_, _, decoded, err := ssdv.UpdatePacketsPreviewSparse(frame.previewCanvas, rawPackets)
+	if err != nil {
+		// Incomplete entropy segments are expected while packets are arriving.
+		// Do not mark them decoded: an FEC-recovered packet can make this exact
+		// segment decodable later.
+		return 0, nil
+	}
+	if decoded <= 0 {
+		return 0, nil
+	}
+	first, firstErr := ssdv.ParsePacket(rawPackets[0])
+	last, lastErr := ssdv.ParsePacket(rawPackets[len(rawPackets)-1])
+	if firstErr != nil || lastErr != nil || first.MCUIndex == 0xffff {
+		return 0, nil
+	}
+	totalMCUs := int(first.MCUCount)
+	segmentEndMCU := totalMCUs
+	if last.MCUIndex != 0xffff && last.MCUIndex > first.MCUIndex {
+		segmentEndMCU = int(last.MCUIndex)
+	}
+	if segmentEndMCU > totalMCUs {
+		segmentEndMCU = totalMCUs
+	}
+	if len(frame.coveredMCUs) != totalMCUs {
+		frame.coveredMCUs = make([]bool, totalMCUs)
+	}
+	// The sparse decoder reports how many MCU blocks it actually reconstructed.
+	// Do not mark the whole [first, end) range merely because the EOI tail is
+	// present: a damaged/truncated tail can decode only a prefix, and falsely
+	// counting the remaining MCUs makes an incomplete keyframe look complete.
+	decodedEndMCU := int(first.MCUIndex) + decoded
+	if decodedEndMCU > segmentEndMCU {
+		decodedEndMCU = segmentEndMCU
+	}
+	newlyCovered := 0
+	for mcu := int(first.MCUIndex); mcu < decodedEndMCU; mcu++ {
+		if !frame.coveredMCUs[mcu] {
+			frame.coveredMCUs[mcu] = true
+			newlyCovered++
+		}
+	}
+	// Cache only a fully decoded bounded segment. A short final EOI tail remains
+	// retryable so an 8+2/FEC-recovered packet arriving after the close marker
+	// can complete it later.
+	if decoded >= segmentEndMCU-int(first.MCUIndex) {
+		frame.decodedSegments[key] = struct{}{}
+	}
+	frame.decodedMCUs += newlyCovered
+	return newlyCovered, nil
+}
+
+// decodeGIFSegmentsNearPacket only revisits the one or two MCU intervals that
+// can become complete when this packet arrives. It avoids sorting and
+// re-decoding every packet accumulated in a long animation frame (the previous
+// implementation performed O(n²) work and repeatedly encoded full PNG/Base64
+// previews, which could saturate the RX worker queue).
+func decodeGIFSegmentsNearPacket(frame *gifFrameBuffer, packet ssdv.Packet) (int, error) {
+	if frame == nil {
+		return 0, fmt.Errorf("GIF frame is nil")
+	}
+	if err := ensureGIFFramePreviewCanvas(frame); err != nil {
+		return 0, err
+	}
+	insertGIFBoundary(frame, packet)
+	if packet.EOI {
+		frame.eoiPacketID = packet.PacketID
+		frame.hasEOI = true
+	}
+	ids := frame.boundaryPacketIDs
+	index := sort.Search(len(ids), func(i int) bool { return ids[i] >= packet.PacketID })
+	newlyDecoded := 0
+	try := func(start, end uint16) {
+		decoded, _ := tryDecodeGIFSegment(frame, start, end)
+		newlyDecoded += decoded
+	}
+	if packet.MCUOffset != 0xff && packet.MCUIndex != 0xffff {
+		if index > 0 {
+			try(ids[index-1], packet.PacketID)
+		}
+		if index+1 < len(ids) {
+			try(packet.PacketID, ids[index+1])
+		}
+	} else if index > 0 && index < len(ids) {
+		// This packet may be the missing middle payload between two restart
+		// boundaries (for example, a late Raptor/8+2 recovery packet).
+		try(ids[index-1], ids[index])
+	}
+	if frame.hasEOI && len(ids) > 0 {
+		lastBoundary := ids[len(ids)-1]
+		if lastBoundary <= frame.eoiPacketID && packet.PacketID <= frame.eoiPacketID {
+			// This also handles a late non-boundary packet in the final entropy
+			// tail. Such a packet has no following MCU restart marker, so the
+			// ordinary predecessor/successor lookup cannot find its segment.
+			try(lastBoundary, frame.eoiPacketID)
+		}
+	}
+	return newlyDecoded, nil
+}
+
+func decodeAllReadyGIFSegments(frame *gifFrameBuffer) (int, error) {
+	if frame == nil || len(frame.packets) == 0 {
+		return 0, nil
+	}
+	if len(frame.boundaryPacketIDs) == 0 {
+		// Compatibility with legacy continuous-JPEG GIF senders that do not
+		// carry independent MCU restart metadata. Decode their complete stream
+		// once, at close, rather than retrying it after every packet.
+		raw := orderedGIFPackets(frame.packets)
+		canvas := cloneRGBA(frame.baseCanvas)
+		preview, _, decoded, err := decodeGIFFramePreview(canvas, frame, raw)
+		if err != nil {
+			return 0, err
+		}
+		frame.previewCanvas = preview
+		frame.decodedMCUs += decoded
+		return decoded, nil
+	}
+	newlyDecoded := 0
+	ids := frame.boundaryPacketIDs
+	for i := 0; i+1 < len(ids); i++ {
+		decoded, err := tryDecodeGIFSegment(frame, ids[i], ids[i+1])
+		if err != nil {
+			return newlyDecoded, err
+		}
+		newlyDecoded += decoded
+	}
+	// The final entropy tail ends at the SSDV EOI packet. It may have no MCU
+	// restart metadata of its own, so it is handled separately.
+	eoiID, hasEOI := frame.eoiPacketID, frame.hasEOI
+	if !hasEOI {
+		for id, raw := range frame.packets {
+			parsed, err := ssdv.ParsePacket(raw[:])
+			if err == nil && parsed.EOI && (!hasEOI || id > eoiID) {
+				eoiID, hasEOI = id, true
+			}
+		}
+	}
+	if hasEOI && ids[len(ids)-1] <= eoiID {
+		decoded, err := tryDecodeGIFSegment(frame, ids[len(ids)-1], eoiID)
+		if err != nil {
+			return newlyDecoded, err
+		}
+		newlyDecoded += decoded
+	}
+	return newlyDecoded, nil
+}
+
+func shouldPublishGIFPreview(frame *gifFrameBuffer, now time.Time, force bool) bool {
+	if frame == nil || frame.previewCanvas == nil {
+		return false
+	}
+	if force || len(frame.previewPNG) == 0 {
+		return true
+	}
+	if frame.receivedPackets-frame.lastPreviewPackets >= gifPreviewPacketStride {
+		return true
+	}
+	return now.Sub(frame.lastPreviewAt) >= gifPreviewPublishInterval
+}
+
+func storeGIFFrameSnapshotLocked(stream *gifStreamSession, frame *gifFrameBuffer) bool {
+	if stream == nil || frame == nil || len(frame.previewPNG) == 0 {
+		return false
+	}
+	if frame.snapshotIndex >= 0 && frame.snapshotIndex < len(stream.frames) {
+		stream.frameBytes -= len(stream.frames[frame.snapshotIndex])
+		stream.frames[frame.snapshotIndex] = append(stream.frames[frame.snapshotIndex][:0], frame.previewPNG...)
+		stream.frameBytes += len(frame.previewPNG)
+		stream.archiveDirty = true
+		return true
+	}
+	if !appendGIFFrameSnapshotLocked(stream, frame.previewPNG, frame.delayCS) {
+		return false
+	}
+	frame.snapshotIndex = len(stream.frames) - 1
+	return true
 }
 
 func decodeGIFFramePreview(canvas *image.RGBA, frame *gifFrameBuffer, rawPackets [][]byte) (*image.RGBA, ssdv.Packet, int, error) {
@@ -651,6 +1002,7 @@ func (m *Manager) ReleaseGIFExport(sessionID string) bool {
 		stream.frameBytes = 0
 		stream.canvas = nil
 		stream.pending = nil
+		stream.recentFrames = nil
 		stream.archiveDirty = false
 		stream.lastUpdate = time.Now()
 		return true

@@ -1361,9 +1361,9 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 			} else {
 				update.GIFSaved = true
 				a.rxManager.MarkGIFSnapshotArchived(update.SessionID)
-				if update.GIFEnd {
-					// Keep only compact duplicate-suppression metadata after a terminal
-					// stream snapshot has been safely stored, even if some frames were lost.
+				if update.GIFEnd && !update.GIFStreamIncomplete {
+					// Keep incomplete frame packet buffers briefly after stream end so
+					// late packet-level FEC recovery can repair the latest album snapshot.
 					a.rxManager.ReleaseGIFExport(update.SessionID)
 				}
 			}
