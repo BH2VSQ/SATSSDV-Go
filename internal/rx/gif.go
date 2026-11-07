@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BH2VSQ/SATSSDV-Go/internal/gifmode"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/transport"
 )
@@ -33,6 +34,7 @@ type gifFrameBuffer struct {
 	endSeen         bool
 	receivedPackets int // unique frame-open, data and frame-close packets
 	startedAt       time.Time
+	baseCanvas      *image.RGBA // SGV2 motion-compensated base for this frame
 }
 
 const (
@@ -164,6 +166,11 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 		frame.width, frame.height = parsed.Width, parsed.Height
 		frame.quality, frame.fec = parsed.Quality, parsed.FEC
 		frame.delayCS = parsed.GIFDelayCS
+		if !frame.keyframe && parsed.GIFVersion >= 2 && len(parsed.GIFMotion) > 0 {
+			frame.baseCanvas = gifmode.ApplyMotionVectors(stream.canvas, parsed.GIFMotion)
+		} else if !frame.keyframe && stream.canvas != nil {
+			frame.baseCanvas = cloneRGBA(stream.canvas)
+		}
 		// Count one decoded frame-open and one expected frame-close control
 		// packet in addition to the advertised image-data packet count. The
 		// stream decoder removes the three redundant physical copies.
@@ -205,7 +212,10 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 		stream.packetsReceived++
 		stream.lastUpdate = now
 		rawPackets := orderedGIFPackets(frame.packets)
-		canvas := cloneRGBA(stream.canvas)
+		canvas := cloneRGBA(frame.baseCanvas)
+		if canvas == nil {
+			canvas = cloneRGBA(stream.canvas)
+		}
 		frameCopy := *frame
 		frameCopy.packets = nil
 		update := gifProgressUpdate(stream, frame, packet, false, nil, 0)
@@ -269,7 +279,10 @@ func (m *Manager) processGIFPacket(packet transport.ReceivedPacket) (Update, boo
 	frame.receivedPackets++ // one de-duplicated frame-close control packet
 	stream.packetsReceived++
 	rawPackets := orderedGIFPackets(frame.packets)
-	canvas := cloneRGBA(stream.canvas)
+	canvas := cloneRGBA(frame.baseCanvas)
+	if canvas == nil {
+		canvas = cloneRGBA(stream.canvas)
+	}
 	frameCopy := *frame
 	frameCopy.packets = nil
 	stream.pending = nil

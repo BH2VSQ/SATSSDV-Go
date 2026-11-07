@@ -29,6 +29,24 @@ type PlaybackStream interface {
 	Play(context.Context, []float32, int) error
 	StopPlayback() error
 }
+
+// StreamProducer emits bounded PCM blocks. A producer must stop when ctx is
+// cancelled and must not retain or mutate a block after emit returns.
+type StreamProducer func(ctx context.Context, emit func([]float32) error) error
+
+// StreamingPlaybackSession separates PCM preparation from device playback.
+// PrepareStream fills a bounded queue before PTT is asserted; Play starts the
+// device callback and waits until the producer and queued PCM are drained.
+type StreamingPlaybackSession interface {
+	Play(context.Context) error
+	Stop() error
+}
+
+// StreamingPlaybackStream prepares PCM through a bounded queue rather than
+// requiring one full-duration waveform allocation.
+type StreamingPlaybackStream interface {
+	PrepareStream(context.Context, int, int64, StreamProducer, func(float64)) (StreamingPlaybackSession, error)
+}
 type State struct {
 	RXActive bool `json:"rxActive"`
 	TXActive bool `json:"txActive"`
@@ -235,6 +253,110 @@ func (d *Duplex) TransmitPackets(ctx context.Context, packets [][]float32, onPro
 	keyed = false
 	return nil
 }
+
+// TransmitStream holds PTT for one continuous stream while the waveform is
+// generated incrementally and played through a bounded PCM queue. estimatedSamples
+// is used for the TX timeout and progress reporting; it must be positive.
+func (d *Duplex) TransmitStream(ctx context.Context, estimatedSamples int64, producer StreamProducer, onProgress func(float64)) (retErr error) {
+	if d == nil {
+		return ErrClosed
+	}
+	if estimatedSamples <= 0 || producer == nil {
+		return errors.New("positive estimated sample count and stream producer are required")
+	}
+	playback, ok := d.playback.(StreamingPlaybackStream)
+	if !ok {
+		return errors.New("audio playback backend does not support bounded streaming")
+	}
+	if !d.txMu.TryLock() {
+		return ErrTXBusy
+	}
+	defer d.txMu.Unlock()
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return ErrClosed
+	}
+	rate := int64(d.sampleRate)
+	// Bound the duration before converting to time.Duration so a malformed
+	// estimate cannot overflow the timeout calculation. Actual image/GIF jobs
+	// are much shorter (GIF TX is capped at ten minutes).
+	const maxStreamSeconds = int64(24 * 60 * 60)
+	if estimatedSamples > rate*maxStreamSeconds {
+		d.mu.Unlock()
+		return errors.New("stream TX duration exceeds the 24-hour safety limit")
+	}
+	seconds, remainder := estimatedSamples/rate, estimatedSamples%rate
+	timeout := time.Duration(seconds)*time.Second + time.Duration(remainder)*time.Second/time.Duration(rate) + 30*time.Second
+	txCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	d.txCancel = cancel
+	d.txActive = true
+	d.mu.Unlock()
+	defer func() {
+		cancel()
+		d.mu.Lock()
+		d.txActive, d.txCancel = false, nil
+		d.mu.Unlock()
+	}()
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				cancel()
+			case <-txCtx.Done():
+			}
+		}()
+	}
+	// Prepare and prefill PCM before keying the radio. This keeps CPU-heavy
+	// modulation out of the PTT lead interval and avoids a keyed silent start.
+	session, err := playback.PrepareStream(txCtx, d.sampleRate, estimatedSamples, producer, onProgress)
+	if err != nil {
+		return fmt.Errorf("prepare stream TX audio: %w", err)
+	}
+	defer func() { retErr = errors.Join(retErr, session.Stop()) }()
+	if err := d.ptt.SetPTT(txCtx, true); err != nil {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		releaseErr := d.ptt.SetPTT(releaseCtx, false)
+		releaseCancel()
+		if releaseErr != nil {
+			return errors.Join(fmt.Errorf("assert PTT: %w", err), fmt.Errorf("emergency PTT release: %w", releaseErr))
+		}
+		return fmt.Errorf("assert PTT: %w", err)
+	}
+	keyed := true
+	defer func() {
+		if keyed {
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer releaseCancel()
+			if err := d.ptt.SetPTT(releaseCtx, false); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("release PTT: %w", err))
+			}
+		}
+	}()
+	if policy, ok := d.ptt.(interface{ RequiresPTTLeadTime() bool }); !ok || policy.RequiresPTTLeadTime() {
+		if err := wait(txCtx, d.lead); err != nil {
+			return err
+		}
+	}
+	if err := session.Play(txCtx); err != nil {
+		return fmt.Errorf("stream TX audio: %w", err)
+	}
+	if err := wait(txCtx, d.tail); err != nil {
+		return err
+	}
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	err = d.ptt.SetPTT(releaseCtx, false)
+	releaseCancel()
+	if err != nil {
+		return fmt.Errorf("release PTT: %w", err)
+	}
+	keyed = false
+	if onProgress != nil {
+		onProgress(1)
+	}
+	return nil
+}
+
 func (d *Duplex) StopTX() {
 	if d == nil {
 		return

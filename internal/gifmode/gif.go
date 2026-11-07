@@ -43,6 +43,8 @@ type Stats struct {
 	TotalPackets   int
 	ChangedMCUs    int
 	TotalMCUs      int
+	MotionVectors  int
+	PredictedMCUs  int
 }
 
 // Decode composes GIF image descriptors, transparency and disposal operations
@@ -399,6 +401,17 @@ func Encode(frames []Frame, callsign string, baseImageID uint8, quality uint8) (
 // GIF can contain many frames, so Stop TX should not have to wait for the
 // entire animation to be packetized before it takes effect.
 func EncodeContext(ctx context.Context, frames []Frame, callsign string, baseImageID uint8, quality uint8) ([][]byte, Stats, error) {
+	return encodeContext(ctx, frames, callsign, baseImageID, quality, 1)
+}
+
+// EncodeContextV2 enables MCU-level translation prediction and writes the
+// SGV2 extension into frame-open controls. The RX parser remains compatible
+// with SGV1; the existing Encode/EncodeContext APIs continue to emit SGV1.
+func EncodeContextV2(ctx context.Context, frames []Frame, callsign string, baseImageID uint8, quality uint8) ([][]byte, Stats, error) {
+	return encodeContext(ctx, frames, callsign, baseImageID, quality, 2)
+}
+
+func encodeContext(ctx context.Context, frames []Frame, callsign string, baseImageID uint8, quality uint8, protocolVersion uint8) ([][]byte, Stats, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -426,9 +439,20 @@ func EncodeContext(ctx context.Context, frames []Frame, callsign string, baseIma
 			return nil, stats, errors.New("GIF frames have inconsistent resized dimensions")
 		}
 		frameID := uint8(uint16(baseImageID) + uint16(frameIndex))
-		changed, changedCount, totalMCUs := changedMCUs(previous, frame.Image)
+		comparisonBase := previous
+		var motionVectors []ssdv.GIFMotionVector
+		predictedMCUs := 0
+		if protocolVersion >= 2 && previous != nil {
+			comparisonBase, motionVectors, predictedMCUs = PredictMotion(previous, frame.Image)
+		}
+		changed, changedCount, totalMCUs := changedMCUs(comparisonBase, frame.Image)
 		keyframe := previous == nil || frameIndex%KeyframeInterval == 0 ||
 			(float64(changedCount)/float64(max(1, totalMCUs))) >= KeyframeChangeRatio
+		if keyframe {
+			motionVectors = nil
+			predictedMCUs = 0
+			changed, changedCount, totalMCUs = changedMCUs(previous, frame.Image)
+		}
 
 		fullPackets, err := ssdv.EncodeImage(frame.Image, ssdv.EncodeConfig{
 			Callsign: callsign, ImageID: frameID, Quality: quality, FEC: true,
@@ -460,6 +484,8 @@ func EncodeContext(ctx context.Context, frames []Frame, callsign string, baseIma
 			}
 			if !sparseAvailable {
 				keyframe = true
+				motionVectors = nil
+				predictedMCUs = 0
 				selected, err = ssdv.EncodeImage(frame.Image, ssdv.EncodeConfig{
 					Callsign: callsign, ImageID: frameID, Quality: quality, FEC: true,
 					GIFMode: true, Keyframe: true,
@@ -472,9 +498,17 @@ func EncodeContext(ctx context.Context, frames []Frame, callsign string, baseIma
 		// Send a frame-open marker before the image data so RX knows the exact
 		// expected data-packet count while the MCU blocks are arriving. The
 		// independent frame-close marker commits the frame after all payloads.
-		openMarker, markerErr := ssdv.NewGIFFrameControlPacket(callsign, frameID,
-			frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
-			uint16(len(selected)), true, false, frameIndex == 0, false, keyframe)
+		var openMarker []byte
+		var markerErr error
+		if protocolVersion >= 2 {
+			openMarker, markerErr = ssdv.NewGIFFrameControlPacketV2(callsign, frameID,
+				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
+				uint16(len(selected)), true, false, frameIndex == 0, false, keyframe, motionVectors)
+		} else {
+			openMarker, markerErr = ssdv.NewGIFFrameControlPacket(callsign, frameID,
+				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
+				uint16(len(selected)), true, false, frameIndex == 0, false, keyframe)
+		}
 		if markerErr != nil {
 			return nil, stats, fmt.Errorf("build GIF frame %d open marker: %w", frameIndex, markerErr)
 		}
@@ -482,9 +516,16 @@ func EncodeContext(ctx context.Context, frames []Frame, callsign string, baseIma
 			allPackets = append(allPackets, append([]byte(nil), openMarker...))
 		}
 		allPackets = append(allPackets, selected...)
-		closeMarker, markerErr := ssdv.NewGIFFrameControlPacket(callsign, frameID,
-			frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
-			uint16(len(selected)), false, true, false, frameIndex == len(frames)-1, keyframe)
+		var closeMarker []byte
+		if protocolVersion >= 2 {
+			closeMarker, markerErr = ssdv.NewGIFFrameControlPacketV2(callsign, frameID,
+				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
+				uint16(len(selected)), false, true, false, frameIndex == len(frames)-1, keyframe, nil)
+		} else {
+			closeMarker, markerErr = ssdv.NewGIFFrameControlPacket(callsign, frameID,
+				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
+				uint16(len(selected)), false, true, false, frameIndex == len(frames)-1, keyframe)
+		}
 		if markerErr != nil {
 			return nil, stats, fmt.Errorf("build GIF frame %d close marker: %w", frameIndex, markerErr)
 		}
@@ -500,6 +541,8 @@ func EncodeContext(ctx context.Context, frames []Frame, callsign string, baseIma
 		stats.ControlPackets += ControlPacketCopies * 2
 		stats.ChangedMCUs += changedCount
 		stats.TotalMCUs += totalMCUs
+		stats.MotionVectors += len(motionVectors)
+		stats.PredictedMCUs += predictedMCUs
 		previous = cloneRGBA(frame.Image)
 	}
 	stats.TotalPackets = len(allPackets)

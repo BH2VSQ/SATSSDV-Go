@@ -627,8 +627,10 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 	var archiveGIF []byte
 	var archiveWidth, archiveHeight int
 	var stats gifmode.Stats
-	var waveform []float32
 	var waveformRate int
+	var packets [][]byte
+	var encoder *transport.Encoder
+	var estimatedSamples int64
 	var duplex *audio.Duplex
 	var currentCallsign string
 	var baseImageID uint8
@@ -671,12 +673,13 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 				prepared = true
 				return prepareErr
 			}
-			packets, packetStats, encodeErr := gifmode.EncodeContext(ctx, frames, currentCallsign, baseImageID, ssdv.DefaultJPEGQuality)
+			encodedPackets, packetStats, encodeErr := gifmode.EncodeContextV2(ctx, frames, currentCallsign, baseImageID, ssdv.DefaultJPEGQuality)
 			if encodeErr != nil {
 				prepareErr = encodeErr
 				prepared = true
 				return prepareErr
 			}
+			packets = encodedPackets
 			stats = packetStats
 			// The compressed album animation is now prepared and packetization is
 			// complete. Do not retain every full-resolution RGBA frame or the source
@@ -694,35 +697,32 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 				transportConfig.Source = ax25.Address{Callsign: currentCallsign, SSID: uint8(ax25SSID)}
 				transportConfig.Destination = ax25.Address{Callsign: ax25To}
 			}
-			encoder, createErr := transport.NewEncoder(transportConfig)
+			var createErr error
+			encoder, createErr = transport.NewEncoder(transportConfig)
 			if createErr != nil {
 				prepareErr = createErr
 				prepared = true
 				return prepareErr
 			}
-			waveform, prepareErr = encoder.EncodePackets(packets)
-			packets = nil
+			estimatedSamples, prepareErr = encoder.EstimateOutputSamplesForPackets(packets)
 			if prepareErr != nil {
 				prepared = true
-				return fmt.Errorf("modulate GIF template packets: %w", prepareErr)
+				return fmt.Errorf("estimate GIF template stream: %w", prepareErr)
 			}
-			// Return temporary frame/packet allocations to the Go heap before the
-			// long playback phase. This runs once during TX preparation, not in the
-			// audio callback or between frames.
+			// Discard temporary frame and image buffers before opening the bounded
+			// PCM stream. The encoded 256-byte packet set is retained for repeat TX.
 			runtimedebug.FreeOSMemory()
 			waveformRate, prepareErr = encoder.SampleRate()
-			if prepareErr == nil {
-				prepareErr = transport.FilterTXWaveformInPlace(domain.TransportMode(profileID), waveform, waveformRate)
-			}
 			if prepareErr != nil {
 				prepared = true
-				return fmt.Errorf("prepare GIF template audio: %w", prepareErr)
+				return fmt.Errorf("prepare GIF template stream: %w", prepareErr)
 			}
 			prepared = true
 			a.emit("tx:gif-stats", map[string]any{
 				"frames": stats.Frames, "keyframes": stats.Keyframes,
 				"dataPackets": stats.DataPackets, "totalPackets": stats.TotalPackets,
 				"changedMCUs": stats.ChangedMCUs, "totalMCUs": stats.TotalMCUs,
+				"motionVectors": stats.MotionVectors, "predictedMCUs": stats.PredictedMCUs,
 				"estimatedSeconds": int(airtime.Seconds()),
 			})
 		}
@@ -733,8 +733,21 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 			return err
 		}
 		startedAt := time.Now().UTC()
-		if err := duplex.Transmit(ctx, waveform, func(progress float64) {
-			a.emitTXProgress(waveform, waveformRate, progress)
+		producer := func(streamCtx context.Context, emit func([]float32) error) error {
+			streamedSamples, streamErr := encoder.StreamPackets(streamCtx, packets, func(block []float32) error {
+				if emitErr := emit(block); emitErr != nil {
+					return emitErr
+				}
+				a.emitTXStreamSpectrum(block, waveformRate)
+				return nil
+			})
+			if streamErr == nil && streamedSamples != estimatedSamples {
+				return fmt.Errorf("GIF stream encoder produced %d samples, estimated %d", streamedSamples, estimatedSamples)
+			}
+			return streamErr
+		}
+		if err := duplex.TransmitStream(ctx, estimatedSamples, producer, func(progress float64) {
+			a.emitTXProgress(nil, waveformRate, progress)
 		}); err != nil {
 			return err
 		}
@@ -848,18 +861,37 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 	if duplex == nil {
 		return audio.ErrRuntimeUnavailable
 	}
-	result, err := tximage.EncodeImageWithAX25(source, job.Profile, job.Quality, callsign, imageID, rate, uint8(job.AX25SSID), job.AX25To)
+	prepared, err := tximage.PrepareImagePacketsWithAX25(source, job.Profile, job.Quality, callsign, imageID, rate, uint8(job.AX25SSID), job.AX25To)
+	if err != nil {
+		return err
+	}
+	source = nil // the prepared/resized image and encoded packets are now sufficient
+	estimatedSamples, err := prepared.Encoder.EstimateOutputSamplesForPackets(prepared.Packets)
 	if err != nil {
 		return err
 	}
 	a.emit("tx:progress", 0.0)
 	transmissionStartedAt := time.Now().UTC()
-	if err := duplex.Transmit(ctx, result.Waveform, func(progress float64) {
-		a.emitTXProgress(result.Waveform, result.SampleRate, progress)
+	producer := func(streamCtx context.Context, emit func([]float32) error) error {
+		streamedSamples, streamErr := prepared.Encoder.StreamPackets(streamCtx, prepared.Packets, func(block []float32) error {
+			if emitErr := emit(block); emitErr != nil {
+				return emitErr
+			}
+			a.emitTXStreamSpectrum(block, prepared.SampleRate)
+			return nil
+		})
+		if streamErr == nil && streamedSamples != estimatedSamples {
+			return fmt.Errorf("stream encoder produced %d samples, estimated %d", streamedSamples, estimatedSamples)
+		}
+		return streamErr
+	}
+	if err := duplex.TransmitStream(ctx, estimatedSamples, producer, func(progress float64) {
+		a.emitTXProgress(nil, prepared.SampleRate, progress)
 	}); err != nil {
 		return err
 	}
-	return a.archiveTXImage(result.Image, job, callsign, imageID, result.PacketCount, transmissionStartedAt)
+	prepared.Packets = nil
+	return a.archiveTXImage(prepared.Image, job, callsign, imageID, prepared.PacketCount, transmissionStartedAt)
 }
 
 func (a *App) archiveTXImage(img image.Image, job txqueue.Job, callsign string, imageID uint8, packetCount int, transmissionStartedAt time.Time) error {
@@ -994,6 +1026,28 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 	}
 }
 
+// emitTXStreamSpectrum consumes the most recent streamed PCM block. Unlike the
+// old batch path it never indexes into a full-duration waveform. FFT work and UI
+// events remain limited to 15 Hz to match waterfall row cadence.
+func (a *App) emitTXStreamSpectrum(samples []float32, sampleRate int) {
+	if len(samples) < 1024 {
+		return
+	}
+	now := time.Now()
+	a.txSpectrumMu.Lock()
+	if now.Sub(a.txSpectrumLastEmit) < time.Second/15 {
+		a.txSpectrumMu.Unlock()
+		return
+	}
+	a.txSpectrumLastEmit = now
+	a.txSpectrumMu.Unlock()
+	window := samples[len(samples)-1024:]
+	bins, err := dsp.Spectrum(window, sampleRate)
+	if err == nil {
+		a.emit("tx:spectrum", bins)
+	}
+}
+
 // TransmitPCM accepts mono float32 samples from the Go image/modem pipeline.
 // Native clients should normally invoke a backend image-send method rather than
 // transferring large PCM arrays through the local IPC channel.
@@ -1013,12 +1067,51 @@ func (a *App) TransmitPCM(samples []float32, waveformSampleRate int) error {
 	a.txReserved = true
 	a.txGate.Unlock()
 	defer func() { a.txGate.Lock(); a.txReserved = false; a.txGate.Unlock() }()
-	pcm, err := dsp.ResampleLinear(samples, waveformSampleRate, targetRate)
-	if err != nil {
-		return err
+	if waveformSampleRate <= 0 || targetRate <= 0 {
+		return errors.New("PCM sample rates must be positive")
 	}
-	return d.Transmit(ctx, pcm, func(progress float64) {
-		a.emitTXProgress(pcm, targetRate, progress)
+	estimated := int64(math.Round(float64(len(samples)) * float64(targetRate) / float64(waveformSampleRate)))
+	if estimated <= 0 {
+		return errors.New("PCM waveform is empty")
+	}
+	producer := func(streamCtx context.Context, emit func([]float32) error) error {
+		var resampler *dsp.StreamResampler
+		if waveformSampleRate != targetRate {
+			var createErr error
+			resampler, createErr = dsp.NewStreamResampler(waveformSampleRate, targetRate)
+			if createErr != nil {
+				return createErr
+			}
+		}
+		const chunkSamples = 4096
+		for offset := 0; offset < len(samples); offset += chunkSamples {
+			if err := streamCtx.Err(); err != nil {
+				return err
+			}
+			end := min(offset+chunkSamples, len(samples))
+			block := samples[offset:end]
+			if resampler != nil {
+				block = resampler.Feed(block)
+			}
+			if len(block) > 0 {
+				if err := emit(block); err != nil {
+					return err
+				}
+				a.emitTXStreamSpectrum(block, targetRate)
+			}
+		}
+		if resampler != nil {
+			if tail := resampler.Flush(); len(tail) > 0 {
+				if err := emit(tail); err != nil {
+					return err
+				}
+				a.emitTXStreamSpectrum(tail, targetRate)
+			}
+		}
+		return nil
+	}
+	return d.TransmitStream(ctx, estimated, producer, func(progress float64) {
+		a.emitTXProgress(nil, targetRate, progress)
 	})
 }
 

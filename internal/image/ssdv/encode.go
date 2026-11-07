@@ -1670,3 +1670,45 @@ func NewGIFFrameControlPacket(callsign string, imageID uint8, width, height int,
 	copy(packet[224:], parity)
 	return packet, nil
 }
+
+// NewGIFFrameControlPacketV2 builds the SGV2 frame-control extension. It keeps
+// the SGV1 magic, base flags and data-packet count at their original offsets so
+// SGV1 parsers can still recognize the frame boundaries and ignore the new
+// motion payload. New receivers additionally apply the MCU motion vectors.
+func NewGIFFrameControlPacketV2(callsign string, imageID uint8, width, height int, quality uint8, delayCS uint16, dataPackets uint16, frameStart, frameEnd, streamStart, streamEnd, keyframe bool, vectors []GIFMotionVector) ([]byte, error) {
+	if len(vectors) > 32 {
+		return nil, errors.New("SGV2 motion extension supports at most 32 vectors per frame")
+	}
+	packet, err := NewGIFFrameControlPacket(callsign, imageID, width, height, quality, delayCS, dataPackets, frameStart, frameEnd, streamStart, streamEnd, keyframe)
+	if err != nil {
+		return nil, err
+	}
+	if len(vectors) > 0 && (!frameStart || keyframe) {
+		return nil, errors.New("SGV2 motion vectors are only valid on delta frame-open controls")
+	}
+	if !validGIFMotionSet(vectors, width, height) {
+		return nil, errors.New("SGV2 motion vector set is invalid or overlaps")
+	}
+	packet[21] |= 0x10 // SGV2 extension-present flag; legacy low bits are unchanged.
+	packet[24] = 2
+	packet[25] = byte(len(vectors))
+	packet[26] = 6
+	for i, vector := range vectors {
+		base := 27 + i*6
+		packet[base] = vector.SourceX
+		packet[base+1] = vector.SourceY
+		packet[base+2] = vector.Width
+		packet[base+3] = vector.Height
+		packet[base+4] = byte(vector.DeltaX)
+		packet[base+5] = byte(vector.DeltaY)
+	}
+	// The extension lies in the control packet's reserved bytes; recompute both
+	// integrity layers after writing it.
+	binary.BigEndian.PutUint32(packet[220:224], crc32.ChecksumIEEE(packet[1:220]))
+	parity, err := fec.RS8Parity(packet[1:224])
+	if err != nil {
+		return nil, err
+	}
+	copy(packet[224:], parity)
+	return packet, nil
+}

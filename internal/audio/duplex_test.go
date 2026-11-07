@@ -56,6 +56,185 @@ func (f *fakePTT) SetPTT(_ context.Context, on bool) error {
 	return nil
 }
 func (f *fakePTT) Close() error { return nil }
+
+type fakeStreamPlayback struct {
+	calls     int
+	count     int
+	key       *historyPTT
+	blockPlay bool
+	started   chan struct{}
+}
+
+type fakeStreamSession struct {
+	playback *fakeStreamPlayback
+	ctx      context.Context
+}
+
+func (f *fakeStreamPlayback) Play(_ context.Context, _ []float32, _ int) error { return nil }
+func (f *fakeStreamPlayback) StopPlayback() error                              { return nil }
+func (f *fakeStreamPlayback) PrepareStream(ctx context.Context, sampleRate int, estimated int64, producer StreamProducer, progress func(float64)) (StreamingPlaybackSession, error) {
+	if sampleRate != 48000 || estimated != 5 {
+		return nil, errors.New("unexpected stream parameters")
+	}
+	if f.key != nil {
+		f.key.mu.Lock()
+		keyed := len(f.key.states) > 0 && f.key.states[len(f.key.states)-1]
+		f.key.mu.Unlock()
+		if keyed {
+			return nil, errors.New("PTT was asserted before stream prefill")
+		}
+	}
+	err := producer(ctx, func(block []float32) error { f.count += len(block); return nil })
+	if err != nil {
+		return nil, err
+	}
+	_ = progress // Playback, not prefill, advances the UI progress indicator.
+	return &fakeStreamSession{playback: f, ctx: ctx}, nil
+}
+
+func (s *fakeStreamSession) Play(ctx context.Context) error {
+	if s.playback.key != nil {
+		s.playback.key.mu.Lock()
+		keyed := len(s.playback.key.states) > 0 && s.playback.key.states[len(s.playback.key.states)-1]
+		s.playback.key.mu.Unlock()
+		if !keyed {
+			return errors.New("PTT was not asserted before playback")
+		}
+	}
+	s.playback.calls++
+	if s.playback.started != nil {
+		close(s.playback.started)
+	}
+	if s.playback.blockPlay {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+	}
+	return nil
+}
+func (s *fakeStreamSession) Stop() error { return nil }
+
+func TestTransmitStreamHoldsPTTAcrossProducerAndPlayback(t *testing.T) {
+	cap := &fakeCapture{}
+	key := &historyPTT{}
+	play := &fakeStreamPlayback{key: key}
+	d, err := NewDuplex(cap, play, key, 48000, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotProgress float64
+	err = d.TransmitStream(context.Background(), 5, func(ctx context.Context, emit func([]float32) error) error {
+		if !d.State().TXActive {
+			return errors.New("TX state was not active while producing")
+		}
+		return emit([]float32{1, 2, 3, 4, 5})
+	}, func(value float64) { gotProgress = value })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if play.calls != 1 || play.count != 5 {
+		t.Fatalf("stream playback calls=%d samples=%d", play.calls, play.count)
+	}
+	key.mu.Lock()
+	states := append([]bool(nil), key.states...)
+	key.mu.Unlock()
+	if len(states) != 2 || !states[0] || states[1] {
+		t.Fatalf("PTT transitions=%v", states)
+	}
+	if gotProgress != 1 {
+		t.Fatalf("final progress=%v", gotProgress)
+	}
+	if d.State().TXActive {
+		t.Fatal("TX remained active after stream completed")
+	}
+	_ = d.Close()
+}
+
+func TestTransmitStreamProducerErrorDoesNotAssertPTT(t *testing.T) {
+	cap := &fakeCapture{}
+	key := &historyPTT{}
+	play := &fakeStreamPlayback{key: key}
+	d, err := NewDuplex(cap, play, key, 48000, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("modulator failed")
+	err = d.TransmitStream(context.Background(), 5, func(context.Context, func([]float32) error) error {
+		return wantErr
+	}, nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("TransmitStream error=%v, want %v", err, wantErr)
+	}
+	key.mu.Lock()
+	states := append([]bool(nil), key.states...)
+	key.mu.Unlock()
+	if len(states) != 0 {
+		t.Fatalf("PTT should not be keyed when prefill fails: %v", states)
+	}
+	_ = d.Close()
+}
+
+func TestTransmitStreamCancellationReleasesPTT(t *testing.T) {
+	cap := &fakeCapture{}
+	key := &historyPTT{}
+	play := &fakeStreamPlayback{key: key, blockPlay: true, started: make(chan struct{})}
+	d, err := NewDuplex(cap, play, key, 48000, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- d.TransmitStream(context.Background(), 5, func(_ context.Context, emit func([]float32) error) error {
+			return emit([]float32{1, 2, 3, 4, 5})
+		}, nil)
+	}()
+	select {
+	case <-play.started:
+	case <-time.After(time.Second):
+		t.Fatal("stream playback did not start")
+	}
+	d.StopTX()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("TX error=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream TX did not stop after cancellation")
+	}
+	key.mu.Lock()
+	states := append([]bool(nil), key.states...)
+	key.mu.Unlock()
+	if len(states) != 2 || !states[0] || states[1] {
+		t.Fatalf("PTT transitions after cancellation=%v", states)
+	}
+	_ = d.Close()
+}
+
+func TestTransmitStreamRejectsExcessiveDurationBeforePTT(t *testing.T) {
+	cap := &fakeCapture{}
+	key := &historyPTT{}
+	play := &fakeStreamPlayback{key: key}
+	d, err := NewDuplex(cap, play, key, 48000, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = d.TransmitStream(context.Background(), int64(48000)*int64(24*60*60+1), func(context.Context, func([]float32) error) error { return nil }, nil)
+	if err == nil {
+		t.Fatal("expected 24-hour safety limit error")
+	}
+	key.mu.Lock()
+	states := append([]bool(nil), key.states...)
+	key.mu.Unlock()
+	if len(states) != 0 {
+		t.Fatalf("PTT should remain off for rejected stream: %v", states)
+	}
+	_ = d.Close()
+}
+
 func TestRXRemainsActiveDuringTX(t *testing.T) {
 	cap := &fakeCapture{}
 	play := &fakePlayback{started: make(chan struct{}), release: make(chan struct{})}

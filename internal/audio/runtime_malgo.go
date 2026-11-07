@@ -22,11 +22,33 @@ import (
 )
 
 type playbackJob struct {
-	done     chan struct{}
-	samples  []float32
-	offset   int
-	finished bool
-	err      error
+	done            chan struct{}
+	samples         []float32
+	offset          int
+	streamRing      *float32Ring
+	producerCancel  context.CancelFunc
+	producerDone    bool
+	producerErr     error
+	played          int64
+	estimated       int64
+	playbackStarted bool
+	finished        bool
+	err             error
+}
+
+var ErrPCMUnderrun = errors.New("streaming PCM buffer underrun")
+
+type malgoStreamSession struct {
+	runtime      *MalgoRuntime
+	job          *playbackJob
+	ring         *float32Ring
+	producerDone chan struct{}
+	cancel       context.CancelFunc
+	estimated    int64
+	onProgress   func(float64)
+	mu           sync.Mutex
+	started      bool
+	stopped      bool
 }
 
 type MalgoRuntime struct {
@@ -309,6 +331,242 @@ func (m *MalgoRuntime) PlayWithProgress(ctx context.Context, samples []float32, 
 	}
 }
 
+// PrepareStream produces and pre-fills a bounded PCM queue without starting the
+// output device. Duplex can therefore assert PTT only after the first audio
+// block is ready, then apply the configured lead time before playback begins.
+func (m *MalgoRuntime) PrepareStream(ctx context.Context, sampleRate int, estimatedSamples int64, producer StreamProducer, onProgress func(float64)) (StreamingPlaybackSession, error) {
+	if m == nil || m.closed.Load() {
+		return nil, errors.New("audio runtime is closed")
+	}
+	if sampleRate != int(m.rate) {
+		return nil, fmt.Errorf("stream sample rate %d does not match device stream %d", sampleRate, m.rate)
+	}
+	if estimatedSamples <= 0 || producer == nil {
+		return nil, errors.New("positive estimated sample count and PCM producer are required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ringCapacity := max(sampleRate*2, 8192) // two seconds of bounded mono float32 PCM
+	ring, err := newFloat32Ring(ringCapacity)
+	if err != nil {
+		return nil, err
+	}
+	producerCtx, producerCancel := context.WithCancel(ctx)
+	producerDone := make(chan struct{})
+
+	m.ctxMu.RLock()
+	if m.ctx == nil || m.closed.Load() {
+		m.ctxMu.RUnlock()
+		producerCancel()
+		return nil, errors.New("audio runtime is closed")
+	}
+	m.playbackLifeMu.Lock()
+	m.playbackMu.Lock()
+	if m.job != nil {
+		m.playbackMu.Unlock()
+		m.playbackLifeMu.Unlock()
+		m.ctxMu.RUnlock()
+		producerCancel()
+		return nil, ErrTXBusy
+	}
+	job := &playbackJob{
+		done: make(chan struct{}), streamRing: ring, producerCancel: producerCancel,
+		estimated: estimatedSamples,
+	}
+	m.job = job
+	m.playbackMu.Unlock()
+	m.playbackLifeMu.Unlock()
+	m.ctxMu.RUnlock()
+
+	go func() {
+		emit := func(block []float32) error { return ring.Write(producerCtx, block) }
+		producerErr := producer(producerCtx, emit)
+		m.playbackMu.Lock()
+		if m.job == job && !job.finished {
+			job.producerErr = producerErr
+			job.producerDone = true
+		}
+		m.playbackMu.Unlock()
+		close(producerDone)
+	}()
+
+	session := &malgoStreamSession{
+		runtime: m, job: job, ring: ring, producerDone: producerDone,
+		cancel: producerCancel, estimated: estimatedSamples, onProgress: onProgress,
+	}
+	abort := func(cause error) (StreamingPlaybackSession, error) {
+		producerCancel()
+		m.finishJob(job, cause)
+		<-producerDone
+		ring.Clear()
+		return nil, cause
+	}
+
+	// Keep at least 250 ms queued before PTT is asserted. Short bursts that
+	// finish sooner are accepted as soon as their producer has completed.
+	prefill := max(sampleRate/4, 1)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		m.playbackMu.Lock()
+		done, finished, producerErr := job.producerDone, job.finished, job.producerErr
+		jobErr := job.err
+		m.playbackMu.Unlock()
+		if finished {
+			if jobErr == nil {
+				jobErr = context.Canceled
+			}
+			return abort(jobErr)
+		}
+		if done {
+			if producerErr != nil {
+				return abort(fmt.Errorf("produce PCM stream: %w", producerErr))
+			}
+			if ring.Len() == 0 {
+				return abort(errors.New("PCM producer completed without audio samples"))
+			}
+			return session, nil
+		}
+		if ring.Len() >= prefill {
+			return session, nil
+		}
+		select {
+		case <-ctx.Done():
+			return abort(ctx.Err())
+		case <-job.done:
+			continue
+		case <-ticker.C:
+		}
+	}
+}
+
+// PlayStream is retained as a convenience wrapper for callers that do not
+// need to coordinate PTT. The Duplex controller uses PrepareStream directly.
+func (m *MalgoRuntime) PlayStream(ctx context.Context, sampleRate int, estimatedSamples int64, producer StreamProducer, onProgress func(float64)) error {
+	session, err := m.PrepareStream(ctx, sampleRate, estimatedSamples, producer, onProgress)
+	if err != nil {
+		return err
+	}
+	defer session.Stop()
+	return session.Play(ctx)
+}
+
+func (s *malgoStreamSession) Play(ctx context.Context) error {
+	if s == nil || s.runtime == nil {
+		return errors.New("stream playback session is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return context.Canceled
+	}
+	if s.started {
+		s.mu.Unlock()
+		return errors.New("stream playback session has already started")
+	}
+	s.started = true
+	s.mu.Unlock()
+
+	m := s.runtime
+	m.ctxMu.RLock()
+	if m.ctx == nil || m.closed.Load() {
+		m.ctxMu.RUnlock()
+		_ = s.Stop()
+		return errors.New("audio runtime is closed")
+	}
+	m.playbackLifeMu.Lock()
+	m.playbackMu.Lock()
+	if m.job != s.job || s.job.finished {
+		m.playbackMu.Unlock()
+		m.playbackLifeMu.Unlock()
+		m.ctxMu.RUnlock()
+		_ = s.Stop()
+		return context.Canceled
+	}
+	if m.playback == nil {
+		dev, err := m.newPlaybackLocked()
+		if err != nil {
+			m.playbackMu.Unlock()
+			m.playbackLifeMu.Unlock()
+			m.ctxMu.RUnlock()
+			_ = s.Stop()
+			return err
+		}
+		m.playback = dev
+	}
+	dev := m.playback
+	// A previous burst may have left the shared device running. Keep this job
+	// gated until Play is called after PTT assertion and lead time have elapsed.
+	s.job.playbackStarted = true
+	m.playbackMu.Unlock()
+	if !dev.IsStarted() {
+		if err := dev.Start(); err != nil {
+			m.playbackLifeMu.Unlock()
+			m.ctxMu.RUnlock()
+			_ = s.Stop()
+			return fmt.Errorf("start audio playback: %w", err)
+		}
+	}
+	m.playbackLifeMu.Unlock()
+	m.ctxMu.RUnlock()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.job.done:
+			<-s.producerDone
+			m.playbackMu.Lock()
+			playErr, played := s.job.err, s.job.played
+			m.playbackMu.Unlock()
+			s.ring.Clear()
+			if playErr == nil && played != s.estimated {
+				playErr = fmt.Errorf("PCM stream played %d samples, expected %d", played, s.estimated)
+			}
+			if s.onProgress != nil {
+				if playErr == nil {
+					s.onProgress(1)
+				} else {
+					s.onProgress(math.Max(0, math.Min(1, float64(played)/float64(s.estimated))))
+				}
+			}
+			return playErr
+		case <-ticker.C:
+			if s.onProgress != nil {
+				m.playbackMu.Lock()
+				played := s.job.played
+				m.playbackMu.Unlock()
+				s.onProgress(math.Max(0, math.Min(0.999, float64(played)/float64(s.estimated))))
+			}
+		case <-ctx.Done():
+			_ = s.Stop()
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *malgoStreamSession) Stop() error {
+	if s == nil || s.runtime == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return nil
+	}
+	s.stopped = true
+	s.mu.Unlock()
+	s.cancel()
+	s.runtime.finishJob(s.job, context.Canceled)
+	<-s.producerDone
+	s.ring.Clear()
+	return nil
+}
+
 func (m *MalgoRuntime) newPlaybackLocked() (*malgo.Device, error) {
 	cfg := malgo.DefaultDeviceConfig(malgo.Playback)
 	cfg.Playback.Format = malgo.FormatF32
@@ -324,6 +582,7 @@ func (m *MalgoRuntime) newPlaybackLocked() (*malgo.Device, error) {
 		defer C.free(id)
 	}
 	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(output, _ []byte, frameCount uint32) {
+		clear(output)
 		m.playbackMu.Lock()
 		defer m.playbackMu.Unlock()
 		job := m.job
@@ -331,18 +590,54 @@ func (m *MalgoRuntime) newPlaybackLocked() (*malgo.Device, error) {
 		if frames*4 > len(output) {
 			frames = len(output) / 4
 		}
+		if job == nil || job.finished {
+			return
+		}
+		if job.streamRing != nil {
+			if !job.playbackStarted {
+				return
+			}
+			if job.producerDone && job.producerErr != nil {
+				job.finished = true
+				job.err = job.producerErr
+				job.streamRing = nil
+				m.job = nil
+				close(job.done)
+				return
+			}
+			read := job.streamRing.ReadToBytes(output[:frames*4])
+			job.played += int64(read)
+			if read < frames && !job.producerDone {
+				// Never insert silent gaps into a modulated burst. Abort immediately
+				// and let Duplex release PTT through its normal cleanup path.
+				job.finished = true
+				job.err = ErrPCMUnderrun
+				if job.producerCancel != nil {
+					job.producerCancel()
+				}
+				job.streamRing = nil
+				m.job = nil
+				close(job.done)
+				return
+			}
+			if job.producerDone && job.streamRing.Len() == 0 {
+				job.finished = true
+				job.err = job.producerErr
+				job.streamRing = nil
+				m.job = nil
+				close(job.done)
+			}
+			return
+		}
 		for i := 0; i < frames; i++ {
 			var value float32
-			if job != nil && !job.finished && job.offset < len(job.samples) {
+			if job.offset < len(job.samples) {
 				value = job.samples[job.offset]
 				job.offset++
 			}
 			binary.LittleEndian.PutUint32(output[i*4:i*4+4], math.Float32bits(value))
 		}
-		for i := frames * 4; i+4 <= len(output); i += 4 {
-			binary.LittleEndian.PutUint32(output[i:i+4], 0)
-		}
-		if job != nil && !job.finished && job.offset >= len(job.samples) {
+		if job.offset >= len(job.samples) {
 			job.finished = true
 			job.samples = nil
 			m.job = nil
@@ -364,6 +659,13 @@ func (m *MalgoRuntime) finishJob(job *playbackJob, err error) {
 	job.finished = true
 	job.err = err
 	job.samples = nil
+	if job.streamRing != nil {
+		job.streamRing.Clear()
+		job.streamRing = nil
+	}
+	if job.producerCancel != nil {
+		job.producerCancel()
+	}
 	m.job = nil
 	close(job.done)
 }
@@ -380,6 +682,13 @@ func (m *MalgoRuntime) StopPlayback() error {
 		job.finished = true
 		job.err = context.Canceled
 		job.samples = nil
+		if job.streamRing != nil {
+			job.streamRing.Clear()
+			job.streamRing = nil
+		}
+		if job.producerCancel != nil {
+			job.producerCancel()
+		}
 		close(job.done)
 	}
 	m.playbackMu.Unlock()

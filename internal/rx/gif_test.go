@@ -2,6 +2,7 @@ package rx
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"image"
 	"image/color"
@@ -15,6 +16,96 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/transport"
 )
+
+func TestSGV2MotionPredictedFramesReconstructThroughRXManager(t *testing.T) {
+	const width, height = 320, 240
+	first := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			first.SetRGBA(x, y, color.RGBA{R: uint8(x % 251), G: uint8(y % 239), B: uint8((x*3 + y*7) % 241), A: 255})
+		}
+	}
+	second := image.NewRGBA(first.Bounds())
+	draw.Draw(second, second.Bounds(), first, first.Bounds().Min, draw.Src)
+	const sx, sy, objectW, objectH, dx, dy = 4, 4, 4, 3, 2, 1
+	sprite := image.NewRGBA(image.Rect(0, 0, objectW*16, objectH*16))
+	for y := 0; y < objectH*16; y++ {
+		for x := 0; x < objectW*16; x++ {
+			sprite.SetRGBA(x, y, color.RGBA{R: uint8((x*11 + y*3) % 255), G: uint8((x*5 + y*17) % 255), B: uint8((x*7 + y*13) % 255), A: 255})
+		}
+	}
+	draw.Draw(first, image.Rect(sx*16, sy*16, (sx+objectW)*16, (sy+objectH)*16), sprite, sprite.Bounds().Min, draw.Src)
+	draw.Draw(second, image.Rect((sx+dx)*16, (sy+dy)*16, (sx+dx+objectW)*16, (sy+dy+objectH)*16), sprite, sprite.Bounds().Min, draw.Src)
+
+	packets, stats, err := gifmode.EncodeContextV2(context.Background(), []gifmode.Frame{{Image: first, DelayCS: 10}, {Image: second, DelayCS: 20}}, "N0CALL", 201, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.MotionVectors == 0 || stats.PredictedMCUs == 0 {
+		t.Fatalf("SGV2 encoder did not use motion prediction: %+v", stats)
+	}
+	profile := domain.SSDVCCSDS1200
+	encoder, err := transport.NewEncoder(transport.Config{Profile: profile, AudioSampleRate: 19200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waveform []float32
+	streamedSamples, err := encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+		waveform = append(waveform, block...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(waveform)) != streamedSamples {
+		t.Fatalf("streamed waveform count=%d, reported=%d", len(waveform), streamedSamples)
+	}
+	decoder, err := transport.NewStreamDecoder(profile, 19200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+	var final Update
+	for offset := 0; offset < len(waveform); offset += 1920 {
+		end := min(offset+1920, len(waveform))
+		received, feedErr := decoder.Feed(waveform[offset:end])
+		if feedErr != nil {
+			t.Fatalf("decode SGV2 waveform: %v", feedErr)
+		}
+		for _, packet := range received {
+			update, ok := manager.process(packet)
+			if !ok {
+				continue
+			}
+			if update.Error != "" {
+				t.Fatalf("RX rejected SGV2 packet: %s", update.Error)
+			}
+			if update.GIFEnd {
+				final = update
+			}
+		}
+	}
+	if final.SessionID == "" || !final.GIFFrameComplete {
+		t.Fatal("SGV2 stream did not complete")
+	}
+	exported, _, frameCount, err := manager.ExportGIF(final.SessionID)
+	if err != nil {
+		t.Fatalf("export SGV2 GIF: %v", err)
+	}
+	decoded, err := gif.DecodeAll(bytes.NewReader(exported))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frameCount != 2 || len(decoded.Image) != 2 {
+		t.Fatalf("SGV2 export frame count=%d decoded=%d", frameCount, len(decoded.Image))
+	}
+	// The second frame must show the sprite at the translated destination.
+	actualR, actualG, actualB, _ := decoded.Image[1].At((sx+dx)*16+8, (sy+dy)*16+8).RGBA()
+	want := sprite.RGBAAt(8, 8)
+	if absIntRX(int(actualR>>8)-int(want.R)) > 60 || absIntRX(int(actualG>>8)-int(want.G)) > 60 || absIntRX(int(actualB>>8)-int(want.B)) > 60 {
+		t.Fatalf("motion-predicted target pixel mismatch: got %d/%d/%d want approximately %d/%d/%d", actualR>>8, actualG>>8, actualB>>8, want.R, want.G, want.B)
+	}
+}
 
 func TestGIFFramesDecodeEndToEndThroughCCSDSAndRXManager(t *testing.T) {
 	first := image.NewRGBA(image.Rect(0, 0, 320, 240))
@@ -421,4 +512,11 @@ func TestReleaseGIFExportDropsFrameSnapshotsButKeepsDuplicateSuppressionState(t 
 	if manager.ReleaseGIFExport("completed-session") {
 		t.Fatal("second release unexpectedly reported retained frame data")
 	}
+}
+
+func absIntRX(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

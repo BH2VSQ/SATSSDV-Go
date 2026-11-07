@@ -57,7 +57,7 @@ checks = {
     "countdown uses a typed numeric field": "RemainingSeconds int    `json:\"remainingSeconds,omitempty\"`" in text["scheduler"] and 'p.value(QStringLiteral("remainingSeconds")).toInt()' in text["cpp"],
     "TX waterfall scrolls blank rows after a burst": "void appendBlankRow()" in text["cpp"] and "m_decayTimer.start()" in text["cpp"] and 'setStreaming(phase == QStringLiteral("sending"))' in text["cpp"],
     "GIF incremental TX package is present": (ROOT / "internal" / "gifmode" / "gif.go").is_file() and "GIFMode" in (ROOT / "internal" / "image" / "ssdv" / "packet.go").read_text(encoding="utf-8"),
-    "GIF TX preserves M-ary waveform constellation": "transport.FilterTXWaveformInPlace" in text["app"] and (ROOT / "internal" / "transport" / "audio_filter.go").is_file(),
+    "streaming M-ary TX bypasses generic audio filtering": 'profile.LinkLayer != "CCSDS-MARY"' in (ROOT / "internal" / "transport" / "stream_encoder.go").read_text(encoding="utf-8") and (ROOT / "internal" / "transport" / "audio_filter.go").is_file(),
     "GIF RX control packets are not misrouted into static decoders": 'if packet.GIFMode || packet.Codec == "SSDV-GIF"' in text["rx"],
     "Qt TX detects and extracts a template GIF": 'startsWith(QStringLiteral("data:image/gif")' in text["cpp"] and 'QStringLiteral("gifBase64")' in text["cpp"] and 'QStringLiteral("gifRect")' in text["cpp"],
     "countdown display is not reset while TX is sending": (

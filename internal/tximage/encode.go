@@ -8,7 +8,6 @@ import (
 	"image"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
-	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/imagequality"
@@ -21,6 +20,14 @@ type Result struct {
 	Waveform    []float32
 	PacketCount int
 	SampleRate  int
+}
+
+type Prepared struct {
+	Image       *image.RGBA
+	Packets     [][]byte
+	PacketCount int
+	SampleRate  int
+	Encoder     *transport.Encoder
 }
 
 // pcsiChromaCompression maps the three UI image-size presets to a PCSI MMT
@@ -47,8 +54,15 @@ func EncodeImage(src image.Image, profileID, quality, callsign string, imageID u
 
 // EncodeImageWithAX25 allows the UI to set the local source SSID and the
 // destination callsign used by AX.25. The values are ignored by CCSDS modes.
-func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string) (Result, error) {
-	var result Result
+func PrepareImagePackets(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int) (Prepared, error) {
+	return PrepareImagePacketsWithAX25(src, profileID, quality, callsign, imageID, outputSampleRate, 0, "CQ")
+}
+
+// PrepareImagePacketsWithAX25 prepares encoded image packets and a persistent
+// transport encoder without materializing the full-duration audio waveform.
+// Call Encoder.StreamPackets to feed a bounded PCM consumer during TX.
+func PrepareImagePacketsWithAX25(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string) (Prepared, error) {
+	var result Prepared
 	profile, err := domain.ParseProfile(profileID)
 	if err != nil {
 		return result, err
@@ -67,10 +81,6 @@ func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, i
 			Callsign: callsign, ImageID: imageID, Quality: ssdv.DefaultJPEGQuality, FEC: true,
 		})
 	case "PCSI-MMT":
-		// A larger chroma-compression value assigns more payload bits to Y-only
-		// samples, preserving fine luminance detail while reducing packet count.
-		// Use a moderate setting for the medium default and progressively favor
-		// airtime on low-resolution presets; high resolution retains more color.
 		chromaCompression := pcsiChromaCompression(quality)
 		encoder, encErr := pcsi.NewEncoder(resized, pcsi.Config{
 			Callsign: callsign, ImageID: imageID, BitDepth: 12, ChromaCompression: chromaCompression,
@@ -92,9 +102,7 @@ func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, i
 	if err != nil {
 		return result, err
 	}
-	transportConfig := transport.Config{
-		Profile: domain.TransportMode(profileID), AudioSampleRate: outputSampleRate,
-	}
+	transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: outputSampleRate}
 	if profile.LinkLayer == "AX.25 UI / HDLC" {
 		if destination == "" {
 			destination = "CQ"
@@ -106,16 +114,28 @@ func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, i
 	if err != nil {
 		return result, err
 	}
-	waveform, err := transportEncoder.EncodePackets(packets)
-	if err != nil {
-		return result, err
-	}
 	rate, err := transportEncoder.SampleRate()
 	if err != nil {
 		return result, err
 	}
-	if err := dsp.FilterModulatedAudioInPlace(waveform, rate); err != nil {
+	return Prepared{Image: resized, Packets: packets, PacketCount: len(packets), SampleRate: rate, Encoder: transportEncoder}, nil
+}
+
+// EncodeImageWithAX25 retains the legacy batch API for callers that explicitly
+// need the full waveform. The radio TX path uses PrepareImagePackets and
+// StreamPackets instead.
+func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string) (Result, error) {
+	var result Result
+	prepared, err := PrepareImagePacketsWithAX25(src, profileID, quality, callsign, imageID, outputSampleRate, sourceSSID, destination)
+	if err != nil {
+		return result, err
+	}
+	waveform, err := prepared.Encoder.EncodePackets(prepared.Packets)
+	if err != nil {
+		return result, err
+	}
+	if err := transport.FilterTXWaveformInPlace(domain.TransportMode(profileID), waveform, prepared.SampleRate); err != nil {
 		return result, fmt.Errorf("filter modulated TX audio: %w", err)
 	}
-	return Result{Image: resized, Waveform: waveform, PacketCount: len(packets), SampleRate: rate}, nil
+	return Result{Image: prepared.Image, Waveform: waveform, PacketCount: prepared.PacketCount, SampleRate: prepared.SampleRate}, nil
 }

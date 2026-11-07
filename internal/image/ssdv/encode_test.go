@@ -358,7 +358,9 @@ func TestDecodePacketsToPreviewFillsIndependentMCUBlocksAndMarksGaps(t *testing.
 		t.Fatalf("packet MCU indices do not advance: first=%d later=%d", first.MCUIndex, later.MCUIndex)
 	}
 	missing, err := ParsePacket(packets[1])
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	missingIndex := int(missing.MCUIndex)
 	missingX, missingY := (missingIndex%(320/16))*16+8, (missingIndex/(320/16))*16+8
 	r, g, b, _ := preview.At(missingX, missingY).RGBA()
@@ -374,7 +376,6 @@ func TestDecodePacketsToPreviewFillsIndependentMCUBlocksAndMarksGaps(t *testing.
 		t.Fatalf("complete block preview = %v, %d MCUs; want 320x240, %d MCUs", fullPreview.Bounds(), fullBlocks, wantBlocks)
 	}
 }
-
 
 func TestIncrementalPreviewMatchesCompletePreview(t *testing.T) {
 	packets, err := EncodeImage(fixtureImage(320, 240), EncodeConfig{Callsign: "N0CALL", ImageID: 67, Quality: 4, FEC: true})
@@ -506,5 +507,45 @@ func BenchmarkDecodePacketsToPreview320x240(b *testing.B) {
 		if _, _, _, err := DecodePacketsToPreview(packets); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestSGV2MotionControlParsesAndSGV1RemainsReadable(t *testing.T) {
+	vector := GIFMotionVector{SourceX: 3, SourceY: 4, Width: 4, Height: 3, DeltaX: 3, DeltaY: 1}
+	rawV2, err := NewGIFFrameControlPacketV2("N0CALL", 9, 320, 240, 4, 8, 12, true, false, true, false, false, []GIFMotionVector{vector})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedV2, err := ParsePacket(rawV2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsedV2.GIFVersion != 2 || len(parsedV2.GIFMotion) != 1 || parsedV2.GIFMotion[0] != vector {
+		t.Fatalf("SGV2 metadata mismatch: version=%d vectors=%+v", parsedV2.GIFVersion, parsedV2.GIFMotion)
+	}
+
+	rawV1, err := NewGIFFrameControlPacket("N0CALL", 10, 320, 240, 4, 8, 12, true, false, true, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedV1, err := ParsePacket(rawV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsedV1.GIFVersion != 1 || len(parsedV1.GIFMotion) != 0 || !parsedV1.GIFFrameStart || !parsedV1.GIFStart {
+		t.Fatalf("SGV1 compatibility mismatch: %+v", parsedV1)
+	}
+
+	if _, err := NewGIFFrameControlPacketV2("N0CALL", 11, 320, 240, 4, 8, 12, true, false, false, false, true, []GIFMotionVector{vector}); err == nil {
+		t.Fatal("SGV2 keyframe must not carry motion vectors")
+	}
+	if _, err := NewGIFFrameControlPacketV2("N0CALL", 12, 320, 240, 4, 8, 12, true, false, false, false, false, []GIFMotionVector{{SourceX: 19, SourceY: 4, Width: 2, Height: 3, DeltaX: -1}}); err == nil {
+		t.Fatal("SGV2 accepted an out-of-bounds source rectangle")
+	}
+	if _, err := NewGIFFrameControlPacketV2("N0CALL", 13, 320, 240, 4, 8, 12, true, false, false, false, false, []GIFMotionVector{
+		{SourceX: 1, SourceY: 1, Width: 2, Height: 2, DeltaX: 2},
+		{SourceX: 5, SourceY: 1, Width: 2, Height: 2, DeltaX: -2},
+	}); err == nil {
+		t.Fatal("SGV2 accepted overlapping destination rectangles")
 	}
 }

@@ -83,3 +83,46 @@ func applyBiquad(input float64, coeff biquadCoefficients, state *biquadState) fl
 	state.z2 = coeff.b2*input - coeff.a2*output
 	return output
 }
+
+// StreamModulatedAudioFilter preserves the biquad delay state between PCM
+// blocks. It is equivalent to FilterModulatedAudioInPlace on one concatenated
+// waveform, but requires memory proportional only to the current block.
+type StreamModulatedAudioFilter struct {
+	highPass biquadCoefficients
+	lowPass1 biquadCoefficients
+	lowPass2 biquadCoefficients
+	hpState  biquadState
+	lp1State biquadState
+	lp2State biquadState
+}
+
+func NewStreamModulatedAudioFilter(sampleRate int) (*StreamModulatedAudioFilter, error) {
+	if sampleRate < 8000 || sampleRate > 192000 {
+		return nil, errors.New("modulated audio filter sample rate must be within 8000..192000 Hz")
+	}
+	if modulatedAudioLowPassHz >= float64(sampleRate)/2 {
+		return nil, errors.New("modulated audio filter passband is invalid for the selected sample rate")
+	}
+	return &StreamModulatedAudioFilter{
+		highPass: designButterworthBiquad(modulatedAudioHighPassHz, float64(sampleRate), true, 0.7071067811865476),
+		lowPass1: designButterworthBiquad(modulatedAudioLowPassHz, float64(sampleRate), false, 0.541196100146197),
+		lowPass2: designButterworthBiquad(modulatedAudioLowPassHz, float64(sampleRate), false, 1.306562964876377),
+	}, nil
+}
+
+func (f *StreamModulatedAudioFilter) ProcessInPlace(samples []float32) {
+	if f == nil {
+		return
+	}
+	for i, sample := range samples {
+		value := applyBiquad(float64(sample), f.highPass, &f.hpState)
+		value = applyBiquad(value, f.lowPass1, &f.lp1State)
+		value = applyBiquad(value, f.lowPass2, &f.lp2State)
+		if value > 1 {
+			value = 1
+		} else if value < -1 {
+			value = -1
+		}
+		samples[i] = float32(value)
+	}
+}
