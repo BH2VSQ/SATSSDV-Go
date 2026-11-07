@@ -74,7 +74,6 @@ const Translation kTranslations[] = {
     {"显示", "Visible", "表示"}, {"描边", "Outline", "縁取り"},
     {"删除组件", "Delete component", "コンポーネントを削除"},
     {"可直接拖动画布中的组件移动位置，拖动右下角控制点调整字号或图像比例。", "Drag components on the canvas; drag the lower-right handle to resize text or images.", "キャンバス上でコンポーネントをドラッグして移動し、右下のハンドルで文字サイズや画像倍率を調整します。"},
-    {"协议编解码仍在开发验证中，当前版本不应直接用于空中发射。", "Protocol codecs are still under development and validation. Do not use this build for on-air transmission.", "プロトコルコーデックは開発・検証中です。このビルドを実際の送信に使用しないでください。"},
     {"全部图像", "All images", "すべての画像"}, {"仅接收 RX", "RX only", "RX のみ"}, {"仅发送 TX", "TX only", "TX のみ"},
     {"刷新", "Refresh", "更新"}, {"导入图库图片", "Import library image", "ライブラリ画像をインポート"},
     {"导出相册到文件夹", "Export album to folder", "アルバムをフォルダーにエクスポート"},

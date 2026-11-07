@@ -39,7 +39,7 @@ transmitting and receiving stations need compatible implementations.
 - Frames: at most 120.
 - Logical screen: at most 8 megapixels.
 - Cumulative decoded frame area: at most 64 megapixels.
-- Estimated on-air duration: at most 10 minutes per burst.
+- No GIF-specific 10-minute airtime limit. The shared streaming TX layer retains a 24-hour upper bound as a defensive duration/timeout guard.
 - PCSI profiles and multiple visible GIF components are not supported.
 
 ## Native Qt receive support

@@ -257,7 +257,15 @@ func (d *Duplex) TransmitPackets(ctx context.Context, packets [][]float32, onPro
 // TransmitStream holds PTT for one continuous stream while the waveform is
 // generated incrementally and played through a bounded PCM queue. estimatedSamples
 // is used for the TX timeout and progress reporting; it must be positive.
-func (d *Duplex) TransmitStream(ctx context.Context, estimatedSamples int64, producer StreamProducer, onProgress func(float64)) (retErr error) {
+func (d *Duplex) TransmitStream(ctx context.Context, estimatedSamples int64, producer StreamProducer, onProgress func(float64)) error {
+	return d.TransmitStreamWithStart(ctx, estimatedSamples, producer, nil, onProgress)
+}
+
+// TransmitStreamWithStart is TransmitStream with a callback invoked immediately
+// before PCM playback starts (after stream prefill, PTT assertion, and lead time).
+// It lets callers measure actual on-air audio elapsed time rather than counting
+// preparation and PTT lead time as transmitted audio.
+func (d *Duplex) TransmitStreamWithStart(ctx context.Context, estimatedSamples int64, producer StreamProducer, onPlaybackStart func(), onProgress func(float64)) (retErr error) {
 	if d == nil {
 		return ErrClosed
 	}
@@ -279,8 +287,8 @@ func (d *Duplex) TransmitStream(ctx context.Context, estimatedSamples int64, pro
 	}
 	rate := int64(d.sampleRate)
 	// Bound the duration before converting to time.Duration so a malformed
-	// estimate cannot overflow the timeout calculation. Actual image/GIF jobs
-	// are much shorter (GIF TX is capped at ten minutes).
+	// estimate cannot overflow the timeout calculation. The limit is shared by
+	// all streaming transmissions; GIF bursts have no separate 10-minute cap.
 	const maxStreamSeconds = int64(24 * 60 * 60)
 	if estimatedSamples > rate*maxStreamSeconds {
 		d.mu.Unlock()
@@ -337,6 +345,9 @@ func (d *Duplex) TransmitStream(ctx context.Context, estimatedSamples int64, pro
 		if err := wait(txCtx, d.lead); err != nil {
 			return err
 		}
+	}
+	if onPlaybackStart != nil {
+		onPlaybackStart()
 	}
 	if err := session.Play(txCtx); err != nil {
 		return fmt.Errorf("stream TX audio: %w", err)

@@ -126,17 +126,21 @@ func TestTransmitStreamHoldsPTTAcrossProducerAndPlayback(t *testing.T) {
 		t.Fatal(err)
 	}
 	var gotProgress float64
-	err = d.TransmitStream(context.Background(), 5, func(ctx context.Context, emit func([]float32) error) error {
+	playbackStarted := false
+	err = d.TransmitStreamWithStart(context.Background(), 5, func(ctx context.Context, emit func([]float32) error) error {
 		if !d.State().TXActive {
 			return errors.New("TX state was not active while producing")
 		}
 		return emit([]float32{1, 2, 3, 4, 5})
-	}, func(value float64) { gotProgress = value })
+	}, func() { playbackStarted = true }, func(value float64) { gotProgress = value })
 	if err != nil {
 		t.Fatal(err)
 	}
 	if play.calls != 1 || play.count != 5 {
 		t.Fatalf("stream playback calls=%d samples=%d", play.calls, play.count)
+	}
+	if !playbackStarted {
+		t.Fatal("playback-start callback was not invoked")
 	}
 	key.mu.Lock()
 	states := append([]bool(nil), key.states...)
@@ -149,6 +153,38 @@ func TestTransmitStreamHoldsPTTAcrossProducerAndPlayback(t *testing.T) {
 	}
 	if d.State().TXActive {
 		t.Fatal("TX remained active after stream completed")
+	}
+	_ = d.Close()
+}
+
+func TestTransmitStreamPlaybackStartCallbackRunsAfterPTTAndPrefill(t *testing.T) {
+	cap := &fakeCapture{}
+	key := &historyPTT{}
+	play := &fakeStreamPlayback{key: key}
+	d, err := NewDuplex(cap, play, key, 48000, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = d.TransmitStreamWithStart(context.Background(), 5, func(_ context.Context, emit func([]float32) error) error {
+		return emit([]float32{1, 2, 3, 4, 5})
+	}, func() {
+		key.mu.Lock()
+		keyed := len(key.states) > 0 && key.states[len(key.states)-1]
+		key.mu.Unlock()
+		if !keyed {
+			t.Error("playback-start callback ran before PTT was asserted")
+		}
+		if play.calls != 0 {
+			t.Error("playback-start callback ran after playback entered")
+		}
+		called = true
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("playback-start callback was not invoked")
 	}
 	_ = d.Close()
 }

@@ -443,6 +443,17 @@ QString prettyBytes(const QByteArray &data) {
     return QString::number(data.size()) + QStringLiteral(" bytes");
 }
 
+QString formatTXDuration(qint64 seconds) {
+    seconds = qMax<qint64>(0, seconds);
+    const qint64 hours = seconds / 3600;
+    const qint64 minutes = (seconds / 60) % 60;
+    const qint64 remainder = seconds % 60;
+    return QStringLiteral("%1:%2:%3")
+        .arg(hours, 2, 10, QLatin1Char('0'))
+        .arg(minutes, 2, 10, QLatin1Char('0'))
+        .arg(remainder, 2, 10, QLatin1Char('0'));
+}
+
 QString valueOr(const QJsonObject &object, const QString &key, const QString &fallback = QString()) {
     const QString value = object.value(key).toString();
     return value.isEmpty() ? fallback : value;
@@ -1102,6 +1113,13 @@ void MainWindow::buildUi() {
     m_txProgress->setValue(0);
     m_txProgress->setTextVisible(false);
     txLayout->addWidget(m_txProgress);
+    m_txMetrics = new QLabel(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
+        .arg(QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("0"), QStringLiteral("0")), txPane);
+    m_txMetrics->setObjectName(QStringLiteral("txMetrics"));
+    m_txMetrics->setWordWrap(true);
+    m_txMetrics->setMinimumHeight(30);
+    m_txMetrics->setStyleSheet(QStringLiteral("font-size:8pt; color:#586b77; padding:2px 1px; background:transparent; border:0;"));
+    txLayout->addWidget(m_txMetrics);
     auto *txSpectrumTitle = new QHBoxLayout();
     txSpectrumTitle->addWidget(new QLabel(uiText(QStringLiteral("TX 瀑布图")), txPane));
     txSpectrumTitle->addStretch();
@@ -1124,9 +1142,6 @@ void MainWindow::buildUi() {
     split->setStretchFactor(1, 1);
     split->setSizes({760, 790});
     workLayout->addWidget(split, 1);
-    auto *warning = new QLabel(uiText(QStringLiteral("协议编解码仍在开发验证中，当前版本不应直接用于空中发射。")), workbench);
-    warning->setStyleSheet(QStringLiteral("background:#f7f0df; border-top:1px solid #e0d2ac; color:#8b7441; padding:5px 8px; font-size:8pt;"));
-    workLayout->addWidget(warning);
     tabs->addTab(workbench, uiText(QStringLiteral("工作台")));
 
     // Album cards replace the data table. Each card keeps the image itself as
@@ -2114,6 +2129,15 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         }
     } else if(name==QStringLiteral("tx:progress")){
         m_txProgress->setValue(static_cast<int>(payloadValue.toDouble()*1000.0));
+    } else if(name==QStringLiteral("tx:metrics")){
+        const auto p = payloadValue.toObject();
+        const QString estimated = formatTXDuration(p.value(QStringLiteral("estimatedSeconds")).toInteger());
+        const QString elapsed = formatTXDuration(p.value(QStringLiteral("elapsedSeconds")).toInteger());
+        const QString remaining = formatTXDuration(p.value(QStringLiteral("remainingSeconds")).toInteger());
+        const qint64 sent = qMax<qint64>(0, p.value(QStringLiteral("sentDataFrames")).toInteger());
+        const qint64 total = qMax<qint64>(0, p.value(QStringLiteral("totalDataFrames")).toInteger());
+        m_txMetrics->setText(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
+            .arg(estimated, elapsed, remaining).arg(sent).arg(total));
     } else if(name==QStringLiteral("tx:state")){
         m_txActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
         if (m_txSpectrum) m_txSpectrum->setStreaming(m_txActive);
@@ -2425,6 +2449,9 @@ void MainWindow::startTX() {
     if (m_txPreparing || m_txActive || !m_backend || !m_backend->isRunning()) return;
     if (!m_audioConnected) { showError(uiText(QStringLiteral("音频后端异常"))); return; }
     m_txPreparing = true;
+    m_txProgress->setValue(0);
+    m_txMetrics->setText(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
+        .arg(QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("0"), QStringLiteral("0")));
     updateRepeatControls();
     updateTXToggle();
 

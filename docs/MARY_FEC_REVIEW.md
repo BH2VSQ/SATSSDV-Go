@@ -1,0 +1,139 @@
+# QPSK / 8PSK / 16QAM FEC review (read-only audit)
+
+Date: 2026-11-07
+
+This document records an inspection of the existing QPSK, 8PSK and 16QAM
+transport paths. No FEC, interleaver, demapper or profile parameters were
+changed as part of this review.
+
+## Current configuration
+
+All three profiles use 1600 symbols/s and 48 kHz audio:
+
+| Profile | Bits/symbol | Gross bit rate | Current image-packet FEC |
+|---|---:|---:|---|
+| QPSK | 2 | 3.2 kbit/s | SSDV RS8, RS(255,223), 32 parity symbols |
+| 8PSK | 3 | 4.8 kbit/s | SSDV RS8, RS(255,223), 32 parity symbols |
+| 16QAM | 4 | 6.4 kbit/s | SSDV RS8, RS(255,223), 32 parity symbols |
+
+`internal/tximage/encode.go` and `internal/gifmode/gif.go` both request
+`FEC: true`. For each 256-byte SSDV packet, bytes 1..255 form the shortened
+RS8 codeword: 223 data symbols plus 32 parity symbols. The decoder corrects
+up to 16 erroneous byte symbols in that codeword, then validates the packet
+CRC32. The leading sync byte is outside that RS codeword. This packet-level
+RS8 layer is common to all three M-ary modulation profiles.
+
+The M-ary layer currently adds no separate convolutional, turbo or LDPC FEC.
+It sends a 96-symbol known BPSK training word, then Gray-labelled constellation
+symbols carrying the CCSDS ASM and PN-randomized 256-byte SSDV packet. The
+randomizer whitens the payload; it does not add redundancy. ASM acquisition
+accepts a 32-bit word within one bit of the reference ASM, which helps frame
+synchronization but does not correct payload bits.
+
+The receive modem currently makes hard constellation decisions. QPSK uses
+quadrant decisions; 8PSK and 16QAM choose the nearest constellation point or
+nearest PAM level. The demapper does not expose per-bit log-likelihood ratios
+(LLRs), so downstream RS8 sees bytes after hard decisions only.
+
+## What this means for the three modes
+
+The packet FEC strength is identical in QPSK, 8PSK and 16QAM. Their RF/audio
+robustness is not identical:
+
+- QPSK has the widest constellation decision margin at equal average symbol
+  energy and is expected to be the most tolerant of noise and residual phase
+  error.
+- 8PSK has closer angular decision boundaries than QPSK.
+- 16QAM has closer normalized point spacing and additionally depends on
+  amplitude accuracy, so it is the most sensitive to compression, clipping,
+  gain changes and nonlinear audio paths.
+
+The current receiver has training-based amplitude/phase/frequency acquisition
+and decision-directed tracking, but this is synchronization/equalization, not
+FEC. Existing software tests cover clean loopback and selected frequency
+offset/gain/filter cases. They do not establish AWGN, burst-fade or real-radio
+packet-error performance.
+
+## Recommended improvements (not implemented)
+
+### Priority 1: soft-decision demapping
+
+Change the M-ary receive path to retain the complex matched-filter symbol and
+produce bit LLRs rather than immediately slicing to hard bits. Use measured
+noise variance from the training/residual symbols to normalize confidence.
+For 16QAM, per-bit LLRs are especially valuable because inner and outer points
+have different reliability. This requires a compatible inner FEC code; merely
+calculating LLRs while continuing to discard them before RS8 will not improve
+correction.
+
+### Priority 2: add a selectable inner FEC profile
+
+Keep the existing per-packet RS8 unchanged as the outer packet-integrity layer.
+Add an optional channel-code layer around the CCSDS randomized data payload,
+with ASM/training acquisition kept separately recognizable. Candidate
+experiments:
+
+- Constraint-length-7 convolutional code with soft-decision Viterbi decoding:
+  rate 1/2 as a robust baseline, then punctured 2/3 and 3/4 variants for
+  throughput/robustness trade-offs.
+- A modern LDPC option at a moderate code rate if a block decoder and its
+  latency/CPU budget are acceptable.
+
+Do not select code rates based on intuition alone. Compare packet success rate
+at equal on-air duration and equal information payload. QPSK can reasonably be
+offered with a lower code rate; 8PSK/16QAM should be measured with more
+conservative margins, but the final mapping should be configurable and tested.
+
+### Priority 3: symbol/byte interleaving
+
+Add a bounded block interleaver across multiple transport data units, then
+reverse it before RS8 packet parsing. Start with depths 4 and 8. This can turn a
+short continuous fade or impulse burst into dispersed errors that individual
+RS8 codewords can correct. Interleaving adds latency and buffering and must be
+specified on-air. It does not recover an entire packet that was completely
+lost/erased.
+
+### Priority 4: packet-erasure recovery
+
+The existing RS8 code repairs corrupted symbols inside a received packet. It
+cannot recreate a whole missing SSDV packet. For unacknowledged/simplex
+transmission, add packet-level erasure coding across groups of source packets
+(e.g. systematic K data + R parity) or a fountain-code layer. A small initial
+experiment such as K=8 with R=2 can quantify the 20% parity overhead and
+recover up to two erased packets per group when enough independent equations
+arrive. Larger groups or fountain coding can handle less predictable loss at
+higher implementation complexity. This is the feature most directly related
+to whole-frame/packet loss rather than bit corruption.
+
+### Priority 5: link adaptation and instrumentation
+
+Record per profile: training quality, estimated noise variance, carrier/phase
+tracking error, hard/soft BER estimate, RS8 corrected-symbol count, CRC failure,
+ASM loss, missing packet count and reconstructed-image coverage. Use measured
+curves to define QPSK/8PSK/16QAM operating recommendations. Avoid fixed SNR
+switch thresholds until a repeatable AWGN and recorded-radio test matrix exists.
+
+## Suggested validation matrix
+
+1. AWGN sweeps per modulation and FEC rate; report BER and complete SSDV packet
+   success, not only raw bit recovery.
+2. Burst errors and short fades with/without interleaving depths 4 and 8.
+3. Erasure simulation at 1%, 3%, 5%, 10% and burst loss patterns for packet
+   parity/fountain candidates.
+4. Carrier offset, sample-clock offset, audio gain variation and clipping.
+5. Real WAV/audio loopback and actual radio/SDR captures once available.
+6. Compare image completion/coverage and useful image bits per second at equal
+   transmit airtime.
+
+## Source inspection points
+
+- `internal/domain/profile.go`: three 1600-baud M-ary profiles and raw rates.
+- `internal/tximage/encode.go`: static SSDV packet generation with `FEC: true`.
+- `internal/gifmode/gif.go`: GIF frame packet generation with `FEC: true`.
+- `internal/fec/rs8.go`: RS8 parameters and correction implementation.
+- `internal/image/ssdv/packet.go`: RS8 correction followed by CRC32 validation.
+- `internal/modem/mary/modem.go`: constellation mapping, hard decisions and
+  training/decision-directed receiver.
+- `internal/modem/ccsds/frame.go`: ASM and PN randomization; no payload FEC.
+
+No FEC or modulation code was changed for this review.

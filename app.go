@@ -687,11 +687,6 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 			frames = nil
 			gifData, base, overlay = nil, nil, nil
 			airtime := gifmode.EstimateAirtime(stats.TotalPackets, parsedProfile.BitRate)
-			if airtime > 10*time.Minute {
-				prepareErr = fmt.Errorf("GIF template requires an estimated %s of airtime (%d packets); the GIF mode safety limit is 10 minutes", airtime.Round(time.Second), stats.TotalPackets)
-				prepared = true
-				return prepareErr
-			}
 			transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: audioRate}
 			if parsedProfile.LinkLayer == "AX.25 UI / HDLC" {
 				transportConfig.Source = ax25.Address{Callsign: currentCallsign, SSID: uint8(ax25SSID)}
@@ -732,7 +727,9 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		startedAt := time.Now().UTC()
+		var startedAt time.Time
+		estimatedDuration := durationForSamples(estimatedSamples, waveformRate)
+		totalDataFrames := stats.TotalPackets
 		producer := func(streamCtx context.Context, emit func([]float32) error) error {
 			streamedSamples, streamErr := encoder.StreamPackets(streamCtx, packets, func(block []float32) error {
 				if emitErr := emit(block); emitErr != nil {
@@ -746,8 +743,12 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 			}
 			return streamErr
 		}
-		if err := duplex.TransmitStream(ctx, estimatedSamples, producer, func(progress float64) {
+		if err := duplex.TransmitStreamWithStart(ctx, estimatedSamples, producer, func() {
+			startedAt = time.Now().UTC()
+			a.emitTXMetrics(startedAt, estimatedDuration, totalDataFrames, 0)
+		}, func(progress float64) {
 			a.emitTXProgress(nil, waveformRate, progress)
+			a.emitTXMetrics(startedAt, estimatedDuration, totalDataFrames, progress)
 		}); err != nil {
 			return err
 		}
@@ -871,7 +872,9 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 		return err
 	}
 	a.emit("tx:progress", 0.0)
-	transmissionStartedAt := time.Now().UTC()
+	var transmissionStartedAt time.Time
+	totalDataFrames := len(prepared.Packets)
+	estimatedDuration := durationForSamples(estimatedSamples, prepared.SampleRate)
 	producer := func(streamCtx context.Context, emit func([]float32) error) error {
 		streamedSamples, streamErr := prepared.Encoder.StreamPackets(streamCtx, prepared.Packets, func(block []float32) error {
 			if emitErr := emit(block); emitErr != nil {
@@ -885,8 +888,12 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 		}
 		return streamErr
 	}
-	if err := duplex.TransmitStream(ctx, estimatedSamples, producer, func(progress float64) {
+	if err := duplex.TransmitStreamWithStart(ctx, estimatedSamples, producer, func() {
+		transmissionStartedAt = time.Now().UTC()
+		a.emitTXMetrics(transmissionStartedAt, estimatedDuration, totalDataFrames, 0)
+	}, func(progress float64) {
 		a.emitTXProgress(nil, prepared.SampleRate, progress)
+		a.emitTXMetrics(transmissionStartedAt, estimatedDuration, totalDataFrames, progress)
 	}); err != nil {
 		return err
 	}
@@ -985,6 +992,65 @@ func (a *App) archiveTXGIFData(data []byte, width, height int, profileID, callsi
 		return err
 	}
 	return nil
+}
+
+// durationForSamples converts an exact PCM sample estimate to a wall-clock
+// duration without including preparation time or PTT lead/tail delays.
+func durationForSamples(samples int64, sampleRate int) time.Duration {
+	if samples <= 0 || sampleRate <= 0 {
+		return 0
+	}
+	return time.Duration(float64(samples) / float64(sampleRate) * float64(time.Second))
+}
+
+// buildTXMetrics creates the UI payload. Data-frame progress is derived from
+// the played PCM fraction; all SSDV transport frames have a fixed 256-byte
+// packet size, so this is a monotonic estimate of frames that have reached the
+// audio output. GIF control markers are included because they are also full
+// 256-byte transport frames; AX.25 bit stuffing may make individual boundaries vary.
+func buildTXMetrics(startedAt, now time.Time, estimated time.Duration, totalFrames int, progress float64) map[string]any {
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 1 {
+		progress = 1
+	}
+	if totalFrames < 0 {
+		totalFrames = 0
+	}
+	elapsed := time.Duration(0)
+	if !startedAt.IsZero() && now.After(startedAt) {
+		elapsed = now.Sub(startedAt)
+	}
+	remaining := estimated - elapsed
+	if remaining < 0 || progress >= 1 {
+		remaining = 0
+	}
+	sentFrames := int(math.Floor(float64(totalFrames) * progress))
+	if progress >= 1 {
+		sentFrames = totalFrames
+	}
+	secondsCeil := func(d time.Duration) int {
+		if d <= 0 {
+			return 0
+		}
+		return int((d + time.Second - 1) / time.Second)
+	}
+	return map[string]any{
+		"estimatedSeconds": secondsCeil(estimated),
+		"elapsedSeconds":   int(elapsed / time.Second),
+		"remainingSeconds": secondsCeil(remaining),
+		"totalDataFrames":  totalFrames,
+		"sentDataFrames":   sentFrames,
+		"progress":         progress,
+	}
+}
+
+func (a *App) emitTXMetrics(startedAt time.Time, estimated time.Duration, totalFrames int, progress float64) {
+	if startedAt.IsZero() {
+		return
+	}
+	a.emit("tx:metrics", buildTXMetrics(startedAt, time.Now(), estimated, totalFrames, progress))
 }
 
 func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64) {

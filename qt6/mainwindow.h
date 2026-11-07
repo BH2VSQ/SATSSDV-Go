@@ -117,6 +117,7 @@ private:
     QCheckBox *m_repeat = nullptr;
     QSpinBox *m_repeatInterval = nullptr;
     QProgressBar *m_txProgress = nullptr;
+    QLabel *m_txMetrics = nullptr;
     QLabel *m_audioStatus = nullptr;
     QLabel *m_rxStatus = nullptr;
     QLabel *m_rxMeta = nullptr;
