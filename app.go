@@ -57,6 +57,7 @@ type App struct {
 	rxSpectrumMu       sync.Mutex
 	rxPreviewMu        sync.RWMutex
 	rxPreviewPNG       []byte
+	rxPreviewGIF       []byte
 	rxSpectrumWindow   []float32
 	rxSpectrumLastEmit time.Time
 	txSpectrumMu       sync.Mutex
@@ -1300,6 +1301,10 @@ func (a *App) archiveRXGIF(update rxengine.Update) error {
 			}
 		}
 	}
+	// The completed animated file becomes the live RX preview. Progressive PNG
+	// frame snapshots are useful while receiving, but leaving the last PNG in
+	// this slot would make the main RX pane appear frozen after GIF completion.
+	a.setLatestRXGIF(data)
 	return nil
 }
 
@@ -1328,6 +1333,21 @@ func (a *App) setLatestRXPreview(data []byte) {
 	copyOfData := append([]byte(nil), data...)
 	a.rxPreviewMu.Lock()
 	a.rxPreviewPNG = copyOfData
+	// A newer progressive still-image preview supersedes the previous GIF.
+	a.rxPreviewGIF = nil
+	a.rxPreviewMu.Unlock()
+}
+
+func (a *App) setLatestRXGIF(data []byte) {
+	if a == nil || len(data) == 0 || len(data) > 16*1024*1024 {
+		return
+	}
+	if _, err := gif.DecodeConfig(bytes.NewReader(data)); err != nil {
+		return
+	}
+	copyOfData := append([]byte(nil), data...)
+	a.rxPreviewMu.Lock()
+	a.rxPreviewGIF = copyOfData
 	a.rxPreviewMu.Unlock()
 }
 
@@ -1773,8 +1793,12 @@ func (a *App) GetGalleryImageData(id string) (string, error) {
 // GetLatestRXImageData returns the newest archived RX image for template layers.
 func (a *App) GetLatestRXImageData() (string, error) {
 	a.rxPreviewMu.RLock()
+	animated := append([]byte(nil), a.rxPreviewGIF...)
 	preview := append([]byte(nil), a.rxPreviewPNG...)
 	a.rxPreviewMu.RUnlock()
+	if len(animated) > 0 {
+		return "data:image/gif;base64," + base64.StdEncoding.EncodeToString(animated), nil
+	}
 	if len(preview) > 0 {
 		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(preview), nil
 	}

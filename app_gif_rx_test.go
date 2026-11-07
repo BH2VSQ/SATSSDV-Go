@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"image"
 	"image/color"
 	"image/draw"
@@ -63,8 +65,17 @@ func TestReceivedGIFIsDecodedAndArchivedAsAnimatedAlbumItem(t *testing.T) {
 	if finalUpdate.Codec != "SSDV-GIF" || finalUpdate.GIFFrame != 2 || finalUpdate.PNGBase64 == "" {
 		t.Fatalf("unexpected final GIF update: %+v", finalUpdate)
 	}
-	if err := app.archiveRXGIF(finalUpdate); err != nil {
-		t.Fatalf("archive reconstructed GIF: %v", err)
+	// Exercise the same completion handler used by live RX. It must replace
+	// the progressive PNG preview with the completed animated GIF before
+	// publishing rx:image, so the native RX pane can start animation playback.
+	app.handleRXImageUpdate(finalUpdate)
+
+	latestPreview, err := app.GetLatestRXImageData()
+	if err != nil {
+		t.Fatalf("get latest RX preview after GIF completion: %v", err)
+	}
+	if !strings.HasPrefix(latestPreview, "data:image/gif;base64,") {
+		t.Fatalf("completed GIF did not become the live RX preview; got %q", latestPreview[:min(len(latestPreview), 48)])
 	}
 
 	records, err := app.GetAlbum()
@@ -88,6 +99,14 @@ func TestReceivedGIFIsDecodedAndArchivedAsAnimatedAlbumItem(t *testing.T) {
 	}
 	if len(decoded.Image) != 2 || len(decoded.Delay) != 2 || decoded.Delay[1] != 18 {
 		t.Fatalf("archived GIF lost frames/delays: frames=%d delays=%v", len(decoded.Image), decoded.Delay)
+	}
+	previewBytes, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(latestPreview, "data:image/gif;base64,"))
+	if err != nil {
+		t.Fatalf("decode latest RX preview GIF data URL: %v", err)
+	}
+	previewAnimation, err := gif.DecodeAll(bytes.NewReader(previewBytes))
+	if err != nil || len(previewAnimation.Image) != 2 {
+		t.Fatalf("latest RX preview is not an animated two-frame GIF: frames=%d err=%v", len(previewAnimation.Image), err)
 	}
 
 	dataURL, err := app.GetAlbumImageData(records[0].ID)

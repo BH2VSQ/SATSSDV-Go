@@ -79,11 +79,42 @@ public:
     }
 
     void setSourceImage(const QImage &image) {
+        clearMovie();
         m_source = image;
         updatePixmap();
     }
 
+    bool setSourceGIF(const QByteArray &data) {
+        clearMovie();
+        m_source = QImage();
+        setPixmap(QPixmap());
+        setText(QString());
+
+        m_movieBuffer = new QBuffer(this);
+        m_movieBuffer->setData(data);
+        if (!m_movieBuffer->open(QIODevice::ReadOnly)) {
+            clearMovie();
+            return false;
+        }
+        m_movie = new QMovie(m_movieBuffer, QByteArrayLiteral("gif"), this);
+        if (!m_movie->isValid() || !m_movie->jumpToFrame(0)) {
+            clearMovie();
+            return false;
+        }
+        m_movie->setCacheMode(QMovie::CacheAll);
+        m_movieOriginalSize = m_movie->currentImage().size();
+        updateMovieScale();
+        if (!m_movie->jumpToFrame(0)) {
+            clearMovie();
+            return false;
+        }
+        setMovie(m_movie);
+        m_movie->start();
+        return true;
+    }
+
     void clearSourceImage() {
+        clearMovie();
         m_source = QImage();
         setPixmap(QPixmap());
         setText(uiText(QStringLiteral("等待图像")));
@@ -92,10 +123,32 @@ public:
 protected:
     void resizeEvent(QResizeEvent *event) override {
         QLabel::resizeEvent(event);
-        updatePixmap();
+        if (m_movie) updateMovieScale();
+        else updatePixmap();
     }
 
 private:
+    void clearMovie() {
+        if (m_movie) {
+            m_movie->stop();
+            setMovie(nullptr);
+            delete m_movie;
+            m_movie = nullptr;
+        }
+        if (m_movieBuffer) {
+            m_movieBuffer->close();
+            delete m_movieBuffer;
+            m_movieBuffer = nullptr;
+        }
+        m_movieOriginalSize = QSize();
+    }
+
+    void updateMovieScale() {
+        if (!m_movie || m_movieOriginalSize.isEmpty() || contentsRect().isEmpty()) return;
+        const QSize scaled = m_movieOriginalSize.scaled(contentsRect().size(), Qt::KeepAspectRatio);
+        if (!scaled.isEmpty()) m_movie->setScaledSize(scaled);
+    }
+
     void updatePixmap() {
         if (m_source.isNull()) {
             setPixmap(QPixmap());
@@ -108,6 +161,9 @@ private:
     }
 
     QImage m_source;
+    QBuffer *m_movieBuffer = nullptr;
+    QMovie *m_movie = nullptr;
+    QSize m_movieOriginalSize;
 };
 
 class SpectrumWaterfallWidget final : public QWidget {
@@ -1862,7 +1918,9 @@ void MainWindow::handleEvent(const QJsonObject &event) {
     const QString name=event.value(QStringLiteral("name")).toString(); const QJsonValue payloadValue=event.value(QStringLiteral("payload"));
     if(name==QStringLiteral("rx:image")){
         const auto payload=payloadValue.toObject();
-        if(payload.value(QStringLiteral("hasPreview")).toBool()) refreshLatestRXPreview();
+        if (payload.value(QStringLiteral("hasPreview")).toBool() || payload.value(QStringLiteral("gifEnd")).toBool()) {
+            refreshLatestRXPreview();
+        }
         m_templateImageCache.remove(QStringLiteral("last-rx"));
         refreshTemplateCanvas();
         const QString profile = payload.value(QStringLiteral("profile")).toString();
@@ -2956,7 +3014,18 @@ void MainWindow::selectTemplateBackground() {
     selectInlineGalleryAsset();
 }
 
-void MainWindow::showImage(const QString &dataUrl, ImagePreviewLabel *target) { const QImage image = imageFromDataUrl(dataUrl); if (!image.isNull()) target->setSourceImage(image); }
+void MainWindow::showImage(const QString &dataUrl, ImagePreviewLabel *target) {
+    if (!target || dataUrl.isEmpty()) return;
+    if (dataUrl.startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive)) {
+        const qsizetype separator = dataUrl.indexOf(QLatin1Char(','));
+        if (separator >= 0) {
+            const QByteArray gifData = QByteArray::fromBase64(dataUrl.mid(separator + 1).toLatin1());
+            if (target->setSourceGIF(gifData)) return;
+        }
+    }
+    const QImage image = imageFromDataUrl(dataUrl);
+    if (!image.isNull()) target->setSourceImage(image);
+}
 void MainWindow::appendLog(const QString &text){if(m_log){m_log->append(QStringLiteral("[%1] %2").arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")),text));}}
 void MainWindow::showError(const QString &message) {
     appendLog(uiText(QStringLiteral("错误：")) + message);
