@@ -13,6 +13,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,7 @@ const (
 	maxSSDVPackets        = 8192
 	sessionRetention      = 3 * time.Minute
 	sessionSweepInterval  = 30 * time.Second
+	gifPartialArchiveIdle = 2 * time.Second
 )
 
 type Update struct {
@@ -61,13 +63,18 @@ type Update struct {
 	GIFStart                bool    `json:"gifStart,omitempty"`
 	GIFEnd                  bool    `json:"gifEnd,omitempty"`
 	GIFSaved                bool    `json:"gifSaved,omitempty"`
-	GIFSaveError            string  `json:"gifSaveError,omitempty"`
-	FrameDurationMS         int     `json:"frameDurationMs,omitempty"`
-	Error                   string  `json:"error,omitempty"`
-	Started                 bool    `json:"started,omitempty"`
-	SessionID               string  `json:"sessionId,omitempty"`
-	HasAX25SSID             bool    `json:"hasAX25SSID,omitempty"`
-	AX25SourceSSID          uint8   `json:"ax25SourceSSID,omitempty"`
+	GIFPartialArchive       bool    `json:"gifPartialArchive,omitempty"`
+	GIFFrameAbandoned       bool    `json:"gifFrameAbandoned,omitempty"`
+
+	GIFAwaitingKeyframe bool   `json:"gifAwaitingKeyframe,omitempty"`
+	GIFStreamIncomplete bool   `json:"gifStreamIncomplete,omitempty"`
+	GIFSaveError        string `json:"gifSaveError,omitempty"`
+	FrameDurationMS     int    `json:"frameDurationMs,omitempty"`
+	Error               string `json:"error,omitempty"`
+	Started             bool   `json:"started,omitempty"`
+	SessionID           string `json:"sessionId,omitempty"`
+	HasAX25SSID         bool   `json:"hasAX25SSID,omitempty"`
+	AX25SourceSSID      uint8  `json:"ax25SourceSSID,omitempty"`
 }
 
 type imageSession struct {
@@ -185,6 +192,8 @@ func (m *Manager) DroppedPackets() uint64 {
 
 func (m *Manager) run() {
 	defer close(m.done)
+	gifArchiveTicker := time.NewTicker(500 * time.Millisecond)
+	defer gifArchiveTicker.Stop()
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -195,8 +204,79 @@ func (m *Manager) run() {
 			}
 		case result := <-m.reconResult:
 			m.finishReconstruction(result)
+		case now := <-gifArchiveTicker.C:
+			if m.on == nil {
+				continue
+			}
+			for _, update := range m.collectIdleGIFArchiveUpdates(now) {
+				m.on(update)
+			}
 		}
 	}
+}
+
+// collectIdleGIFArchiveUpdates emits a checkpoint after a GIF stream has been
+// quiet long enough. This makes a partially received animation durable even
+// when RF reception stops before a frame-close or stream-end marker arrives.
+// The caller archives the snapshot and acknowledges it with
+// MarkGIFSnapshotArchived; failed saves remain dirty and are retried later.
+func (m *Manager) collectIdleGIFArchiveUpdates(now time.Time) []Update {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	updates := make([]Update, 0)
+	for _, stream := range m.gifStreams {
+		if stream == nil || stream.complete || !stream.archiveDirty || now.Sub(stream.lastUpdate) < gifPartialArchiveIdle {
+			continue
+		}
+		if !hasGIFSnapshotLocked(stream) {
+			continue
+		}
+		if !stream.lastPartialArchive.IsZero() && now.Sub(stream.lastPartialArchive) < gifPartialArchiveIdle {
+			continue
+		}
+		imageID := stream.lastFrameID
+		if stream.pending != nil {
+			imageID = stream.pending.imageID
+		}
+		width, height := 0, 0
+		if stream.pending != nil {
+			width, height = stream.pending.width, stream.pending.height
+		}
+		if stream.canvas != nil {
+			width, height = stream.canvas.Bounds().Dx(), stream.canvas.Bounds().Dy()
+		}
+		updates = append(updates, Update{
+			Profile: stream.profile, Codec: "SSDV-GIF", Callsign: stream.callsign,
+			ImageID: imageID, PacketsReceived: stream.packetsReceived,
+			PacketsExpected: stream.packetsExpected, ImageWidth: width, ImageHeight: height,
+			GIFMode: true, GIFPartialArchive: true, GIFStreamIncomplete: true,
+			GIFAwaitingKeyframe: stream.awaitingKeyframe, SessionID: stream.sessionID,
+			HasAX25SSID: stream.hasSSID, AX25SourceSSID: stream.ssid,
+		})
+		stream.lastPartialArchive = now
+	}
+	return updates
+}
+
+// MarkGIFSnapshotArchived clears the dirty bit after the application has
+// atomically persisted a partial or complete GIF snapshot to the album.
+func (m *Manager) MarkGIFSnapshotArchived(sessionID string) bool {
+	if m == nil || strings.TrimSpace(sessionID) == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, stream := range m.gifStreams {
+		if stream.sessionID == sessionID {
+			stream.archiveDirty = false
+			stream.lastPartialArchive = time.Now()
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) runReconstruction() {

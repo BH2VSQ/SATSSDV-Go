@@ -2104,8 +2104,17 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         const int gifFrame = payload.value(QStringLiteral("gifFrame")).toInt();
         const bool gifFrameComplete = payload.value(QStringLiteral("gifFrameComplete")).toBool();
         const bool gifEnd = payload.value(QStringLiteral("gifEnd")).toBool();
+        const bool gifSaved = payload.value(QStringLiteral("gifSaved")).toBool();
+        const bool gifFrameAbandoned = payload.value(QStringLiteral("gifFrameAbandoned")).toBool();
+        const bool gifAwaitingKeyframe = payload.value(QStringLiteral("gifAwaitingKeyframe")).toBool();
+        QString gifReceiveState = gifFrameComplete ? uiText(QStringLiteral("帧完成")) : uiText(QStringLiteral("解码中"));
+        if (gifFrameAbandoned) {
+            gifReceiveState = uiText(QStringLiteral("帧不完整，继续重同步"));
+        } else if (gifAwaitingKeyframe) {
+            gifReceiveState = uiText(QStringLiteral("等待关键帧，增量帧仍继续接收"));
+        }
         const QString receiveMode = gifMode
-            ? uiText(QStringLiteral("GIF 第 %1 帧 · %2")).arg(gifFrame).arg(gifFrameComplete ? uiText(QStringLiteral("帧完成")) : uiText(QStringLiteral("解码中")))
+            ? uiText(QStringLiteral("GIF 第 %1 帧 · %2")).arg(gifFrame).arg(gifReceiveState)
             : (complete ? uiText(QStringLiteral("完成")) : uiText(QStringLiteral("接收中")));
         m_rxStatus->setText(QStringLiteral("%1 · %2 · %3% · %4")
             .arg(shownProfile, callsign).arg(coverage, 0, 'f', 1).arg(receiveMode));
@@ -2113,10 +2122,14 @@ void MainWindow::handleEvent(const QJsonObject &event) {
             .arg(callsign, ssid).arg(imageId).arg(received).arg(expected).arg(shownProfile));
         if (gifMode && !payload.value(QStringLiteral("gifSaveError")).toString().isEmpty()) {
             statusBar()->showMessage(uiText(QStringLiteral("GIF 已解码，但相册保存失败：%1")).arg(payload.value(QStringLiteral("gifSaveError")).toString()), 8000);
-        } else if (gifMode && gifEnd && payload.value(QStringLiteral("gifSaved")).toBool()) {
+        } else if (gifMode && gifEnd && gifSaved && payload.value(QStringLiteral("gifStreamIncomplete")).toBool()) {
+            statusBar()->showMessage(uiText(QStringLiteral("GIF 接收中断，已保存可解码的部分动画（%1 帧）")).arg(gifFrame), 6000);
+        } else if (gifMode && gifEnd && gifSaved) {
             statusBar()->showMessage(uiText(QStringLiteral("GIF 动图接收完成并已保存到相册（%1 帧）")).arg(gifFrame), 5000);
+        } else if (gifMode && gifSaved) {
+            statusBar()->showMessage(uiText(QStringLiteral("GIF 部分接收内容已自动保存到相册")), 3500);
         }
-        if (gifMode ? gifEnd : complete) refreshAlbum();
+        if (gifMode ? gifSaved || gifEnd : complete) refreshAlbum();
     } else if(name==QStringLiteral("rx:level")){
         const auto p=payloadValue.toObject();m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
     } else if(name==QStringLiteral("rx:spectrum")||name==QStringLiteral("tx:spectrum")){

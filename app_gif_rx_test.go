@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/gifmode"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	rxengine "github.com/BH2VSQ/SATSSDV-Go/internal/rx"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/transport"
 )
@@ -119,4 +120,71 @@ func TestReceivedGIFIsDecodedAndArchivedAsAnimatedAlbumItem(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(app.dataDir, "album.json")); err != nil {
 		t.Fatalf("GIF album index was not persisted: %v", err)
 	}
+}
+
+func TestInterruptedGIFIsAutomaticallyArchivedAsPartialAnimation(t *testing.T) {
+	frame := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	for y := 0; y < frame.Bounds().Dy(); y++ {
+		for x := 0; x < frame.Bounds().Dx(); x++ {
+			frame.SetRGBA(x, y, color.RGBA{R: uint8(x % 251), G: uint8(y % 239), B: 80, A: 255})
+		}
+	}
+	packets, _, err := gifmode.Encode([]gifmode.Frame{{Image: frame, DelayCS: 12}}, "N0CALL", 119, 4)
+	if err != nil {
+		t.Fatalf("encode partial GIF fixture: %v", err)
+	}
+
+	app := &App{dataDir: t.TempDir(), events: NewEventBroker()}
+	manager := rxengine.NewManager(app.handleRXImageUpdate)
+	app.rxManager = manager
+	defer manager.Close()
+
+	dataPackets := 0
+	for _, raw := range packets {
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if parsed.GIFControl && parsed.GIFFrameEnd {
+			continue // Simulate loss of the frame-close and stream-end markers.
+		}
+		if !parsed.GIFControl {
+			dataPackets++
+		}
+		if !manager.Submit(transport.ReceivedPacket{Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Raw: raw}) {
+			t.Fatal("submit partial GIF packet")
+		}
+	}
+	if dataPackets < 2 {
+		t.Fatalf("fixture unexpectedly has only %d data packets", dataPackets)
+	}
+
+	deadline := time.Now().Add(7 * time.Second)
+	for time.Now().Before(deadline) {
+		records, albumErr := app.GetAlbum()
+		if albumErr != nil {
+			t.Fatalf("read album while waiting for partial GIF checkpoint: %v", albumErr)
+		}
+		if len(records) > 0 {
+			record := records[0]
+			if record.Status != "partial" {
+				t.Fatalf("interrupted GIF album item status=%q, want partial", record.Status)
+			}
+			if !strings.HasSuffix(strings.ToLower(record.ImagePath), ".gif") {
+				t.Fatalf("partial RX animation was not saved as GIF: %s", record.ImagePath)
+			}
+			file, openErr := os.Open(record.ImagePath)
+			if openErr != nil {
+				t.Fatalf("open partial GIF album item: %v", openErr)
+			}
+			decoded, decodeErr := gif.DecodeAll(file)
+			_ = file.Close()
+			if decodeErr != nil || len(decoded.Image) == 0 {
+				t.Fatalf("partial album GIF is not playable: frames=%d err=%v", len(decoded.Image), decodeErr)
+			}
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("interrupted GIF was not automatically checkpointed into the album")
 }

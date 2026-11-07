@@ -520,3 +520,214 @@ func absIntRX(v int) int {
 	}
 	return v
 }
+
+func TestGIFRXResynchronizesAfterIncompleteKeyframeAndContinuesDeltaFrames(t *testing.T) {
+	const width, height = 320, 240
+	const baseImageID = uint8(70)
+	frames := make([]gifmode.Frame, 13)
+	for index := range frames {
+		frame := image.NewRGBA(image.Rect(0, 0, width, height))
+		for y := 0; y < height; y++ {
+			for x := 0; x < width; x++ {
+				frame.SetRGBA(x, y, color.RGBA{R: 24, G: 48, B: 72, A: 255})
+			}
+		}
+		// Move a textured 4x4-MCU object by one MCU per frame. This keeps the
+		// frames sparse while providing independently decodable delta regions.
+		object := image.NewRGBA(image.Rect(0, 0, 64, 64))
+		for y := 0; y < 64; y++ {
+			for x := 0; x < 64; x++ {
+				object.SetRGBA(x, y, color.RGBA{
+					R: uint8((x*7 + y*3 + 11) % 255),
+					G: uint8((x*5 + y*13 + 29) % 255),
+					B: uint8((x*17 + y*2 + 47) % 255), A: 255,
+				})
+			}
+		}
+		x := 32 + (index%8)*16
+		draw.Draw(frame, image.Rect(x, 64, x+64, 128), object, object.Bounds().Min, draw.Src)
+		frames[index] = gifmode.Frame{Image: frame, DelayCS: uint16(8 + index)}
+	}
+	packets, stats, err := gifmode.EncodeContextV2(context.Background(), frames, "N0CALL", baseImageID, 4)
+	if err != nil {
+		t.Fatalf("encode recovery GIF: %v", err)
+	}
+	if stats.Keyframes < 2 {
+		t.Fatalf("test stream needs a periodic recovery keyframe, stats=%+v", stats)
+	}
+
+	manager := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+	var firstFrameAbandoned, awaitingKeyframe bool
+	deltaPreviews := 0
+	var final Update
+	for _, raw := range packets {
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		// Simulate a completely missed initial keyframe payload while preserving
+		// its open/close controls. Subsequent delta frames and the periodic
+		// recovery keyframe remain on air.
+		if parsed.ImageID == baseImageID && !parsed.GIFControl {
+			continue
+		}
+		update, ok := manager.processGIFPacket(transport.ReceivedPacket{
+			Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Callsign: "N0CALL", Raw: raw,
+		})
+		if !ok {
+			continue
+		}
+		if parsed.ImageID == baseImageID && update.GIFFrameAbandoned {
+			firstFrameAbandoned = true
+			awaitingKeyframe = update.GIFAwaitingKeyframe
+		}
+		if parsed.ImageID != baseImageID && parsed.ImageID != baseImageID+12 && !parsed.GIFControl && update.PNGBase64 != "" {
+			deltaPreviews++
+		}
+		if update.GIFEnd {
+			final = update
+		}
+	}
+	if !firstFrameAbandoned || !awaitingKeyframe {
+		t.Fatalf("missing first keyframe did not enter recoverable state: abandoned=%v awaiting=%v", firstFrameAbandoned, awaitingKeyframe)
+	}
+	if deltaPreviews == 0 {
+		t.Fatal("subsequent delta frames were not decoded over the recovery placeholder")
+	}
+	if final.SessionID == "" || !final.GIFFrameComplete || final.ImageID != baseImageID+12 {
+		t.Fatalf("periodic keyframe did not restore decoding: %+v", final)
+	}
+	if !final.GIFStreamIncomplete {
+		t.Fatal("stream should be marked partial because its initial keyframe was lost")
+	}
+	data, _, frameCount, complete, exportErr := manager.ExportGIFSnapshot(final.SessionID)
+	if exportErr != nil {
+		t.Fatalf("export recovered partial GIF: %v", exportErr)
+	}
+	if complete || frameCount == 0 {
+		t.Fatalf("recovered stream should export a non-empty partial animation: complete=%v frames=%d", complete, frameCount)
+	}
+	decoded, decodeErr := gif.DecodeAll(bytes.NewReader(data))
+	if decodeErr != nil || len(decoded.Image) != frameCount {
+		t.Fatalf("recovered partial GIF is invalid: frames=%d decoded=%d err=%v", frameCount, len(decoded.Image), decodeErr)
+	}
+}
+
+func TestGIFRXKeepsDecodingWhenOneKeyframeDataPacketIsLost(t *testing.T) {
+	first := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	for y := 0; y < first.Bounds().Dy(); y++ {
+		for x := 0; x < first.Bounds().Dx(); x++ {
+			first.SetRGBA(x, y, color.RGBA{R: uint8((x * 3) % 255), G: uint8((y * 5) % 255), B: uint8((x + y) % 255), A: 255})
+		}
+	}
+	second := cloneRGBA(first)
+	draw.Draw(second, image.Rect(112, 96, 176, 160), image.NewUniform(color.RGBA{R: 250, G: 35, B: 20, A: 255}), image.Point{}, draw.Src)
+	packets, _, err := gifmode.EncodeContextV2(context.Background(), []gifmode.Frame{{Image: first, DelayCS: 10}, {Image: second, DelayCS: 18}}, "N0CALL", 88, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+	lostOne := false
+	deltaPreview := false
+	var final Update
+	for _, raw := range packets {
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if parsed.ImageID == 88 && !parsed.GIFControl && !lostOne {
+			lostOne = true
+			continue
+		}
+		update, ok := manager.processGIFPacket(transport.ReceivedPacket{Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Raw: raw})
+		if !ok {
+			continue
+		}
+		if update.PNGBase64 != "" && parsed.ImageID == 89 && !parsed.GIFControl {
+			deltaPreview = true
+		}
+		if update.GIFEnd {
+			final = update
+		}
+	}
+	if !lostOne {
+		t.Fatal("test fixture did not contain keyframe data packets")
+	}
+	if !deltaPreview || final.SessionID == "" || !final.GIFFrameComplete || !final.GIFStreamIncomplete || !final.GIFAwaitingKeyframe {
+		t.Fatalf("RX did not continue while preserving keyframe resync state after packet loss: deltaPreview=%v final=%+v", deltaPreview, final)
+	}
+}
+
+func TestGIFRXResynchronizesAfterIncompletePeriodicKeyframeWithExistingCanvas(t *testing.T) {
+	const width, height = 320, 240
+	const firstImageID = uint8(120)
+	frames := make([]gifmode.Frame, 25)
+	object := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			object.SetRGBA(x, y, color.RGBA{
+				R: uint8((x*7 + y*3 + 11) % 255),
+				G: uint8((x*5 + y*13 + 29) % 255),
+				B: uint8((x*17 + y*2 + 47) % 255), A: 255,
+			})
+		}
+	}
+	for index := range frames {
+		frame := image.NewRGBA(image.Rect(0, 0, width, height))
+		draw.Draw(frame, frame.Bounds(), image.NewUniform(color.RGBA{R: 24, G: 48, B: 72, A: 255}), image.Point{}, draw.Src)
+		x := 16 + (index%10)*16
+		draw.Draw(frame, image.Rect(x, 64, x+64, 128), object, object.Bounds().Min, draw.Src)
+		frames[index] = gifmode.Frame{Image: frame, DelayCS: 8}
+	}
+	packets, stats, err := gifmode.EncodeContextV2(context.Background(), frames, "N0CALL", firstImageID, 4)
+	if err != nil {
+		t.Fatalf("encode periodic-keyframe recovery fixture: %v", err)
+	}
+	if stats.Keyframes < 3 {
+		t.Fatalf("fixture needs initial, failed periodic and recovery keyframes; stats=%+v", stats)
+	}
+
+	manager := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+	var hadReferenceCanvas, failedPeriodicKeyframe, remainedAwaiting bool
+	deltaAfterFailure := 0
+	var final Update
+	failedKeyframeID := uint8(firstImageID + 12)
+	recoveryKeyframeID := uint8(firstImageID + 24)
+	for _, raw := range packets {
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		if parsed.ImageID == failedKeyframeID && !parsed.GIFControl {
+			continue // Lose the complete payload of a periodic keyframe, not its controls.
+		}
+		update, ok := manager.processGIFPacket(transport.ReceivedPacket{
+			Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", Callsign: "N0CALL", Raw: raw,
+		})
+		if !ok {
+			continue
+		}
+		if parsed.ImageID == firstImageID && update.GIFFrameComplete {
+			hadReferenceCanvas = true
+		}
+		if parsed.ImageID == failedKeyframeID && update.GIFFrameAbandoned {
+			failedPeriodicKeyframe = true
+			remainedAwaiting = update.GIFAwaitingKeyframe
+		}
+		if parsed.ImageID > failedKeyframeID && parsed.ImageID < recoveryKeyframeID && !parsed.GIFControl && update.PNGBase64 != "" {
+			deltaAfterFailure++
+		}
+		if parsed.ImageID == recoveryKeyframeID && update.GIFFrameComplete {
+			final = update
+		}
+	}
+	if !hadReferenceCanvas || !failedPeriodicKeyframe || !remainedAwaiting {
+		t.Fatalf("periodic keyframe loss did not preserve resync state: initial=%v failed=%v awaiting=%v", hadReferenceCanvas, failedPeriodicKeyframe, remainedAwaiting)
+	}
+	if deltaAfterFailure == 0 {
+		t.Fatal("delta frames after the missing periodic keyframe were not decoded")
+	}
+	if final.SessionID == "" || final.GIFAwaitingKeyframe || !final.GIFFrameComplete || final.ImageID != recoveryKeyframeID {
+		t.Fatalf("later complete keyframe did not restore the reference canvas: %+v", final)
+	}
+}

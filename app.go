@@ -1352,14 +1352,20 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 	}
 
 	if update.Codec == "SSDV-GIF" {
-		if update.GIFEnd {
+		// Persist a final GIF immediately, or checkpoint a partial GIF after an
+		// RX idle interval. Avoid re-encoding/writing the entire growing animation
+		// after every frame, which would create O(n^2) CPU and disk traffic.
+		if update.GIFEnd || update.GIFPartialArchive {
 			if err := a.archiveRXGIF(update); err != nil {
 				update.GIFSaveError = err.Error()
 			} else {
 				update.GIFSaved = true
-				// Once the compressed GIF is safely archived, keep only session
-				// metadata for duplicate suppression; release all PNG frame snapshots.
-				a.rxManager.ReleaseGIFExport(update.SessionID)
+				a.rxManager.MarkGIFSnapshotArchived(update.SessionID)
+				if update.GIFEnd {
+					// Keep only compact duplicate-suppression metadata after a terminal
+					// stream snapshot has been safely stored, even if some frames were lost.
+					a.rxManager.ReleaseGIFExport(update.SessionID)
+				}
 			}
 		}
 	} else if update.PNGBase64 != "" && (update.ArchivePreview || update.Complete) && previewPNG != nil {
@@ -1384,13 +1390,15 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 	a.emit("rx:image", update)
 }
 
-// archiveRXGIF exports only a fully reconstructed stream. Frame snapshots are
-// kept in RX.Manager until GIFEnd, then written as one animated album record.
+// archiveRXGIF exports the current decodable snapshot of a GIF stream. The
+// same album record is updated at RX idle checkpoints and once more when the
+// stream terminates, so interrupted transfers remain available as partial GIFs
+// without re-encoding the entire animation after every received frame.
 func (a *App) archiveRXGIF(update rxengine.Update) error {
 	if a.rxManager == nil || strings.TrimSpace(update.SessionID) == "" {
 		return errors.New("received GIF session is unavailable")
 	}
-	data, callsign, frameCount, err := a.rxManager.ExportGIF(update.SessionID)
+	data, callsign, frameCount, complete, err := a.rxManager.ExportGIFSnapshot(update.SessionID)
 	if err != nil {
 		return err
 	}
@@ -1447,7 +1455,10 @@ func (a *App) archiveRXGIF(update rxengine.Update) error {
 			record.CreatedAt = created
 			record.PacketsReceived, record.PacketsExpected = update.PacketsReceived, update.PacketsExpected
 			record.Quality = fmt.Sprintf("SSDV GIF · %d frames", frameCount)
-			record.Status = "complete"
+			record.Status = "partial"
+			if complete {
+				record.Status = "complete"
+			}
 			updated = true
 		} else {
 			if record.ImagePath != "" {
@@ -1474,8 +1485,11 @@ func (a *App) archiveRXGIF(update rxengine.Update) error {
 			Type: "RX", ImagePath: path, ImageWidth: config.Width, ImageHeight: config.Height,
 			CreatedAt: created, Profile: update.Profile, Callsign: callsign, ImageID: uint16(update.ImageID),
 			SessionID: update.SessionID, PacketsReceived: update.PacketsReceived, PacketsExpected: update.PacketsExpected,
-			Quality: fmt.Sprintf("SSDV GIF · %d frames", frameCount), Status: "complete",
+			Quality: fmt.Sprintf("SSDV GIF · %d frames", frameCount), Status: "partial",
 		})
+		if complete {
+			index.Records[len(index.Records)-1].Status = "complete"
+		}
 	}
 	if err := storage.SaveJSON(indexPath, index); err != nil {
 		_ = os.Remove(path)
