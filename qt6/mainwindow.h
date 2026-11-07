@@ -151,7 +151,12 @@ private:
     QCheckBox *m_componentBoldCheck = nullptr;
     QCheckBox *m_componentVisibleCheck = nullptr;
     QCheckBox *m_componentOutlineCheck = nullptr;
-    QLabel *m_componentEditorHint = nullptr;
+    QLabel *m_componentTextLabel = nullptr;
+    QLabel *m_componentAssetLabel = nullptr;
+    QLabel *m_componentScaleLabel = nullptr;
+    QLabel *m_componentFontLabel = nullptr;
+    QLabel *m_componentOutlineLabel = nullptr;
+    bool m_lastRXPreviewIsGIF = false;
     QTabWidget *m_mainTabs = nullptr;
     QHash<QString, QImage> m_templateImageCache;
     QTextEdit *m_log = nullptr;

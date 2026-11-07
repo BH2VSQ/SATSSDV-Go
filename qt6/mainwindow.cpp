@@ -47,6 +47,9 @@
 #include <QTime>
 #include <QPixmap>
 #include <QMovie>
+#include <QImageReader>
+#include <QDebug>
+#include <QCryptographicHash>
 #include <QAbstractItemView>
 #include <QVector>
 #include <QColor>
@@ -84,32 +87,77 @@ public:
         updatePixmap();
     }
 
-    bool setSourceGIF(const QByteArray &data) {
+    bool setSourceGIF(const QByteArray &data, QString *errorMessage = nullptr) {
+        const QByteArray digest = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
+        // RX events may request the exact same completed GIF more than once.
+        // Keep the active QMovie instead of resetting it to frame zero.
+        if (m_movie && digest == m_movieDigest)
+            return true;
+
         clearMovie();
         m_source = QImage();
         setPixmap(QPixmap());
         setText(QString());
+        if (data.size() < 13 || !(data.startsWith("GIF87a") || data.startsWith("GIF89a"))) {
+            if (errorMessage) *errorMessage = QStringLiteral("invalid GIF header or truncated data");
+            return false;
+        }
 
         m_movieBuffer = new QBuffer(this);
         m_movieBuffer->setData(data);
         if (!m_movieBuffer->open(QIODevice::ReadOnly)) {
+            if (errorMessage) *errorMessage = QStringLiteral("unable to open GIF data buffer");
             clearMovie();
             return false;
         }
+
         m_movie = new QMovie(m_movieBuffer, QByteArrayLiteral("gif"), this);
+        m_movie->setCacheMode(QMovie::CacheAll);
         if (!m_movie->isValid() || !m_movie->jumpToFrame(0)) {
+            if (errorMessage) {
+                const QString detail = m_movie->lastErrorString();
+                *errorMessage = detail.isEmpty()
+                    ? QStringLiteral("Qt GIF decoder rejected the image") : detail;
+            }
             clearMovie();
             return false;
         }
-        m_movie->setCacheMode(QMovie::CacheAll);
+
         m_movieOriginalSize = m_movie->currentImage().size();
         updateMovieScale();
         if (!m_movie->jumpToFrame(0)) {
+            if (errorMessage) *errorMessage = QStringLiteral("unable to decode the first GIF frame");
             clearMovie();
             return false;
         }
-        setMovie(m_movie);
+
+        // QMovie owns the playback clock and frame timing. Do not rely on
+        // QLabel::setMovie(): explicitly repaint the current frame whenever
+        // QMovie reports a decoded-frame update, which also works with custom
+        // preview labels and avoids the previous frozen-first-frame behavior.
+        connect(m_movie, &QMovie::updated, this, [this](const QRect &) {
+            displayMovieFrame();
+        });
+        connect(m_movie, &QMovie::resized, this, [this](const QSize &) {
+            displayMovieFrame();
+        });
+        connect(m_movie, &QMovie::error, this, [this](QImageReader::ImageReaderError) {
+            const QString detail = m_movie ? m_movie->lastErrorString() : QString();
+            qWarning().noquote() << "RX GIF playback error:" << detail;
+        });
+
+        m_movieDigest = digest;
+        displayMovieFrame();
         m_movie->start();
+        if (m_movie->state() != QMovie::Running) {
+            if (errorMessage) {
+                const QString detail = m_movie->lastErrorString();
+                *errorMessage = detail.isEmpty()
+                    ? QStringLiteral("Qt GIF playback did not enter the running state") : detail;
+            }
+            clearMovie();
+            return false;
+        }
         return true;
     }
 
@@ -141,12 +189,24 @@ private:
             m_movieBuffer = nullptr;
         }
         m_movieOriginalSize = QSize();
+        m_movieDigest.clear();
     }
 
     void updateMovieScale() {
         if (!m_movie || m_movieOriginalSize.isEmpty() || contentsRect().isEmpty()) return;
         const QSize scaled = m_movieOriginalSize.scaled(contentsRect().size(), Qt::KeepAspectRatio);
-        if (!scaled.isEmpty()) m_movie->setScaledSize(scaled);
+        if (!scaled.isEmpty()) {
+            m_movie->setScaledSize(scaled);
+            displayMovieFrame();
+        }
+    }
+
+    void displayMovieFrame() {
+        if (!m_movie) return;
+        const QPixmap frame = m_movie->currentPixmap();
+        if (frame.isNull()) return;
+        setText(QString());
+        setPixmap(frame.scaled(contentsRect().size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     }
 
     void updatePixmap() {
@@ -164,8 +224,8 @@ private:
     QBuffer *m_movieBuffer = nullptr;
     QMovie *m_movie = nullptr;
     QSize m_movieOriginalSize;
+    QByteArray m_movieDigest;
 };
-
 class SpectrumWaterfallWidget final : public QWidget {
 public:
     explicit SpectrumWaterfallWidget(QWidget *parent = nullptr)
@@ -384,6 +444,16 @@ QString prettyBytes(const QByteArray &data) {
 QString valueOr(const QJsonObject &object, const QString &key, const QString &fallback = QString()) {
     const QString value = object.value(key).toString();
     return value.isEmpty() ? fallback : value;
+}
+
+bool isGifGalleryAsset(const QJsonArray &gallery, const QString &assetId) {
+    if (assetId.isEmpty()) return false;
+    for (const QJsonValue &value : gallery) {
+        const QJsonObject asset = value.toObject();
+        if (asset.value(QStringLiteral("id")).toString() != assetId) continue;
+        return asset.value(QStringLiteral("name")).toString().endsWith(QStringLiteral(".gif"), Qt::CaseInsensitive);
+    }
+    return false;
 }
 }
 
@@ -895,11 +965,11 @@ void MainWindow::buildUi() {
         connect(field, &QLineEdit::textChanged, this, [this] { refreshTemplateCanvas(); });
     }
 
-    auto *templateEditor = new QGroupBox(uiText(QStringLiteral("模板组件 / 属性")), txMain);
+    auto *templateEditor = new QGroupBox(uiText(QStringLiteral("模板编辑")), txMain);
     auto *editorLayout = new QVBoxLayout(templateEditor);
     editorLayout->setContentsMargins(7, 8, 7, 7);
     editorLayout->setSpacing(5);
-    m_templateComponentsSummary = new QLabel(uiText(QStringLiteral("模板组件")), templateEditor);
+    m_templateComponentsSummary = new QLabel(uiText(QStringLiteral("模板编辑")), templateEditor);
     m_templateComponentsSummary->setWordWrap(true);
     m_templateComponentsSummary->setStyleSheet(QStringLiteral("color:#6d7982; font-size:8pt;"));
     editorLayout->addWidget(m_templateComponentsSummary);
@@ -932,18 +1002,23 @@ void MainWindow::buildUi() {
     m_componentTextEdit = new QTextEdit(templateEditor);
     m_componentTextEdit->setPlaceholderText(uiText(QStringLiteral("文字内容 / {MYCALL} / {LOCATOR}")));
     m_componentTextEdit->setMaximumHeight(54);
-    propertyForm->addRow(uiText(QStringLiteral("文字内容")), m_componentTextEdit);
+    m_componentTextLabel = new QLabel(uiText(QStringLiteral("文字内容")), templateEditor);
+    propertyForm->addRow(m_componentTextLabel, m_componentTextEdit);
     m_componentAssetCombo = makeCombo(templateEditor, {});
-    propertyForm->addRow(uiText(QStringLiteral("图库图像")), m_componentAssetCombo);
+    m_componentAssetLabel = new QLabel(uiText(QStringLiteral("图库图像")), templateEditor);
+    propertyForm->addRow(m_componentAssetLabel, m_componentAssetCombo);
     m_componentScaleSlider = new QSlider(Qt::Horizontal, templateEditor);
     m_componentScaleSlider->setRange(5, 100);
-    propertyForm->addRow(uiText(QStringLiteral("图像缩放")), m_componentScaleSlider);
+    m_componentScaleLabel = new QLabel(uiText(QStringLiteral("图像缩放")), templateEditor);
+    propertyForm->addRow(m_componentScaleLabel, m_componentScaleSlider);
     m_componentFontSlider = new QSlider(Qt::Horizontal, templateEditor);
     m_componentFontSlider->setRange(6, 160);
-    propertyForm->addRow(uiText(QStringLiteral("文字字号")), m_componentFontSlider);
+    m_componentFontLabel = new QLabel(uiText(QStringLiteral("文字字号")), templateEditor);
+    propertyForm->addRow(m_componentFontLabel, m_componentFontSlider);
     m_componentOutlineSlider = new QSlider(Qt::Horizontal, templateEditor);
     m_componentOutlineSlider->setRange(0, 20);
-    propertyForm->addRow(uiText(QStringLiteral("描边宽度")), m_componentOutlineSlider);
+    m_componentOutlineLabel = new QLabel(uiText(QStringLiteral("描边宽度")), templateEditor);
+    propertyForm->addRow(m_componentOutlineLabel, m_componentOutlineSlider);
     editorLayout->addLayout(propertyForm);
     auto *colorRow = new QHBoxLayout();
     m_componentColorButton = new QPushButton(uiText(QStringLiteral("文字颜色")), templateEditor);
@@ -959,15 +1034,10 @@ void MainWindow::buildUi() {
     flagsRow->addWidget(m_componentVisibleCheck);
     flagsRow->addWidget(m_componentOutlineCheck);
     flagsRow->addStretch();
-    auto *deleteComponent = new QPushButton(uiText(QStringLiteral("删除组件")), templateEditor);
+    auto *deleteComponent = new QPushButton(uiText(QStringLiteral("删除")), templateEditor);
     deleteComponent->setProperty("role", "danger");
     flagsRow->addWidget(deleteComponent);
     editorLayout->addLayout(flagsRow);
-    m_componentEditorHint = new QLabel(uiText(QStringLiteral("可直接拖动画布中的组件移动位置，拖动右下角控制点调整字号或图像比例。")), templateEditor);
-    m_componentEditorHint->setWordWrap(true);
-    m_componentEditorHint->setStyleSheet(QStringLiteral("color:#687780; font-size:8pt; padding:4px; background:transparent; border:0;"));
-    editorLayout->addWidget(m_componentEditorHint);
-
     connect(m_templateComponentList, &QListWidget::currentRowChanged, this, [this](int row) {
         if (m_templateCanvas) m_templateCanvas->setSelectedIndex(row);
         refreshInlineTemplateEditor();
@@ -1236,7 +1306,10 @@ void MainWindow::refreshLatestRXPreview() {
     m_backend->call(QStringLiteral("GetLatestRXImageData"), {}, [this](bool ok, const QJsonValue &value, const QString &error) {
         m_rxPreviewRequestPending = false;
         if (ok && !value.toString().isEmpty()) {
+            m_lastRXPreviewIsGIF = value.toString().startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive);
             showImage(value.toString(), m_rxPreview);
+            refreshInlineTemplateEditor();
+            refreshTemplateCanvas();
         } else if (!ok) {
             appendLog(uiText(QStringLiteral("刷新接收图像预览失败：")) + error);
         }
@@ -1338,7 +1411,7 @@ void MainWindow::refreshTemplateComponentList() {
     const QJsonObject selected = selectedTemplate();
     const QJsonArray components = selected.value(QStringLiteral("components")).toArray();
     if (m_templateComponentsSummary) {
-        m_templateComponentsSummary->setText(uiText(QStringLiteral("%1 · %2 个组件 · 拖动右侧预览画布中的图层可调整位置"))
+        m_templateComponentsSummary->setText(uiText(QStringLiteral("%1 · %2 项"))
             .arg(selected.value(QStringLiteral("name")).toString(), QString::number(components.size())));
     }
     if (!m_templateComponentList) return;
@@ -1352,7 +1425,7 @@ void MainWindow::refreshTemplateComponentList() {
         const QString type = component.value(QStringLiteral("type")).toString();
         const QString id = component.value(QStringLiteral("id")).toString();
         QString label = type == QStringLiteral("text")
-            ? QStringLiteral("T · %1").arg(valueOr(component, QStringLiteral("text"), uiText(QStringLiteral("文字组件"))))
+            ? QStringLiteral("T · %1").arg(valueOr(component, QStringLiteral("text"), uiText(QStringLiteral("文字"))))
             : type == QStringLiteral("image") ? QStringLiteral("IMG · %1").arg(valueOr(component, QStringLiteral("assetName"), valueOr(component, QStringLiteral("assetId"), uiText(QStringLiteral("图库图像")))))
             : uiText(QStringLiteral("RX · 上次接收图像"));
         auto *item = new QListWidgetItem(label.left(34), m_templateComponentList);
@@ -1367,7 +1440,16 @@ void MainWindow::refreshTemplateComponentList() {
 void MainWindow::refreshTemplateCanvas() {
     if (!m_templateCanvas) return;
     const QJsonObject selected = selectedTemplate();
-    const QJsonArray components = selected.value(QStringLiteral("components")).toArray();
+    QJsonArray components = selected.value(QStringLiteral("components")).toArray();
+    for (int i = 0; i < components.size(); ++i) {
+        QJsonObject component = components.at(i).toObject();
+        const QString type = component.value(QStringLiteral("type")).toString();
+        const bool gif = type == QStringLiteral("image")
+            ? isGifGalleryAsset(m_gallery, component.value(QStringLiteral("assetId")).toString())
+            : type == QStringLiteral("last-rx-image") && m_lastRXPreviewIsGIF;
+        component.insert(QStringLiteral("isGIF"), gif);
+        components.replace(i, component);
+    }
     QImage background(640, 480, QImage::Format_ARGB32_Premultiplied);
     background.fill(QColor(QStringLiteral("#17232d")));
     const QString backgroundId = valueOr(m_settings, QStringLiteral("templateBackgroundAssetId"));
@@ -1424,24 +1506,21 @@ void MainWindow::refreshInlineTemplateEditor() {
     const bool isText = valid && type == QStringLiteral("text");
     const bool isImage = valid && type == QStringLiteral("image");
     const bool isImageLayer = isImage || (valid && type == QStringLiteral("last-rx-image"));
-    bool isGIFImage = false;
-    if (isImage) {
-        const QString assetId = component.value(QStringLiteral("assetId")).toString();
-        for (const QJsonValue &assetValue : m_gallery) {
-            const QJsonObject asset = assetValue.toObject();
-            if (asset.value(QStringLiteral("id")).toString() == assetId) {
-                isGIFImage = asset.value(QStringLiteral("name")).toString().endsWith(QStringLiteral(".gif"), Qt::CaseInsensitive);
-                break;
-            }
-        }
-    }
+    const bool isGIFImage = isImage
+        ? isGifGalleryAsset(m_gallery, component.value(QStringLiteral("assetId")).toString())
+        : valid && type == QStringLiteral("last-rx-image") && m_lastRXPreviewIsGIF;
+    const bool showOutline = valid && !isGIFImage;
+
     const QSignalBlocker b1(m_componentTextEdit), b2(m_componentAssetCombo), b3(m_componentScaleSlider),
         b4(m_componentFontSlider), b5(m_componentOutlineSlider), b6(m_componentBoldCheck),
         b7(m_componentVisibleCheck), b8(m_componentOutlineCheck);
     if (m_componentTextEdit) {
         m_componentTextEdit->setPlainText(component.value(QStringLiteral("text")).toString());
         m_componentTextEdit->setEnabled(isText);
+        m_componentTextEdit->setVisible(isText);
     }
+    if (m_componentTextLabel) m_componentTextLabel->setVisible(isText);
+
     if (m_componentAssetCombo) {
         m_componentAssetCombo->clear();
         for (const QJsonValue &assetValue : m_gallery) {
@@ -1451,26 +1530,61 @@ void MainWindow::refreshInlineTemplateEditor() {
         const int assetIndex = m_componentAssetCombo->findData(component.value(QStringLiteral("assetId")).toString());
         if (assetIndex >= 0) m_componentAssetCombo->setCurrentIndex(assetIndex);
         m_componentAssetCombo->setEnabled(isImage);
+        m_componentAssetCombo->setVisible(isImage);
     }
-    if (m_componentScaleSlider) { m_componentScaleSlider->setValue(qBound(5, component.value(QStringLiteral("scale")).toInt(35), 100)); m_componentScaleSlider->setEnabled(isImageLayer); }
-    if (m_componentFontSlider) { m_componentFontSlider->setValue(qBound(6, component.value(QStringLiteral("fontSize")).toInt(28), 160)); m_componentFontSlider->setEnabled(isText); }
-    if (m_componentOutlineSlider) { m_componentOutlineSlider->setValue(qBound(0, component.value(QStringLiteral("outlineWidth")).toInt(2), 20)); m_componentOutlineSlider->setEnabled(valid); }
-    if (m_componentBoldCheck) { m_componentBoldCheck->setChecked(component.value(QStringLiteral("bold")).toBool()); m_componentBoldCheck->setEnabled(isText); }
-    if (m_componentVisibleCheck) { m_componentVisibleCheck->setChecked(component.value(QStringLiteral("visible")).toBool(true)); m_componentVisibleCheck->setEnabled(valid); }
-    if (m_componentOutlineCheck) { m_componentOutlineCheck->setChecked(!isGIFImage && component.value(QStringLiteral("outline")).toBool(true)); m_componentOutlineCheck->setEnabled(valid && !isGIFImage); }
+    if (m_componentAssetLabel) m_componentAssetLabel->setVisible(isImage);
+
+    if (m_componentScaleSlider) {
+        m_componentScaleSlider->setValue(qBound(5, component.value(QStringLiteral("scale")).toInt(35), 100));
+        m_componentScaleSlider->setEnabled(isImageLayer);
+        m_componentScaleSlider->setVisible(isImageLayer);
+    }
+    if (m_componentScaleLabel) m_componentScaleLabel->setVisible(isImageLayer);
+
+    if (m_componentFontSlider) {
+        m_componentFontSlider->setValue(qBound(6, component.value(QStringLiteral("fontSize")).toInt(28), 160));
+        m_componentFontSlider->setEnabled(isText);
+        m_componentFontSlider->setVisible(isText);
+    }
+    if (m_componentFontLabel) m_componentFontLabel->setVisible(isText);
+
+    if (m_componentOutlineSlider) {
+        m_componentOutlineSlider->setValue(qBound(0, component.value(QStringLiteral("outlineWidth")).toInt(2), 20));
+        m_componentOutlineSlider->setEnabled(showOutline);
+        m_componentOutlineSlider->setVisible(showOutline);
+    }
+    if (m_componentOutlineLabel) m_componentOutlineLabel->setVisible(showOutline);
+
+    if (m_componentBoldCheck) {
+        m_componentBoldCheck->setChecked(component.value(QStringLiteral("bold")).toBool());
+        m_componentBoldCheck->setEnabled(isText);
+        m_componentBoldCheck->setVisible(isText);
+    }
+    if (m_componentVisibleCheck) {
+        m_componentVisibleCheck->setChecked(component.value(QStringLiteral("visible")).toBool(true));
+        m_componentVisibleCheck->setEnabled(valid);
+        m_componentVisibleCheck->setVisible(valid);
+    }
+    if (m_componentOutlineCheck) {
+        m_componentOutlineCheck->setChecked(showOutline && component.value(QStringLiteral("outline")).toBool(true));
+        m_componentOutlineCheck->setEnabled(showOutline);
+        m_componentOutlineCheck->setVisible(showOutline);
+    }
+
     const QString color = valueOr(component, QStringLiteral("color"), QStringLiteral("#ffffff"));
     const QString outline = valueOr(component, QStringLiteral("outlineColor"), QStringLiteral("#000000"));
     if (m_componentColorButton) {
         m_componentColorButton->setEnabled(isText);
+        m_componentColorButton->setVisible(isText);
         m_componentColorButton->setProperty("color", color);
         m_componentColorButton->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(color, QColor(color).lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
     }
     if (m_componentOutlineColorButton) {
-        m_componentOutlineColorButton->setEnabled(valid);
+        m_componentOutlineColorButton->setEnabled(showOutline);
+        m_componentOutlineColorButton->setVisible(showOutline);
         m_componentOutlineColorButton->setProperty("color", outline);
         m_componentOutlineColorButton->setStyleSheet(QStringLiteral("background:%1; color:%2;").arg(outline, QColor(outline).lightness()<128?QStringLiteral("white"):QStringLiteral("black")));
     }
-    if (m_componentEditorHint) m_componentEditorHint->setText(!valid ? uiText(QStringLiteral("选择一个组件后即可修改属性。")) : isText ? uiText(QStringLiteral("文字组件：支持变量替换、字号、颜色、粗体和描边。拖动画布可移动位置。")) : isGIFImage ? uiText(QStringLiteral("GIF 图像组件：支持增量动画发射；不支持软件描边。拖动画布可移动位置。")) : uiText(QStringLiteral("图像组件：可调整等比例缩放、可见性和描边。拖动画布可移动位置。")));
 }
 
 void MainWindow::applyInlineTemplateProperties() {
@@ -1489,17 +1603,27 @@ void MainWindow::applyInlineTemplateProperties() {
         component.insert(QStringLiteral("scale"), m_componentScaleSlider->value());
         if (type == QStringLiteral("image")) component.insert(QStringLiteral("assetId"), m_componentAssetCombo->currentData().toString());
     }
-    component.insert(QStringLiteral("outlineWidth"), m_componentOutlineSlider->value());
-    component.insert(QStringLiteral("outlineColor"), m_componentOutlineColorButton->property("color").toString());
+    const bool isGIFImage = type == QStringLiteral("image")
+        ? isGifGalleryAsset(m_gallery, component.value(QStringLiteral("assetId")).toString())
+        : type == QStringLiteral("last-rx-image") && m_lastRXPreviewIsGIF;
+    component.insert(QStringLiteral("isGIF"), isGIFImage);
+    if (isGIFImage) {
+        component.remove(QStringLiteral("outline"));
+        component.remove(QStringLiteral("outlineWidth"));
+        component.remove(QStringLiteral("outlineColor"));
+    } else {
+        component.insert(QStringLiteral("outlineWidth"), m_componentOutlineSlider->value());
+        component.insert(QStringLiteral("outlineColor"), m_componentOutlineColorButton->property("color").toString());
+        component.insert(QStringLiteral("outline"), m_componentOutlineCheck->isChecked());
+    }
     component.insert(QStringLiteral("visible"), m_componentVisibleCheck->isChecked());
-    component.insert(QStringLiteral("outline"), m_componentOutlineCheck->isChecked());
     components.replace(row, component);
     tpl.insert(QStringLiteral("components"), components);
     const QString id = tpl.value(QStringLiteral("id")).toString();
     for (int i=0;i<m_templates.size();++i) if(m_templates.at(i).toObject().value(QStringLiteral("id")).toString()==id){m_templates.replace(i,tpl);break;}
     if (m_templateComponentList->currentItem()) {
         const QString label = type == QStringLiteral("text")
-            ? QStringLiteral("T · %1").arg(valueOr(component, QStringLiteral("text"), uiText(QStringLiteral("文字组件"))))
+            ? QStringLiteral("T · %1").arg(valueOr(component, QStringLiteral("text"), uiText(QStringLiteral("文字"))))
             : type == QStringLiteral("image") ? QStringLiteral("IMG · %1").arg(m_componentAssetCombo->currentText().isEmpty() ? valueOr(component, QStringLiteral("assetId"), uiText(QStringLiteral("图库图像"))) : m_componentAssetCombo->currentText())
             : uiText(QStringLiteral("RX · 上次接收图像"));
         m_templateComponentList->currentItem()->setText(label.left(34));
@@ -1528,7 +1652,16 @@ void MainWindow::addInlineTemplateComponent(const QString &type, const QString &
     component.insert(QStringLiteral("outlineWidth"), 2.0);
     component.insert(QStringLiteral("outlineColor"), QStringLiteral("#000000"));
     if (type == QStringLiteral("text")) component.insert(QStringLiteral("text"), uiText(QStringLiteral("新文本")));
-    if (type == QStringLiteral("image")) component.insert(QStringLiteral("assetId"), assetId);
+    if (type == QStringLiteral("image")) {
+        component.insert(QStringLiteral("assetId"), assetId);
+        const bool gif = isGifGalleryAsset(m_gallery, assetId);
+        component.insert(QStringLiteral("isGIF"), gif);
+        if (gif) {
+            component.remove(QStringLiteral("outline"));
+            component.remove(QStringLiteral("outlineWidth"));
+            component.remove(QStringLiteral("outlineColor"));
+        }
+    }
     components.append(component);
     tpl.insert(QStringLiteral("components"), components);
     const QString templateId = tpl.value(QStringLiteral("id")).toString();
@@ -2073,8 +2206,9 @@ QImage MainWindow::renderTemplate(QString *errorMessage) {
         }else if(type==QStringLiteral("image")||type==QStringLiteral("last-rx-image")){
             QString data;QString error;if(type==QStringLiteral("image")){data=m_backend->callSync(QStringLiteral("GetGalleryImageData"),QJsonArray{c.value(QStringLiteral("assetId")).toString()},&error,10000).toString();}else{data=m_backend->callSync(QStringLiteral("GetLatestRXImageData"),{},&error,10000).toString();}
             QImage component=imageFromDataUrl(data);if(component.isNull()){if(type==QStringLiteral("last-rx-image")){QRectF frame(x,y,size.width()*0.35,size.height()*0.35*0.75);painter.fillRect(frame,QColor(18,30,40,220));painter.setPen(QColor(QStringLiteral("#d8e0e5")));painter.drawText(frame,Qt::AlignCenter,QStringLiteral("LAST RX"));}continue;}
+            const bool gifImage = data.startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive);
             const qreal fit=qMin(size.width()/qreal(component.width()),size.height()/qreal(component.height()));const qreal factor=fit*qBound(0.01,c.value(QStringLiteral("scale")).toDouble(35)/100.0,1.0);const QSizeF target(component.width()*factor,component.height()*factor);QRectF rect(x,y,target.width(),target.height());
-            if (c.value(QStringLiteral("outline")).toBool(true) && c.value(QStringLiteral("outlineWidth")).toDouble(2.0) > 0) {
+            if (!gifImage && c.value(QStringLiteral("outline")).toBool(true) && c.value(QStringLiteral("outlineWidth")).toDouble(2.0) > 0) {
                 drawAlphaContourOutline(painter, component, rect,
                     QColor(valueOr(c, QStringLiteral("outlineColor"), QStringLiteral("#000000"))),
                     c.value(QStringLiteral("outlineWidth")).toDouble(2.0) * size.height() / 480.0);
@@ -2153,7 +2287,7 @@ QJsonObject MainWindow::buildRenderedTXPayload(const QImage &preview, QString *e
         return rendered;
     }
     if (gifCount > 1) {
-        if (errorMessage) *errorMessage = uiText(QStringLiteral("当前 GIF 增量发射每个模板只支持一个可见 GIF 图像组件"));
+        if (errorMessage) *errorMessage = uiText(QStringLiteral("当前每个模板最多只能发射一个可见 GIF 动图"));
         return {};
     }
 
@@ -2688,6 +2822,15 @@ void MainWindow::editSelectedTemplate() {
 
     refreshGallery();
     QJsonArray components = selected.value(QStringLiteral("components")).toArray();
+    for (int i = 0; i < components.size(); ++i) {
+        QJsonObject component = components.at(i).toObject();
+        const QString type = component.value(QStringLiteral("type")).toString();
+        const bool gif = type == QStringLiteral("image")
+            ? isGifGalleryAsset(m_gallery, component.value(QStringLiteral("assetId")).toString())
+            : type == QStringLiteral("last-rx-image") && m_lastRXPreviewIsGIF;
+        component.insert(QStringLiteral("isGIF"), gif);
+        components.replace(i, component);
+    }
 
     QImage background(640, 480, QImage::Format_ARGB32_Premultiplied);
     background.fill(QColor(QStringLiteral("#101820")));
@@ -2746,13 +2889,13 @@ void MainWindow::editSelectedTemplate() {
     root->addLayout(nameRow);
 
     auto *toolbar = new QHBoxLayout();
-    auto *addText = new QPushButton(uiText(QStringLiteral("＋ 文字组件")), &dialog);
+    auto *addText = new QPushButton(uiText(QStringLiteral("＋ 文字")), &dialog);
     auto *addImage = new QPushButton(uiText(QStringLiteral("＋ 图库图像")), &dialog);
     auto *addLastRx = new QPushButton(uiText(QStringLiteral("＋ 上次接收图像")), &dialog);
     auto *moveLayerUp = new QPushButton(uiText(QStringLiteral("上移图层")), &dialog);
     auto *moveLayerDown = new QPushButton(uiText(QStringLiteral("下移图层")), &dialog);
     auto *snapGrid = new QCheckBox(uiText(QStringLiteral("5% 网格吸附")), &dialog);
-    auto *deleteComponent = new QPushButton(uiText(QStringLiteral("删除选中组件")), &dialog);
+    auto *deleteComponent = new QPushButton(uiText(QStringLiteral("删除选中项")), &dialog);
     deleteComponent->setProperty("role", "danger");
     toolbar->addWidget(addText);
     toolbar->addWidget(addImage);
@@ -2772,7 +2915,7 @@ void MainWindow::editSelectedTemplate() {
     auto *properties = new QWidget(split);
     auto *propertiesLayout = new QVBoxLayout(properties);
     propertiesLayout->setContentsMargins(6, 0, 0, 0);
-    propertiesLayout->addWidget(new QLabel(uiText(QStringLiteral("文字组件属性")), properties));
+    propertiesLayout->addWidget(new QLabel(uiText(QStringLiteral("属性")), properties));
     auto *table = new QTableWidget(properties);
     table->setColumnCount(5);
     table->setHorizontalHeaderLabels({uiText(QStringLiteral("文字内容")), QStringLiteral("X %"), QStringLiteral("Y %"), uiText(QStringLiteral("字号")), uiText(QStringLiteral("颜色"))});
@@ -2781,7 +2924,6 @@ void MainWindow::editSelectedTemplate() {
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->setAlternatingRowColors(true);
     propertiesLayout->addWidget(table, 1);
-    propertiesLayout->addWidget(new QLabel(uiText(QStringLiteral("画布操作：拖动组件移动；拖动右下角控制点调整文字字号或图像比例；选中后按 Delete 删除。")), properties));
     split->addWidget(canvas);
     split->addWidget(properties);
     split->setStretchFactor(0, 3);
@@ -2917,11 +3059,11 @@ void MainWindow::editSelectedTemplate() {
             ids << asset.value(QStringLiteral("id")).toString();
         }
         if (labels.isEmpty()) {
-            QMessageBox::information(&dialog, uiText(QStringLiteral("图库为空")), uiText(QStringLiteral("请先在图像图库页面导入图片，再添加图像组件。")));
+            QMessageBox::information(&dialog, uiText(QStringLiteral("图库为空")), uiText(QStringLiteral("请先导入图库图像。")));
             return;
         }
         bool ok = false;
-        const QString choice = QInputDialog::getItem(&dialog, uiText(QStringLiteral("添加图像组件")), uiText(QStringLiteral("选择图库图像")), labels, 0, false, &ok);
+        const QString choice = QInputDialog::getItem(&dialog, uiText(QStringLiteral("选择图像")), uiText(QStringLiteral("选择图库图像")), labels, 0, false, &ok);
         if (!ok) return;
         const int selectedAsset = labels.indexOf(choice);
         if (selectedAsset < 0) return;
@@ -2930,6 +3072,8 @@ void MainWindow::editSelectedTemplate() {
         component.insert(QStringLiteral("id"), componentId);
         component.insert(QStringLiteral("type"), QStringLiteral("image"));
         component.insert(QStringLiteral("assetId"), ids[selectedAsset]);
+        const bool gif = isGifGalleryAsset(m_gallery, ids[selectedAsset]);
+        component.insert(QStringLiteral("isGIF"), gif);
         component.insert(QStringLiteral("x"), 32.0);
         component.insert(QStringLiteral("y"), 28.0);
         component.insert(QStringLiteral("scale"), 35.0);
@@ -3020,7 +3164,11 @@ void MainWindow::showImage(const QString &dataUrl, ImagePreviewLabel *target) {
         const qsizetype separator = dataUrl.indexOf(QLatin1Char(','));
         if (separator >= 0) {
             const QByteArray gifData = QByteArray::fromBase64(dataUrl.mid(separator + 1).toLatin1());
-            if (target->setSourceGIF(gifData)) return;
+            QString gifError;
+            if (target->setSourceGIF(gifData, &gifError)) return;
+            const QString message = uiText(QStringLiteral("GIF 预览播放失败：%1")).arg(gifError);
+            appendLog(message);
+            if (target == m_rxPreview) statusBar()->showMessage(message, 10000);
         }
     }
     const QImage image = imageFromDataUrl(dataUrl);

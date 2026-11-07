@@ -203,7 +203,8 @@ void TemplateCanvas::paintEvent(QPaintEvent *) {
                 const QRectF imageRect(x, y, image.width() * factor, image.height() * factor);
                 const QColor imageOutline(component.value(QStringLiteral("outlineColor")).toString(QStringLiteral("#000000")));
                 const qreal imageOutlineWidth = qBound(0.0, component.value(QStringLiteral("outlineWidth")).toDouble(2.0), 20.0);
-                if (component.value(QStringLiteral("outline")).toBool(true) && imageOutlineWidth > 0) {
+                if (!component.value(QStringLiteral("isGIF")).toBool(false)
+                    && component.value(QStringLiteral("outline")).toBool(true) && imageOutlineWidth > 0) {
                     drawAlphaContourOutline(painter, image, imageRect, imageOutline, imageOutlineWidth);
                 } else {
                     painter.drawImage(imageRect, image);
