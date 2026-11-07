@@ -3,10 +3,12 @@ package transport
 import (
 	"bytes"
 	"fmt"
+	"hash/crc32"
 	"time"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
@@ -33,19 +35,47 @@ type packetDedupState struct {
 // callback blocks. Feed returns only newly accepted image packets. A nil block
 // marks an input discontinuity and resets modem acquisition while retaining
 // packet de-duplication for the current image session.
+type packetFECGroup struct {
+	imageKey string
+	parity   [2]*fec.PacketParityPayload
+	last     time.Time
+}
+
 type StreamDecoder struct {
-	profile   domain.Profile
-	inputRate int
-	resampler *dsp.StreamResampler
-	fsk       *dsp.FSKStreamDemodulator
-	gmsk2400  *ccsds.ARCSSD2400Demodulator
-	mary      *mary.StreamDemodulator
-	ax25      *ax25.StreamDecoder
-	ccsdsBits []bool
+	profile             domain.Profile
+	inputRate           int
+	resampler           *dsp.StreamResampler
+	fsk                 *dsp.FSKStreamDemodulator
+	gmsk2400            *ccsds.ARCSSD2400Demodulator
+	mary                *mary.StreamDemodulator
+	maryBurstGeneration uint64
+	maryFECRearmPending bool
+	ax25                *ax25.StreamDecoder
+	ccsdsBits           []bool
 	// Packet de-duplication is scoped to an image session, not the lifetime
 	// of the audio stream. A new packet 0 starts a fresh session when an
 	// image ID is reused by a transmitter or after its 8-bit ID wraps.
 	imageStates map[string]*packetDedupState
+
+	maryFECMode         int8 // -1 undecided, 0 legacy hard-decision, 1 soft-FEC burst
+	maryHeaderSoft      []float32
+	maryFECHeader       fec.BurstHeader
+	maryFECDecoder      *fec.ViterbiDecoder
+	maryFECSoft         []float32
+	maryFECBlocksDone   int64
+	maryFECBitsDone     int64
+	maryFECDecodedBits  int64
+	maryFECDecodedBytes uint32
+	maryFECByte         byte
+	maryFECByteBits     uint8
+	maryFECCRC          uint32
+	maryFECFinished     bool
+	maryFECError        error
+
+	packetFECRecent        map[string]map[uint16][]byte
+	packetFECRecentOrder   map[string][]uint16
+	packetFECRecentUpdated map[string]time.Time
+	packetFECGroups        map[string]*packetFECGroup
 }
 
 func NewStreamDecoder(profileID domain.TransportMode, inputSampleRate int) (*StreamDecoder, error) {
@@ -62,13 +92,19 @@ func NewStreamDecoder(profileID domain.TransportMode, inputSampleRate int) (*Str
 	}
 	decoder := &StreamDecoder{
 		profile: profile, inputRate: inputSampleRate, resampler: resampler,
-		imageStates: make(map[string]*packetDedupState),
+		imageStates:            make(map[string]*packetDedupState),
+		maryFECMode:            -1,
+		packetFECRecent:        make(map[string]map[uint16][]byte),
+		packetFECRecentOrder:   make(map[string][]uint16),
+		packetFECRecentUpdated: make(map[string]time.Time),
+		packetFECGroups:        make(map[string]*packetFECGroup),
 	}
 	if profile.LinkLayer == "CCSDS-MARY" {
 		decoder.mary, err = mary.NewStreamDemodulator(mary.Config{SampleRate: profile.SampleRate, SymbolRate: profile.SymbolRate, BitsPerSymbol: profile.BitsPerSymbol, CarrierHz: profile.CarrierHz})
 		if err != nil {
 			return nil, err
 		}
+		decoder.maryBurstGeneration = decoder.mary.BurstGeneration()
 	} else if profile.LinkLayer == "CCSDS" && profile.BitRate == 2400 {
 		decoder.gmsk2400 = &ccsds.ARCSSD2400Demodulator{}
 	} else {
@@ -91,6 +127,7 @@ func (d *StreamDecoder) Reset() {
 		return
 	}
 	d.resampler.Reset()
+	d.maryFECRearmPending = false
 	if d.fsk != nil {
 		d.fsk.Reset()
 	}
@@ -99,11 +136,17 @@ func (d *StreamDecoder) Reset() {
 	}
 	if d.mary != nil {
 		d.mary.Reset()
+		d.maryBurstGeneration = d.mary.BurstGeneration()
 	}
 	if d.ax25 != nil {
 		d.ax25.Reset()
 	}
 	d.ccsdsBits = nil
+	d.resetMARYFEC()
+	d.packetFECRecent = make(map[string]map[uint16][]byte)
+	d.packetFECRecentOrder = make(map[string][]uint16)
+	d.packetFECRecentUpdated = make(map[string]time.Time)
+	d.packetFECGroups = make(map[string]*packetFECGroup)
 }
 
 func (d *StreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
@@ -117,6 +160,11 @@ func (d *StreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 	if len(samples) == 0 {
 		return nil, nil
 	}
+	if d.maryFECRearmPending {
+		d.resetMARYFEC()
+		d.ccsdsBits = nil
+		d.maryFECRearmPending = false
+	}
 	native := d.resampler.Feed(samples)
 	if len(native) == 0 {
 		return nil, nil
@@ -124,7 +172,26 @@ func (d *StreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 	var bits []bool
 	var err error
 	if d.mary != nil {
-		bits = d.mary.Feed(native)
+		soft := d.mary.FeedSoft(native)
+		packets := d.consumeMARYSoft(soft)
+		if generation := d.mary.BurstGeneration(); generation != d.maryBurstGeneration {
+			d.maryBurstGeneration = generation
+			d.resetMARYFEC()
+			d.ccsdsBits = nil
+		}
+		if d.maryFECFinished {
+			// The burst descriptor gives an exact coded length. Re-arm immediately
+			// after consuming it; the next call may contain an inter-burst gap or
+			// the next training word. Keep image de-duplication and FEC recovery
+			// caches intact across this physical-burst boundary.
+			d.mary.Rearm()
+			d.maryBurstGeneration = d.mary.BurstGeneration()
+			d.maryFECRearmPending = true
+		}
+		if d.maryFECError != nil {
+			return packets, d.maryFECError
+		}
+		return packets, nil
 	} else if d.gmsk2400 != nil {
 		bits, err = d.gmsk2400.Feed(native, d.profile.SampleRate)
 	} else {
@@ -178,18 +245,297 @@ func (d *StreamDecoder) consumeCCSDSBits(bits []bool) []ReceivedPacket {
 			start++
 			continue
 		}
-		packet, err := parseImagePacket(d.profile, payload)
-		if err == nil && d.markNew(packet) {
-			packets = append(packets, packet)
+		if fec.IsPacketParityPayload(payload) {
+			packets = append(packets, d.handlePacketParity(payload)...)
+			start += streamCCSDSFrameBits
+			continue
+		}
+		packet, parseErr := parseImagePacket(d.profile, payload)
+		if parseErr == nil {
+			d.rememberPacketForFEC(packet)
+			if d.markNew(packet) {
+				packets = append(packets, packet)
+			}
+			packets = append(packets, d.tryPendingPacketFEC(packet.Callsign, packet.ImageID)...)
 		}
 		start += streamCCSDSFrameBits
 	}
-	// Keep only the incomplete suffix that has not yet been searched. This
-	// also preserves a partial ASM at the end of the current audio block.
 	if start > 0 {
 		d.ccsdsBits = append([]bool(nil), d.ccsdsBits[start:]...)
 	}
 	return packets
+}
+
+func (d *StreamDecoder) resetMARYFEC() {
+	d.maryFECMode = -1
+	d.maryHeaderSoft = nil
+	d.maryFECHeader = fec.BurstHeader{}
+	d.maryFECDecoder = nil
+	d.maryFECSoft = nil
+	d.maryFECBlocksDone = 0
+	d.maryFECBitsDone = 0
+	d.maryFECDecodedBits = 0
+	d.maryFECDecodedBytes = 0
+	d.maryFECByte = 0
+	d.maryFECByteBits = 0
+	d.maryFECCRC = 0
+	d.maryFECFinished = false
+	d.maryFECError = nil
+}
+
+func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
+	if len(llrs) == 0 || d.maryFECFinished {
+		return nil
+	}
+	if d.maryFECMode < 0 {
+		d.maryHeaderSoft = append(d.maryHeaderSoft, llrs...)
+		const headerBits = fec.BurstHeaderWireBits
+		if len(d.maryHeaderSoft) < headerBits {
+			return nil
+		}
+		headerBytes, combineErr := fec.CombineRepeatedBurstHeader(d.maryHeaderSoft[:headerBits])
+		var header fec.BurstHeader
+		var err error
+		if combineErr == nil {
+			header, err = fec.ParseBurstHeader(headerBytes)
+		} else {
+			err = combineErr
+		}
+		if err == nil {
+			d.maryFECMode = 1
+			d.maryFECHeader = header
+			d.maryFECDecoder = fec.NewViterbiDecoder()
+			remaining := append([]float32(nil), d.maryHeaderSoft[headerBits:]...)
+			d.maryHeaderSoft = nil
+			return d.consumeMARYFECSoft(remaining)
+		}
+		// A recognizable SGV2 marker with a failed CRC is a damaged new-format
+		// header, not a legacy burst. Do not silently reinterpret coded payload
+		// bits as old hard-decision CCSDS data.
+		if combineErr == nil && len(headerBytes) >= 4 && string(headerBytes[:4]) == "SDF2" {
+			d.maryFECError = err
+			d.maryFECFinished = true
+			d.maryHeaderSoft = nil
+			return nil
+		}
+		// The first bytes of a legacy M-ary burst are the CCSDS randomizer
+		// preamble. If no recognized descriptor is present, preserve the old
+		// hard-decision path byte-for-byte.
+		d.maryFECMode = 0
+		legacy := softToBits(d.maryHeaderSoft)
+		d.maryHeaderSoft = nil
+		return d.consumeCCSDSBits(legacy)
+	}
+	if d.maryFECMode == 0 {
+		return d.consumeCCSDSBits(softToBits(llrs))
+	}
+	return d.consumeMARYFECSoft(llrs)
+}
+
+func (d *StreamDecoder) consumeMARYFECSoft(llrs []float32) []ReceivedPacket {
+	if len(llrs) > 0 {
+		d.maryFECSoft = append(d.maryFECSoft, llrs...)
+	}
+	codedBits := d.maryFECHeader.CodedBits()
+	var packets []ReceivedPacket
+	for len(d.maryFECSoft) >= fec.InterleaveBlockBits && d.maryFECBitsDone < codedBits {
+		block, err := fec.DeinterleaveSoftBlock(d.maryFECSoft[:fec.InterleaveBlockBits])
+		if err != nil {
+			d.maryFECError = err
+			d.maryFECFinished = true
+			return packets
+		}
+		d.maryFECSoft = d.maryFECSoft[fec.InterleaveBlockBits:]
+		remaining := codedBits - d.maryFECBitsDone
+		use := int64(len(block))
+		if use > remaining {
+			use = remaining
+		}
+		decoded, decodeErr := d.maryFECDecoder.Feed(block[:int(use)])
+		if decodeErr != nil {
+			d.maryFECError = decodeErr
+			d.maryFECFinished = true
+			return packets
+		}
+		packets = append(packets, d.consumeMARYFECDecodedBits(decoded)...)
+		d.maryFECBitsDone += use
+		d.maryFECBlocksDone++
+	}
+	if d.maryFECBitsDone >= codedBits {
+		tail, err := d.maryFECDecoder.Flush()
+		if err != nil {
+			d.maryFECError = err
+			d.maryFECFinished = true
+			return packets
+		}
+		packets = append(packets, d.consumeMARYFECDecodedBits(tail)...)
+		d.maryFECFinished = true
+		if d.maryFECDecodedBits != int64(d.maryFECHeader.RawBytes)*8 || d.maryFECDecodedBytes != d.maryFECHeader.RawBytes {
+			d.maryFECError = fmt.Errorf("soft-FEC decoded %d bytes, expected %d", d.maryFECDecodedBytes, d.maryFECHeader.RawBytes)
+		} else if d.maryFECCRC != d.maryFECHeader.CRC32 {
+			d.maryFECError = fmt.Errorf("soft-FEC burst CRC mismatch: got %08x want %08x", d.maryFECCRC, d.maryFECHeader.CRC32)
+		}
+	}
+	return packets
+}
+
+func (d *StreamDecoder) consumeMARYFECDecodedBits(bits []bool) []ReceivedPacket {
+	remaining := int64(d.maryFECHeader.RawBytes)*8 - d.maryFECDecodedBits
+	if remaining <= 0 {
+		return nil
+	}
+	if int64(len(bits)) > remaining {
+		bits = bits[:int(remaining)]
+	}
+	for _, bit := range bits {
+		d.maryFECByte <<= 1
+		if bit {
+			d.maryFECByte |= 1
+		}
+		d.maryFECByteBits++
+		d.maryFECDecodedBits++
+		if d.maryFECByteBits == 8 {
+			d.maryFECCRC = crc32.Update(d.maryFECCRC, crc32.IEEETable, []byte{d.maryFECByte})
+			d.maryFECDecodedBytes++
+			d.maryFECByte = 0
+			d.maryFECByteBits = 0
+		}
+	}
+	return d.consumeCCSDSBits(bits)
+}
+
+func softToBits(llrs []float32) []bool {
+	bits := make([]bool, len(llrs))
+	for i, value := range llrs {
+		bits[i] = value < 0
+	}
+	return bits
+}
+
+func (d *StreamDecoder) rememberPacketForFEC(packet ReceivedPacket) {
+	now := time.Now()
+	d.prunePacketFEC(now)
+	if len(packet.Raw) != ssdv.PacketSize || packet.Raw[1] != ssdv.TypeFEC || packet.PacketID >= 0xfffe {
+		return
+	}
+	key := fmt.Sprintf("%s|%s|%03d", packet.Profile, packet.Callsign, packet.ImageID)
+	if d.packetFECRecent == nil {
+		d.packetFECRecent = make(map[string]map[uint16][]byte)
+	}
+	if d.packetFECRecentOrder == nil {
+		d.packetFECRecentOrder = make(map[string][]uint16)
+	}
+	if d.packetFECRecentUpdated == nil {
+		d.packetFECRecentUpdated = make(map[string]time.Time)
+	}
+	if d.packetFECRecent[key] == nil {
+		d.packetFECRecent[key] = make(map[uint16][]byte)
+	}
+	if _, exists := d.packetFECRecent[key][packet.PacketID]; !exists {
+		d.packetFECRecentOrder[key] = append(d.packetFECRecentOrder[key], packet.PacketID)
+	}
+	d.packetFECRecent[key][packet.PacketID] = append([]byte(nil), packet.Raw...)
+	d.packetFECRecentUpdated[key] = now
+	for len(d.packetFECRecentOrder[key]) > 512 {
+		oldest := d.packetFECRecentOrder[key][0]
+		d.packetFECRecentOrder[key] = d.packetFECRecentOrder[key][1:]
+		delete(d.packetFECRecent[key], oldest)
+	}
+}
+
+func (d *StreamDecoder) prunePacketFEC(now time.Time) {
+	for key, updated := range d.packetFECRecentUpdated {
+		if now.Sub(updated) > 2*time.Minute {
+			delete(d.packetFECRecent, key)
+			delete(d.packetFECRecentOrder, key)
+			delete(d.packetFECRecentUpdated, key)
+		}
+	}
+	for key, group := range d.packetFECGroups {
+		if now.Sub(group.last) > 30*time.Second {
+			delete(d.packetFECGroups, key)
+		}
+	}
+}
+
+func (d *StreamDecoder) handlePacketParity(payload []byte) []ReceivedPacket {
+	d.prunePacketFEC(time.Now())
+	if d.packetFECGroups == nil {
+		d.packetFECGroups = make(map[string]*packetFECGroup)
+	}
+	parity, err := fec.ParsePacketParityPayload(payload)
+	if err != nil {
+		return nil
+	}
+	callsign := ssdv.DecodeBase40(parity.Callsign)
+	if callsign == "" {
+		return nil
+	}
+	imageKey := fmt.Sprintf("%s|%s|%03d", d.profile.ID, callsign, parity.ImageID)
+	groupKey := fmt.Sprintf("%s|%d", imageKey, parity.IDs[0])
+	group := d.packetFECGroups[groupKey]
+	if group == nil {
+		if len(d.packetFECGroups) >= 128 {
+			oldestKey := ""
+			var oldest time.Time
+			for key, candidate := range d.packetFECGroups {
+				if oldestKey == "" || candidate.last.Before(oldest) {
+					oldestKey, oldest = key, candidate.last
+				}
+			}
+			if oldestKey != "" {
+				delete(d.packetFECGroups, oldestKey)
+			}
+		}
+		group = &packetFECGroup{imageKey: imageKey}
+		d.packetFECGroups[groupKey] = group
+	}
+	copyParity := parity
+	group.parity[parity.Shard] = &copyParity
+	group.last = time.Now()
+	return d.tryRecoverPacketFEC(groupKey, group)
+}
+
+func (d *StreamDecoder) tryPendingPacketFEC(callsign string, imageID uint8) []ReceivedPacket {
+	imageKey := fmt.Sprintf("%s|%s|%03d", d.profile.ID, callsign, imageID)
+	var out []ReceivedPacket
+	for key, group := range d.packetFECGroups {
+		if group.imageKey == imageKey {
+			out = append(out, d.tryRecoverPacketFEC(key, group)...)
+		}
+	}
+	return out
+}
+
+func (d *StreamDecoder) tryRecoverPacketFEC(key string, group *packetFECGroup) []ReceivedPacket {
+	var parities []fec.PacketParityPayload
+	for _, parity := range group.parity {
+		if parity != nil {
+			parities = append(parities, *parity)
+		}
+	}
+	if len(parities) == 0 {
+		return nil
+	}
+	recent := d.packetFECRecent[group.imageKey]
+	recovered, err := fec.RecoverPacketParity(parities, recent)
+	if err != nil {
+		return nil
+	}
+	delete(d.packetFECGroups, key)
+	var out []ReceivedPacket
+	for _, raw := range recovered {
+		packet, parseErr := parseImagePacket(d.profile, raw)
+		if parseErr != nil {
+			continue
+		}
+		packet.FECRecovered = true
+		d.rememberPacketForFEC(packet)
+		if d.markNew(packet) {
+			out = append(out, packet)
+		}
+	}
+	return out
 }
 
 func parseImagePacket(profile domain.Profile, raw []byte) (ReceivedPacket, error) {

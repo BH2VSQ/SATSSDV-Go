@@ -2,11 +2,14 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
@@ -15,6 +18,7 @@ import (
 )
 
 const streamPCMChunkSamples = 4096
+const maryTrainingSymbols = 96
 
 // StreamPackets validates and modulates a packet batch without constructing a
 // full-duration waveform. emit is called synchronously with reusable-sized PCM
@@ -106,6 +110,30 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 	if err != nil {
 		return 0, err
 	}
+	wirePackets, err := buildMARYWirePackets(packets)
+	if err != nil {
+		return 0, err
+	}
+	randomizer := ccsds.RandomizerSequence()
+	totalRawBytes := e.cfg.PreambleSize + e.cfg.TrailerSize + len(wirePackets)*(4+ccsds.PayloadLength)
+	if totalRawBytes <= 0 || uint64(totalRawBytes) > uint64(^uint32(0)) {
+		return 0, errors.New("soft-FEC burst exceeds 32-bit byte length")
+	}
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write(repeatRandomizer(randomizer, e.cfg.PreambleSize))
+	for _, packet := range wirePackets {
+		unit, buildErr := ccsds.BuildDataUnit(packet)
+		if buildErr != nil {
+			return 0, buildErr
+		}
+		_, _ = crc.Write(unit)
+	}
+	_, _ = crc.Write(repeatRandomizer(randomizer, e.cfg.TrailerSize))
+	header, err := (fec.BurstHeader{RawBytes: uint32(totalRawBytes), CRC32: crc.Sum32()}).MarshalBinary()
+	if err != nil {
+		return 0, err
+	}
+
 	training, err := mod.Start()
 	if err != nil {
 		return 0, err
@@ -113,11 +141,36 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 	if err := sink.write(training); err != nil {
 		return 0, err
 	}
-	randomizer := ccsds.RandomizerSequence()
-	if err := sink.writeMARYBytes(mod, repeatRandomizer(randomizer, e.cfg.PreambleSize)); err != nil {
+	// The triplicated descriptor is the enhanced-burst bootstrap for new receivers.
+	// New receivers still accept legacy bursts; legacy receivers do not decode SGV2.
+	wireHeader, err := fec.RepeatBurstHeader(header)
+	if err != nil {
 		return 0, err
 	}
-	for i, packet := range packets {
+	if err := sink.writeMARYBytes(mod, wireHeader); err != nil {
+		return 0, err
+	}
+
+	conv := fec.NewConvStreamEncoder()
+	interleaver := fec.NewBlockInterleaver()
+	writeFECBytes := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		coded, encodeErr := conv.WriteBytes(data)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		interleaved, interleaveErr := interleaver.Write(coded)
+		if interleaveErr != nil {
+			return interleaveErr
+		}
+		return sink.writeMARYBytes(mod, interleaved)
+	}
+	if err := writeFECBytes(repeatRandomizer(randomizer, e.cfg.PreambleSize)); err != nil {
+		return 0, err
+	}
+	for i, packet := range wirePackets {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
@@ -125,21 +178,87 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 		if buildErr != nil {
 			return 0, fmt.Errorf("build CCSDS data unit %d: %w", i, buildErr)
 		}
-		if err := sink.writeMARYBytes(mod, unit); err != nil {
+		if err := writeFECBytes(unit); err != nil {
 			return 0, err
 		}
 	}
-	if err := sink.writeMARYBytes(mod, repeatRandomizer(randomizer, e.cfg.TrailerSize)); err != nil {
+	if err := writeFECBytes(repeatRandomizer(randomizer, e.cfg.TrailerSize)); err != nil {
 		return 0, err
 	}
-	tail, err := mod.Close()
+	tail, err := conv.Close()
 	if err != nil {
 		return 0, err
 	}
-	if err := sink.write(tail); err != nil {
+	interleavedTail, err := interleaver.Write(tail)
+	if err != nil {
+		return 0, err
+	}
+	if err := sink.writeMARYBytes(mod, interleavedTail); err != nil {
+		return 0, err
+	}
+	lastBlock, err := interleaver.Close()
+	if err != nil {
+		return 0, err
+	}
+	if err := sink.writeMARYBytes(mod, lastBlock); err != nil {
+		return 0, err
+	}
+	modTail, err := mod.Close()
+	if err != nil {
+		return 0, err
+	}
+	if err := sink.write(modTail); err != nil {
 		return 0, err
 	}
 	return sink.close()
+}
+
+// buildMARYWirePackets inserts two parity data units after each group of up to
+// eight adjacent FEC-enabled SSDV image packets. Control and non-FEC packets are
+// passed through unchanged; group metadata records packet IDs explicitly.
+func buildMARYWirePackets(packets [][]byte) ([][]byte, error) {
+	out := make([][]byte, 0, len(packets)+((len(packets)+7)/8)*2)
+	group := make([][]byte, 0, 8)
+	var groupCall uint32
+	var groupImage uint8
+	flush := func() error {
+		if len(group) >= 2 {
+			parity, err := fec.BuildPacketParityPayloads(group)
+			if err != nil {
+				return err
+			}
+			out = append(out, parity...)
+		}
+		group = group[:0]
+		return nil
+	}
+	for _, raw := range packets {
+		parsed, parseErr := ssdv.ParsePacket(raw)
+		eligible := parseErr == nil && parsed.FEC && !parsed.GIFControl
+		if !eligible {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			out = append(out, raw)
+			continue
+		}
+		call := binary.BigEndian.Uint32(raw[2:6])
+		imageID := raw[6]
+		if len(group) > 0 && (call != groupCall || imageID != groupImage || len(group) == 8) {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+		if len(group) == 0 {
+			groupCall, groupImage = call, imageID
+		}
+		group = append(group, raw)
+		out = append(out, raw)
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (sink *pcmStreamSink) writeMARYBytes(mod *mary.StreamModulator, data []byte) error {
@@ -220,10 +339,15 @@ func (e *Encoder) EstimateOutputSamples(packetCount int) (int64, error) {
 		byteCount := int64(e.cfg.PreambleSize + e.cfg.TrailerSize + packetCount*(4+ccsds.PayloadLength))
 		native = byteCount * 8 * int64(profile.SampleRate/profile.BitRate)
 	case "CCSDS-MARY":
-		byteCount := int64(e.cfg.PreambleSize + e.cfg.TrailerSize + packetCount*(4+ccsds.PayloadLength))
-		bits := byteCount * 8
-		bps := int64(profile.BitsPerSymbol)
-		symbols := int64(96) + (bits+bps-1)/bps
+		// Packet count-only estimate assumes two parity frames per group of
+		// eight SSDV frames and the rate-1/2 inner code with block interleaving.
+		wirePackets := packetCount + 2*((packetCount+7)/8)
+		rawBytes := int64(e.cfg.PreambleSize + e.cfg.TrailerSize + wirePackets*(4+ccsds.PayloadLength))
+		codeBits := 2 * (rawBytes*8 + fec.ConvMemory)
+		codeBytes := (codeBits + 7) / 8
+		interleavedBytes := ((codeBytes + fec.InterleaveBlockBytes - 1) / fec.InterleaveBlockBytes) * fec.InterleaveBlockBytes
+		modBits := int64(fec.BurstHeaderWireBits) + interleavedBytes*8
+		symbols := int64(maryTrainingSymbols) + (modBits+int64(profile.BitsPerSymbol)-1)/int64(profile.BitsPerSymbol)
 		native = symbols * int64(profile.SampleRate/profile.SymbolRate)
 	case "AX.25 UI / HDLC":
 		bits := int64(ax25.DefaultBurstPreambleFlags+ax25.DefaultBurstTrailerFlags) * 8
@@ -251,6 +375,24 @@ func (e *Encoder) EstimateOutputSamplesForPackets(packets [][]byte) (int64, erro
 	profile, err := domain.ParseProfile(string(e.cfg.Profile))
 	if err != nil {
 		return 0, err
+	}
+	if profile.LinkLayer == "CCSDS-MARY" {
+		wirePackets, wireErr := buildMARYWirePackets(packets)
+		if wireErr != nil {
+			return 0, wireErr
+		}
+		rawBytes := int64(e.cfg.PreambleSize + e.cfg.TrailerSize + len(wirePackets)*(4+ccsds.PayloadLength))
+		codeBits := 2 * (rawBytes*8 + fec.ConvMemory)
+		codeBytes := (codeBits + 7) / 8
+		interleavedBytes := ((codeBytes + fec.InterleaveBlockBytes - 1) / fec.InterleaveBlockBytes) * fec.InterleaveBlockBytes
+		modBits := int64(fec.BurstHeaderWireBits) + interleavedBytes*8
+		symbols := int64(maryTrainingSymbols) + (modBits+int64(profile.BitsPerSymbol)-1)/int64(profile.BitsPerSymbol)
+		native := symbols * int64(profile.SampleRate/profile.SymbolRate)
+		targetRate := e.cfg.AudioSampleRate
+		if targetRate <= 0 {
+			targetRate = profile.SampleRate
+		}
+		return (native*int64(targetRate) + int64(profile.SampleRate)/2) / int64(profile.SampleRate), nil
 	}
 	if profile.LinkLayer != "AX.25 UI / HDLC" {
 		return e.EstimateOutputSamples(len(packets))
@@ -358,4 +500,25 @@ func (s *pcmStreamSink) close() (int64, error) {
 		}
 	}
 	return s.outputCount, nil
+}
+
+// EstimateWirePacketCount returns the number of fixed-size physical image/data
+// units emitted by the selected encoder, including SGV2 packet-erasure parity
+// units for M-ary profiles. It does not include the CCSDS preamble/trailer.
+func (e *Encoder) EstimateWirePacketCount(packets [][]byte) (int, error) {
+	if e == nil || len(packets) == 0 {
+		return 0, errors.New("non-empty packet batch is required")
+	}
+	profile, err := domain.ParseProfile(string(e.cfg.Profile))
+	if err != nil {
+		return 0, err
+	}
+	if profile.LinkLayer == "CCSDS-MARY" {
+		wire, buildErr := buildMARYWirePackets(packets)
+		if buildErr != nil {
+			return 0, buildErr
+		}
+		return len(wire), nil
+	}
+	return len(packets), nil
 }

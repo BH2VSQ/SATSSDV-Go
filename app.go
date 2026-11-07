@@ -631,6 +631,7 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 	var packets [][]byte
 	var encoder *transport.Encoder
 	var estimatedSamples int64
+	var wireFrameCount int
 	var duplex *audio.Duplex
 	var currentCallsign string
 	var baseImageID uint8
@@ -686,7 +687,6 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 			// GIF/template layers for the duration of a potentially long TX burst.
 			frames = nil
 			gifData, base, overlay = nil, nil, nil
-			airtime := gifmode.EstimateAirtime(stats.TotalPackets, parsedProfile.BitRate)
 			transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: audioRate}
 			if parsedProfile.LinkLayer == "AX.25 UI / HDLC" {
 				transportConfig.Source = ax25.Address{Callsign: currentCallsign, SSID: uint8(ax25SSID)}
@@ -704,6 +704,12 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 				prepared = true
 				return fmt.Errorf("estimate GIF template stream: %w", prepareErr)
 			}
+			var countErr error
+			wireFrameCount, countErr = encoder.EstimateWirePacketCount(packets)
+			if countErr != nil {
+				prepared = true
+				return fmt.Errorf("estimate GIF physical data frames: %w", countErr)
+			}
 			// Discard temporary frame and image buffers before opening the bounded
 			// PCM stream. The encoded 256-byte packet set is retained for repeat TX.
 			runtimedebug.FreeOSMemory()
@@ -713,9 +719,11 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 				return fmt.Errorf("prepare GIF template stream: %w", prepareErr)
 			}
 			prepared = true
+			airtime := durationForSamples(estimatedSamples, waveformRate)
 			a.emit("tx:gif-stats", map[string]any{
 				"frames": stats.Frames, "keyframes": stats.Keyframes,
 				"dataPackets": stats.DataPackets, "totalPackets": stats.TotalPackets,
+				"wirePackets": wireFrameCount,
 				"changedMCUs": stats.ChangedMCUs, "totalMCUs": stats.TotalMCUs,
 				"motionVectors": stats.MotionVectors, "predictedMCUs": stats.PredictedMCUs,
 				"estimatedSeconds": int(airtime.Seconds()),
@@ -729,7 +737,7 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 		}
 		var startedAt time.Time
 		estimatedDuration := durationForSamples(estimatedSamples, waveformRate)
-		totalDataFrames := stats.TotalPackets
+		totalDataFrames := wireFrameCount
 		producer := func(streamCtx context.Context, emit func([]float32) error) error {
 			streamedSamples, streamErr := encoder.StreamPackets(streamCtx, packets, func(block []float32) error {
 				if emitErr := emit(block); emitErr != nil {
@@ -755,7 +763,7 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 		if err := a.archiveTXGIFData(archiveGIF, archiveWidth, archiveHeight, profileID, currentCallsign, baseImageID, stats, startedAt); err != nil {
 			return fmt.Errorf("archive transmitted GIF: %w", err)
 		}
-		a.emit("tx:gif-sent", map[string]any{"fileName": imageName, "frames": stats.Frames, "packetsSent": stats.TotalPackets, "startedAt": startedAt})
+		a.emit("tx:gif-sent", map[string]any{"fileName": imageName, "frames": stats.Frames, "packetsSent": stats.TotalPackets, "wirePacketsSent": totalDataFrames, "startedAt": startedAt})
 		return nil
 	}
 	return a.startTransmissionWithSender(job, repeat, intervalSeconds, sender)
@@ -873,7 +881,10 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 	}
 	a.emit("tx:progress", 0.0)
 	var transmissionStartedAt time.Time
-	totalDataFrames := len(prepared.Packets)
+	totalDataFrames, err := prepared.Encoder.EstimateWirePacketCount(prepared.Packets)
+	if err != nil {
+		return err
+	}
 	estimatedDuration := durationForSamples(estimatedSamples, prepared.SampleRate)
 	producer := func(streamCtx context.Context, emit func([]float32) error) error {
 		streamedSamples, streamErr := prepared.Encoder.StreamPackets(streamCtx, prepared.Packets, func(block []float32) error {
@@ -1308,9 +1319,10 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 				continue
 			}
 			packets, err := decoder.Feed(block)
-			if err != nil {
+			if err != nil && len(packets) == 0 {
 				// Short acquisition windows and incomplete frame tails are normal
-				// during live RX. Only surface persistent decoder state elsewhere.
+				// during live RX. A final FEC CRC warning may coexist with valid
+				// packets decoded from the same callback, so still deliver them.
 				continue
 			}
 			for _, packet := range packets {

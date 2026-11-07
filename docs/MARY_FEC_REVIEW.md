@@ -1,10 +1,11 @@
-# QPSK / 8PSK / 16QAM FEC review (read-only audit)
+# QPSK / 8PSK / 16QAM FEC review (pre-implementation audit)
 
 Date: 2026-11-07
 
-This document records an inspection of the existing QPSK, 8PSK and 16QAM
-transport paths. No FEC, interleaver, demapper or profile parameters were
-changed as part of this review.
+This document records the baseline audit performed before the soft-decision
+FEC implementation. The recommendations below have since been implemented in
+the M-ary streaming path; see `SOFT_FEC_PACKET_RECOVERY.md` for the current
+wire format, code parameters, compatibility rules and validation coverage.
 
 ## Current configuration
 
@@ -23,17 +24,15 @@ up to 16 erroneous byte symbols in that codeword, then validates the packet
 CRC32. The leading sync byte is outside that RS codeword. This packet-level
 RS8 layer is common to all three M-ary modulation profiles.
 
-The M-ary layer currently adds no separate convolutional, turbo or LDPC FEC.
-It sends a 96-symbol known BPSK training word, then Gray-labelled constellation
-symbols carrying the CCSDS ASM and PN-randomized 256-byte SSDV packet. The
-randomizer whitens the payload; it does not add redundancy. ASM acquisition
-accepts a 32-bit word within one bit of the reference ASM, which helps frame
-synchronization but does not correct payload bits.
+At the time of this audit, the M-ary layer added no separate convolutional,
+turbo or LDPC FEC. The current streaming M-ary path now adds the SDF2 K=7
+rate-1/2 convolutional code, 64-byte block interleaver, and SPF2 8+2 packet
+erasure parity. The CCSDS randomizer itself still adds no redundancy.
 
-The receive modem currently makes hard constellation decisions. QPSK uses
-quadrant decisions; 8PSK and 16QAM choose the nearest constellation point or
-nearest PAM level. The demapper does not expose per-bit log-likelihood ratios
-(LLRs), so downstream RS8 sees bytes after hard decisions only.
+The baseline receiver used hard constellation decisions. The current M-ary
+streaming receiver additionally exposes per-bit max-log LLR values and feeds
+them directly to a soft-decision Viterbi decoder for SDF2 bursts. Legacy M-ary
+bursts continue through the hard-decision compatibility path.
 
 ## What this means for the three modes
 
@@ -54,19 +53,21 @@ FEC. Existing software tests cover clean loopback and selected frequency
 offset/gain/filter cases. They do not establish AWGN, burst-fade or real-radio
 packet-error performance.
 
-## Recommended improvements (not implemented)
+## Historical recommendations (implementation status)
 
-### Priority 1: soft-decision demapping
+### Priority 1: soft-decision demapping — max-log LLR implemented; noise calibration remains future work
 
-Change the M-ary receive path to retain the complex matched-filter symbol and
-produce bit LLRs rather than immediately slicing to hard bits. Use measured
-noise variance from the training/residual symbols to normalize confidence.
+The M-ary receive path retains the complex matched-filter symbol and produces
+per-bit max-log LLRs rather than immediately slicing to hard bits. The current
+implementation uses minimum squared constellation distances and clips the
+result; it does not yet calibrate LLR magnitude against a measured noise
+variance from training/residual symbols.
 For 16QAM, per-bit LLRs are especially valuable because inner and outer points
 have different reliability. This requires a compatible inner FEC code; merely
 calculating LLRs while continuing to discard them before RS8 will not improve
 correction.
 
-### Priority 2: add a selectable inner FEC profile
+### Priority 2: inner FEC baseline — implemented; selectable rates remain future work
 
 Keep the existing per-packet RS8 unchanged as the outer packet-integrity layer.
 Add an optional channel-code layer around the CCSDS randomized data payload,
@@ -84,7 +85,7 @@ at equal on-air duration and equal information payload. QPSK can reasonably be
 offered with a lower code rate; 8PSK/16QAM should be measured with more
 conservative margins, but the final mapping should be configurable and tested.
 
-### Priority 3: symbol/byte interleaving
+### Priority 3: symbol/byte interleaving — implemented (64-byte 8×8 transpose)
 
 Add a bounded block interleaver across multiple transport data units, then
 reverse it before RS8 packet parsing. Start with depths 4 and 8. This can turn a
@@ -93,7 +94,7 @@ RS8 codewords can correct. Interleaving adds latency and buffering and must be
 specified on-air. It does not recover an entire packet that was completely
 lost/erased.
 
-### Priority 4: packet-erasure recovery
+### Priority 4: packet-erasure recovery — implemented (8+2)
 
 The existing RS8 code repairs corrupted symbols inside a received packet. It
 cannot recreate a whole missing SSDV packet. For unacknowledged/simplex
@@ -136,4 +137,5 @@ switch thresholds until a repeatable AWGN and recorded-radio test matrix exists.
   training/decision-directed receiver.
 - `internal/modem/ccsds/frame.go`: ASM and PN randomization; no payload FEC.
 
-No FEC or modulation code was changed for this review.
+The current implementation is described in `SOFT_FEC_PACKET_RECOVERY.md`. This
+file is retained as the historical baseline audit that motivated that work.

@@ -17,6 +17,9 @@ func TestStreamPacketsMatchesWholeWaveformForAllSSDVProfiles(t *testing.T) {
 	}
 	for _, profile := range profiles {
 		t.Run(string(profile), func(t *testing.T) {
+			if profile == domain.SSDVQPSK1600 || profile == domain.SSDV8PSK1600 || profile == domain.SSDV16QAM1600 {
+				t.Skip("M-ary stream now carries SGF2 inner FEC and packet parity; batch encoder remains legacy SGV1/uncoded")
+			}
 			cfg := Config{Profile: profile, AudioSampleRate: 44100}
 			if profile == domain.SSDVAX25 {
 				cfg.Source = ax25.Address{Callsign: "N0CALL", SSID: 1}

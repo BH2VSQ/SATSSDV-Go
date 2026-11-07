@@ -21,21 +21,24 @@ type Config struct {
 }
 
 type StreamDemodulator struct {
-	cfg            Config
-	sps            int
-	baseband       []complex64
-	sampleCount    int64
-	searchPos      int
-	locked         bool
-	cursor         int
-	phase          float64
-	phaseStep      float64
-	symbolIndex    int64
-	phaseRotation  complex128
-	stepRotation   complex128
-	amplitudeScale float64
-	cosLUT         []float64
-	sinLUT         []float64
+	cfg             Config
+	sps             int
+	baseband        []complex64
+	sampleCount     int64
+	searchPos       int
+	locked          bool
+	cursor          int
+	phase           float64
+	phaseStep       float64
+	symbolIndex     int64
+	phaseRotation   complex128
+	stepRotation    complex128
+	amplitudeScale  float64
+	silenceSamples  int
+	signalRMS       float64
+	burstGeneration uint64
+	cosLUT          []float64
+	sinLUT          []float64
 }
 
 func NewStreamDemodulator(cfg Config) (*StreamDemodulator, error) {
@@ -74,6 +77,9 @@ func (d *StreamDemodulator) Reset() {
 	d.phaseRotation = 1
 	d.stepRotation = 1
 	d.amplitudeScale = 1
+	d.silenceSamples = 0
+	d.signalRMS = 0
+	d.burstGeneration++
 }
 
 // ModulateBytes prepends a known 96-symbol BPSK training sequence, then
@@ -127,8 +133,41 @@ func ModulateBytes(data []byte, cfg Config) ([]float32, error) {
 }
 
 func (d *StreamDemodulator) Feed(samples []float32) []bool {
+	llrs := d.FeedSoft(samples)
+	bits := make([]bool, len(llrs))
+	for i, llr := range llrs {
+		bits[i] = llr < 0
+	}
+	return bits
+}
+
+// FeedSoft returns one max-log LLR per payload bit. Positive values favor zero
+// and negative values favor one. Carrier/timing acquisition and decision-
+// directed tracking are shared with the legacy hard-decision path.
+func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 	if d == nil || len(samples) == 0 {
 		return nil
+	}
+	// A sustained low-energy interval marks the end of an M-ary burst. Do not
+	// feed silence into the symbol slicer: drain any complete symbols already
+	// buffered, then release acquisition state so a later training word can
+	// lock the same long-running RX stream again.
+	blockRMS := audioBlockRMS(samples)
+	silenceThreshold := math.Max(0.002, d.signalRMS*0.10)
+	if d.signalRMS > 0 && blockRMS < silenceThreshold {
+		d.silenceSamples += len(samples)
+		var ready []float32
+		if d.locked {
+			ready = d.decodeAvailableSoft()
+		}
+		if d.silenceSamples >= d.cfg.SampleRate/10 && (d.locked || len(d.baseband) > 0) {
+			d.releaseAcquisition()
+		}
+		return ready
+	}
+	d.silenceSamples = 0
+	if blockRMS > d.signalRMS {
+		d.signalRMS = blockRMS
 	}
 	for _, sample := range samples {
 		lutIndex := int(d.sampleCount % int64(len(d.cosLUT)))
@@ -151,7 +190,53 @@ func (d *StreamDemodulator) Feed(samples []float32) []bool {
 			return nil
 		}
 	}
-	return d.decodeAvailable()
+	return d.decodeAvailableSoft()
+}
+
+// BurstGeneration increases whenever a continuous receiver releases its
+// current symbol lock after a 100 ms low-energy gap. StreamDecoder uses this
+// signal to re-arm SGV2 burst framing without clearing completed image IDs.
+// Rearm releases the current symbol lock so the same long-running receiver
+// can acquire the training word of the next independent M-ary burst.
+func (d *StreamDemodulator) Rearm() {
+	if d == nil {
+		return
+	}
+	d.releaseAcquisition()
+}
+
+func (d *StreamDemodulator) BurstGeneration() uint64 {
+	if d == nil {
+		return 0
+	}
+	return d.burstGeneration
+}
+
+func audioBlockRMS(samples []float32) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	var energy float64
+	for _, value := range samples {
+		energy += float64(value) * float64(value)
+	}
+	return math.Sqrt(energy / float64(len(samples)))
+}
+
+func (d *StreamDemodulator) releaseAcquisition() {
+	d.baseband = nil
+	d.searchPos = 0
+	d.locked = false
+	d.cursor = 0
+	d.phase = 0
+	d.phaseStep = 0
+	d.symbolIndex = 0
+	d.phaseRotation = 1
+	d.stepRotation = 1
+	d.amplitudeScale = 1
+	d.sampleCount = 0
+	d.silenceSamples = 0
+	d.burstGeneration++
 }
 
 type trainingCandidate struct {
@@ -299,12 +384,12 @@ func (d *StreamDemodulator) tryAcquire() {
 	d.searchPos = last + 1
 }
 
-func (d *StreamDemodulator) decodeAvailable() []bool {
+func (d *StreamDemodulator) decodeAvailableSoft() []float32 {
 	count := (len(d.baseband) - d.cursor) / d.sps
 	if count <= 0 {
 		return nil
 	}
-	out := make([]bool, 0, count*d.cfg.BitsPerSymbol)
+	out := make([]float32, 0, count*d.cfg.BitsPerSymbol)
 	for n := 0; n < count; n++ {
 		base := d.cursor + n*d.sps
 		z := symbolMean(d.baseband, base, d.sps)
@@ -312,13 +397,10 @@ func (d *StreamDemodulator) decodeAvailable() []bool {
 		z *= complex(d.amplitudeScale, 0)
 		decision := nearestConstellationPoint(z, d.cfg.BitsPerSymbol)
 		phaseError := cmplx.Phase(z * cmplx.Conj(decision))
-		// Decision-directed carrier tracking removes the small residual CFO
-		// left by the finite training word. The proportional term corrects
-		// phase immediately; the integral term tracks slow frequency drift.
 		d.phaseRotation *= cmplx.Rect(1, -0.12*phaseError)
 		d.stepRotation *= cmplx.Rect(1, -0.0015*phaseError)
 		d.phaseRotation *= d.stepRotation
-		out = appendSymbolBits(out, z, d.cfg.BitsPerSymbol)
+		out = appendConstellationLLR(out, z, d.cfg.BitsPerSymbol)
 		d.symbolIndex++
 	}
 	d.cursor += count * d.sps
@@ -327,6 +409,43 @@ func (d *StreamDemodulator) decodeAvailable() []bool {
 		d.cursor = 0
 	}
 	return out
+}
+
+func appendConstellationLLR(dst []float32, z complex128, bitsPerSymbol int) []float32 {
+	const clamp = 32.0
+	for bit := 0; bit < bitsPerSymbol; bit++ {
+		minZero, minOne := math.Inf(1), math.Inf(1)
+		mask := 1 << uint(bitsPerSymbol-1-bit)
+		for label := 0; label < 1<<uint(bitsPerSymbol); label++ {
+			point := complex128(mapLabel(label, bitsPerSymbol))
+			delta := z - point
+			distance := real(delta)*real(delta) + imag(delta)*imag(delta)
+			if label&mask == 0 {
+				if distance < minZero {
+					minZero = distance
+				}
+			} else if distance < minOne {
+				minOne = distance
+			}
+		}
+		llr := minOne - minZero
+		if llr > clamp {
+			llr = clamp
+		}
+		if llr < -clamp {
+			llr = -clamp
+		}
+		dst = append(dst, float32(llr))
+	}
+	return dst
+}
+
+func mapLabel(label, bitsPerSymbol int) complex64 {
+	bits := make([]bool, bitsPerSymbol)
+	for i := 0; i < bitsPerSymbol; i++ {
+		bits[i] = label&(1<<uint(bitsPerSymbol-1-i)) != 0
+	}
+	return mapBits(bits, bitsPerSymbol)
 }
 
 func symbolMean(samples []complex64, base, sps int) complex128 {
