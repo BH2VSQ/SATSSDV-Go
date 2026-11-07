@@ -35,29 +35,39 @@ const (
 )
 
 type Update struct {
-	Profile          string  `json:"profile"`
-	Codec            string  `json:"codec"`
-	Callsign         string  `json:"callsign"`
-	ImageID          uint8   `json:"imageId"`
-	PacketsReceived  int     `json:"packetsReceived"`
-	PacketsExpected  int     `json:"packetsExpected"`
-	Coverage         float64 `json:"coverage"`
-	Complete         bool    `json:"complete"`
-	ArchivePreview   bool    `json:"archivePreview,omitempty"`
-	PNGBase64        string  `json:"pngBase64,omitempty"`
-	HasPreview       bool    `json:"hasPreview,omitempty"`
-	PacketDataBase64 string  `json:"packetDataBase64,omitempty"`
-	PacketPath       string  `json:"packetPath,omitempty"`
-	ImageWidth       int     `json:"imageWidth,omitempty"`
-	ImageHeight      int     `json:"imageHeight,omitempty"`
-	Quality          uint8   `json:"quality,omitempty"`
-	FEC              bool    `json:"fec"`
-	Subsampling      uint8   `json:"subsampling,omitempty"`
-	Error            string  `json:"error,omitempty"`
-	Started          bool    `json:"started,omitempty"`
-	SessionID        string  `json:"sessionId,omitempty"`
-	HasAX25SSID      bool    `json:"hasAX25SSID,omitempty"`
-	AX25SourceSSID   uint8   `json:"ax25SourceSSID,omitempty"`
+	Profile                 string  `json:"profile"`
+	Codec                   string  `json:"codec"`
+	Callsign                string  `json:"callsign"`
+	ImageID                 uint8   `json:"imageId"`
+	PacketsReceived         int     `json:"packetsReceived"`
+	PacketsExpected         int     `json:"packetsExpected"`
+	Coverage                float64 `json:"coverage"`
+	Complete                bool    `json:"complete"`
+	ArchivePreview          bool    `json:"archivePreview,omitempty"`
+	PNGBase64               string  `json:"pngBase64,omitempty"`
+	HasPreview              bool    `json:"hasPreview,omitempty"`
+	PacketDataBase64        string  `json:"packetDataBase64,omitempty"`
+	PacketPath              string  `json:"packetPath,omitempty"`
+	ImageWidth              int     `json:"imageWidth,omitempty"`
+	ImageHeight             int     `json:"imageHeight,omitempty"`
+	Quality                 uint8   `json:"quality,omitempty"`
+	FEC                     bool    `json:"fec"`
+	Subsampling             uint8   `json:"subsampling,omitempty"`
+	GIFMode                 bool    `json:"gifMode,omitempty"`
+	GIFFrame                uint16  `json:"gifFrame,omitempty"`
+	GIFFrameComplete        bool    `json:"gifFrameComplete,omitempty"`
+	GIFFramePacketsReceived int     `json:"gifFramePacketsReceived,omitempty"`
+	GIFFramePacketsExpected int     `json:"gifFramePacketsExpected,omitempty"`
+	GIFStart                bool    `json:"gifStart,omitempty"`
+	GIFEnd                  bool    `json:"gifEnd,omitempty"`
+	GIFSaved                bool    `json:"gifSaved,omitempty"`
+	GIFSaveError            string  `json:"gifSaveError,omitempty"`
+	FrameDurationMS         int     `json:"frameDurationMs,omitempty"`
+	Error                   string  `json:"error,omitempty"`
+	Started                 bool    `json:"started,omitempty"`
+	SessionID               string  `json:"sessionId,omitempty"`
+	HasAX25SSID             bool    `json:"hasAX25SSID,omitempty"`
+	AX25SourceSSID          uint8   `json:"ax25SourceSSID,omitempty"`
 }
 
 type imageSession struct {
@@ -119,6 +129,7 @@ type Manager struct {
 	lastSweep      time.Time
 	sessions       map[string]*imageSession
 	ssdv           map[string]*ssdvSession
+	gifStreams     map[string]*gifStreamSession
 }
 
 func NewManager(onUpdate func(Update)) *Manager {
@@ -129,6 +140,7 @@ func NewManager(onUpdate func(Update)) *Manager {
 		reconResult: make(chan reconstructionResult, 1),
 		done:        make(chan struct{}), reconDone: make(chan struct{}), on: onUpdate,
 		sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession),
+		gifStreams: make(map[string]*gifStreamSession),
 	}
 	go m.runReconstruction()
 	go m.run()
@@ -327,6 +339,11 @@ func (m *Manager) pruneSessionsLocked(now time.Time) {
 			delete(m.ssdv, key)
 		}
 	}
+	for key, stream := range m.gifStreams {
+		if now.Sub(stream.lastUpdate) > sessionRetention {
+			delete(m.gifStreams, key)
+		}
+	}
 	for key, session := range m.sessions {
 		if now.Sub(session.lastUpdate) <= sessionRetention {
 			continue
@@ -341,11 +358,11 @@ func (m *Manager) pruneSessionsLocked(now time.Time) {
 }
 
 func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
-	// This native Qt build currently transmits the private SSDV-GIF extension
-	// but does not yet expose animated GIF RX reconstruction/playback. Do not
-	// route its control packets into the static SSDV or PCSI image assemblers.
+	// Keep the private GIF extension out of the static SSDV assembler. GIF
+	// packets use their own frame/session reconstruction state and sparse MCU
+	// decoder; control markers must never be interpreted as JPEG payloads.
 	if packet.GIFMode || packet.Codec == "SSDV-GIF" {
-		return Update{}, false
+		return m.processGIFPacket(packet)
 	}
 	if packet.Codec == "SSDV" {
 		parsed, err := ssdv.ParsePacket(packet.Raw)

@@ -46,6 +46,7 @@
 #include <QDate>
 #include <QTime>
 #include <QPixmap>
+#include <QMovie>
 #include <QAbstractItemView>
 #include <QVector>
 #include <QColor>
@@ -1742,12 +1743,31 @@ void MainWindow::refreshAlbum() {
                 const QImage previewImage = imageFromDataUrl(dataUrl);
                 if (previewImage.isNull()) { statusBar()->showMessage(uiText(QStringLiteral("无法解码相册图像")), 6000); return; }
                 QDialog preview(this);
-                preview.setWindowTitle(uiText(QStringLiteral("图像预览")));
+                const bool animatedGIF = dataUrl.startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive);
+                preview.setWindowTitle(animatedGIF ? uiText(QStringLiteral("GIF 动图预览")) : uiText(QStringLiteral("图像预览")));
                 auto *layout = new QVBoxLayout(&preview);
                 auto *label = new QLabel(&preview);
                 label->setAlignment(Qt::AlignCenter);
-                label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
                 layout->addWidget(label);
+
+                if (animatedGIF) {
+                    auto *buffer = new QBuffer(&preview);
+                    buffer->setData(imageDataUrlBytes(dataUrl));
+                    if (buffer->open(QIODevice::ReadOnly)) {
+                        auto *movie = new QMovie(buffer, QByteArrayLiteral("gif"), &preview);
+                        movie->setScaledSize(previewImage.size().scaled(QSize(1200, 850), Qt::KeepAspectRatio));
+                        if (movie->jumpToFrame(0) && movie->isValid()) {
+                            label->setMovie(movie);
+                            movie->start();
+                        } else {
+                            label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                        }
+                    } else {
+                        label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                    }
+                } else {
+                    label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                }
                 preview.resize(qMin(1260, previewImage.width() + 40), qMin(920, previewImage.height() + 80));
                 preview.exec();
             };
@@ -1871,11 +1891,24 @@ void MainWindow::handleEvent(const QJsonObject &event) {
                 }
             }
         }
+        const QString codec = payload.value(QStringLiteral("codec")).toString();
+        const bool gifMode = codec == QStringLiteral("SSDV-GIF") || payload.value(QStringLiteral("gifMode")).toBool();
+        const int gifFrame = payload.value(QStringLiteral("gifFrame")).toInt();
+        const bool gifFrameComplete = payload.value(QStringLiteral("gifFrameComplete")).toBool();
+        const bool gifEnd = payload.value(QStringLiteral("gifEnd")).toBool();
+        const QString receiveMode = gifMode
+            ? uiText(QStringLiteral("GIF 第 %1 帧 · %2")).arg(gifFrame).arg(gifFrameComplete ? uiText(QStringLiteral("帧完成")) : uiText(QStringLiteral("解码中")))
+            : (complete ? uiText(QStringLiteral("完成")) : uiText(QStringLiteral("接收中")));
         m_rxStatus->setText(QStringLiteral("%1 · %2 · %3% · %4")
-            .arg(shownProfile, callsign).arg(coverage, 0, 'f', 1).arg(complete ? uiText(QStringLiteral("完成")) : uiText(QStringLiteral("接收中"))));
+            .arg(shownProfile, callsign).arg(coverage, 0, 'f', 1).arg(receiveMode));
         m_rxMeta->setText(QStringLiteral("CALL  %1%2   IMAGE ID  %3   PACKETS  %4 / %5   MODE  %6")
             .arg(callsign, ssid).arg(imageId).arg(received).arg(expected).arg(shownProfile));
-        if(payload.value(QStringLiteral("complete")).toBool())refreshAlbum();
+        if (gifMode && !payload.value(QStringLiteral("gifSaveError")).toString().isEmpty()) {
+            statusBar()->showMessage(uiText(QStringLiteral("GIF 已解码，但相册保存失败：%1")).arg(payload.value(QStringLiteral("gifSaveError")).toString()), 8000);
+        } else if (gifMode && gifEnd && payload.value(QStringLiteral("gifSaved")).toBool()) {
+            statusBar()->showMessage(uiText(QStringLiteral("GIF 动图接收完成并已保存到相册（%1 帧）")).arg(gifFrame), 5000);
+        }
+        if (gifMode ? gifEnd : complete) refreshAlbum();
     } else if(name==QStringLiteral("rx:level")){
         const auto p=payloadValue.toObject();m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
     } else if(name==QStringLiteral("rx:spectrum")||name==QStringLiteral("tx:spectrum")){

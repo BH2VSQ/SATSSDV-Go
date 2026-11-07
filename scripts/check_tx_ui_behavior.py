@@ -67,6 +67,19 @@ checks = {
         )[1].split('phase == QStringLiteral("cancelled")', 1)[0]
     ),
 }
+# GIF receive must be connected end-to-end, not merely recognized by the modem.
+rx_manager = (ROOT / "internal" / "rx" / "manager.go").read_text(encoding="utf-8")
+rx_gif = (ROOT / "internal" / "rx" / "gif.go").read_text(encoding="utf-8")
+app_source = (ROOT / "app.go").read_text(encoding="utf-8")
+qt_source = (ROOT / "qt6" / "mainwindow.cpp").read_text(encoding="utf-8")
+checks.update({
+    "GIF packets enter the dedicated RX decoder": "return m.processGIFPacket(packet)" in rx_manager,
+    "repeated GIF bursts reset transport packet de-duplication": "packet.GIFMode && packet.GIFStart" in (ROOT / "internal" / "transport" / "stream.go").read_text(encoding="utf-8"),
+    "GIF RX reconstructs keyframes and sparse MCU updates": "decodeGIFFramePreview" in rx_gif and "UpdatePacketsPreviewSparse" in rx_gif,
+    "GIF RX exports a completed animation": "func (m *Manager) ExportGIF" in rx_gif,
+    "completed RX GIF is archived once as an animation": "func (a *App) archiveRXGIF" in app_source and 'update.Codec == "SSDV-GIF"' in app_source,
+    "Qt album preview plays animated GIF files": "QMovie" in qt_source and "GIF 动图预览" in qt_source,
+})
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     print("FAIL: " + "; ".join(failed), file=sys.stderr)

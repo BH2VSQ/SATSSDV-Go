@@ -42,10 +42,23 @@ transmitting and receiving stations need compatible implementations.
 - Estimated on-air duration: at most 10 minutes per burst.
 - PCSI profiles and multiple visible GIF components are not supported.
 
-## Current native-build scope
+## Native Qt receive support
 
-This change adds GIF transmission and transport packet recognition to the
-native Qt 6 build. Animated GIF RX reconstruction, playback, and GIF album
-archiving are not included here yet; incoming GIF-mode packets are deliberately
-excluded from the static SSDV/PCSI receive assemblers so control markers cannot
-corrupt ordinary image sessions.
+The native Qt 6 build also reconstructs the private GIF stream on RX:
+
+- GIF control and data packets are routed to a dedicated GIF session manager,
+  never to the static SSDV/PCSI assemblers.
+- Repeated frame-open/frame-close control packets are de-duplicated. Keyframes
+  initialize the receive canvas; sparse MCU restart segments update only the
+  changed image regions in later frames.
+- Decodable MCU updates publish progressive PNG previews to the live RX pane.
+  Frame-close commits one full-canvas snapshot with the received frame delay.
+- The final stream-end marker exports one animated GIF and stores one RX album
+  record. The native album preview uses Qt animated-image playback.
+- An explicit stream-start marker resets transport duplicate suppression, so
+  repeated transmissions that reuse the exact same GIF packets are decoded as
+  new RX sessions rather than discarded as duplicates.
+
+Both stations must run a compatible SATSSDV-Go GIF implementation. Ordinary
+SSDV receivers can receive the RF waveform but cannot interpret the private
+`SGV1` control packets or reconstruct the animation.

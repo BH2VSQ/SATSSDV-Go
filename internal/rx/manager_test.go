@@ -572,11 +572,19 @@ func TestSSDVPreviewAttemptIsMadeForEveryValidPacket(t *testing.T) {
 	}
 }
 
-func TestGIFPacketsAreNotRoutedIntoStaticImageAssemblers(t *testing.T) {
-	m := &Manager{}
-	if update, handled := m.process(transport.ReceivedPacket{
-		Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", GIFMode: true,
-	}); handled || update.Codec != "" {
-		t.Fatalf("GIF packets must be excluded from static SSDV/PCSI assemblers: handled=%v update=%+v", handled, update)
+func TestGIFPacketsAreRoutedIntoDedicatedGIFDecoder(t *testing.T) {
+	raw, err := ssdv.NewGIFFrameControlPacket("N0CALL", 2, 320, 240, 4, 10, 0, true, false, true, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+	update, handled := m.process(transport.ReceivedPacket{
+		Profile: "ssdv-ccsds-1200", Codec: "SSDV-GIF", GIFMode: true, Raw: raw,
+	})
+	if !handled || update.Codec != "SSDV-GIF" || !update.GIFMode || update.Error != "" {
+		t.Fatalf("GIF control packet was not accepted by the dedicated decoder: handled=%v update=%+v", handled, update)
+	}
+	if len(m.gifStreams) != 1 || m.gifStreams["ssdv-ccsds-1200|N0CALL|false|0"] == nil {
+		t.Fatalf("GIF control packet did not create an isolated animation session: %+v", m.gifStreams)
 	}
 }

@@ -20,12 +20,13 @@ const (
 )
 
 type packetDedupState struct {
-	seen        map[uint16]struct{}
-	packetZero  []byte
-	eoiPacketID uint16
-	hasEOI      bool
-	complete    bool
-	lastUpdate  time.Time
+	seen         map[uint16]struct{}
+	packetZero   []byte
+	eoiPacketID  uint16
+	hasEOI       bool
+	complete     bool
+	gifStreamEnd bool
+	lastUpdate   time.Time
 }
 
 // StreamDecoder keeps modem, resampler and frame-search state across audio
@@ -230,6 +231,12 @@ func (d *StreamDecoder) markNew(packet ReceivedPacket) bool {
 	}
 	key := fmt.Sprintf("%s|%s|%03d", packet.Profile, packet.Callsign, packet.ImageID)
 	state := d.imageStates[key]
+	if state != nil && packet.GIFMode && packet.GIFStart && state.gifStreamEnd {
+		// A repeated GIF burst may reuse the same 8-bit image IDs and packet
+		// IDs. Reset only after the preceding stream-end marker, so the three
+		// physical copies of this burst's start marker remain de-duplicated.
+		state = nil
+	}
 	if state != nil && packet.GIFMode && state.complete && !packet.GIFControl {
 		// GIF frame IDs are 8-bit. A completed frame ID can be reused after
 		// wraparound; the next packet starts a fresh deduplication state.
@@ -263,6 +270,9 @@ func (d *StreamDecoder) markNew(packet ReceivedPacket) bool {
 	}
 	if packet.GIFControl {
 		state.complete = true
+		if packet.GIFEnd {
+			state.gifStreamEnd = true
+		}
 	} else if packet.EOI && !packet.GIFMode {
 		state.eoiPacketID = packet.PacketID
 		state.hasEOI = true

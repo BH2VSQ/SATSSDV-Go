@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
-	_ "image/gif"
+	"image/gif"
 	_ "image/jpeg"
 	"image/png"
 	"math"
@@ -1140,9 +1140,8 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 }
 
 func (a *App) handleRXImageUpdate(update rxengine.Update) {
-	// Keep only the newest preview bytes in memory. The bounded UI event ring
-	// stores metadata, never repeated base64 copies of entire reconstructed
-	// images or SSDV packet payloads. Qt fetches the latest image on demand.
+	// GIF frames produce progressive PNG previews for the live RX pane, but
+	// the album stores one reconstructed animated GIF per completed stream.
 	var previewPNG []byte
 	if update.PNGBase64 != "" {
 		data, err := decodeRXPreviewPNG(update.PNGBase64)
@@ -1157,13 +1156,20 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 		}
 	}
 
-	// Archive every decodable preview, not only the final packet-complete image.
-	// The same RX album record is updated as the scan grows and when it completes.
-	if update.PNGBase64 != "" && (update.ArchivePreview || update.Complete) && previewPNG != nil {
+	if update.Codec == "SSDV-GIF" {
+		if update.GIFEnd {
+			if err := a.archiveRXGIF(update); err != nil {
+				update.GIFSaveError = err.Error()
+			} else {
+				update.GIFSaved = true
+			}
+		}
+	} else if update.PNGBase64 != "" && (update.ArchivePreview || update.Complete) && previewPNG != nil {
 		if err := a.archiveRXImageData(update, previewPNG); err != nil {
 			update.Error = err.Error()
 		}
 	}
+
 	if update.Codec == "SSDV" && update.PacketDataBase64 != "" {
 		if path, err := a.archiveRXSSDVPackets(update); err != nil {
 			if update.Error == "" {
@@ -1173,12 +1179,128 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 			update.PacketPath = path
 		}
 	}
-	// Binary payloads are fetched through GetLatestRXImageData and are never
-	// retained in the event history. This keeps memory bounded under repeated
-	// progressive image updates and avoids large JSON event responses.
+	// Binary previews are fetched through GetLatestRXImageData; do not retain
+	// large base64 PNGs in the bounded event history.
 	update.PNGBase64 = ""
 	update.PacketDataBase64 = ""
 	a.emit("rx:image", update)
+}
+
+// archiveRXGIF exports only a fully reconstructed stream. Frame snapshots are
+// kept in RX.Manager until GIFEnd, then written as one animated album record.
+func (a *App) archiveRXGIF(update rxengine.Update) error {
+	if a.rxManager == nil || strings.TrimSpace(update.SessionID) == "" {
+		return errors.New("received GIF session is unavailable")
+	}
+	data, callsign, frameCount, err := a.rxManager.ExportGIF(update.SessionID)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 || len(data) > 16*1024*1024 {
+		return errors.New("reconstructed GIF is empty or exceeds the 16 MiB album limit")
+	}
+	config, err := gif.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("validate reconstructed GIF: %w", err)
+	}
+	dir, err := a.requireDataDir()
+	if err != nil {
+		return err
+	}
+	a.albumMu.Lock()
+	defer a.albumMu.Unlock()
+	imageDir := filepath.Join(dir, "album", "images")
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
+		return err
+	}
+	created := time.Now().UTC()
+	name := fmt.Sprintf("RX_%s_%s_%03d.gif", created.Format("20060102T150405.000000000Z"), safeAlbumName(callsign), update.ImageID)
+	path := filepath.Join(imageDir, name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	indexPath := filepath.Join(dir, "album.json")
+	var index album.Index
+	if err := storage.LoadJSON(indexPath, &index); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(path)
+		return err
+	}
+
+	// Prefer updating an existing record for this RX stream. This keeps the
+	// album to one GIF item even if an older build already archived previews.
+	updated := false
+	var oldPaths []string
+	for i := range index.Records {
+		record := &index.Records[i]
+		if record.Type != "RX" || record.SessionID != update.SessionID || record.Profile != update.Profile || record.Callsign != callsign {
+			continue
+		}
+		if !updated {
+			if record.ImagePath != "" && record.ImagePath != path {
+				oldPaths = append(oldPaths, record.ImagePath)
+			}
+			if record.PacketPath != "" {
+				oldPaths = append(oldPaths, record.PacketPath)
+			}
+			record.ImagePath = path
+			record.PacketPath = ""
+			record.ImageWidth, record.ImageHeight = config.Width, config.Height
+			record.ImageID = uint16(update.ImageID)
+			record.CreatedAt = created
+			record.PacketsReceived, record.PacketsExpected = update.PacketsReceived, update.PacketsExpected
+			record.Quality = fmt.Sprintf("SSDV GIF · %d frames", frameCount)
+			record.Status = "complete"
+			updated = true
+		} else {
+			if record.ImagePath != "" {
+				oldPaths = append(oldPaths, record.ImagePath)
+			}
+			if record.PacketPath != "" {
+				oldPaths = append(oldPaths, record.PacketPath)
+			}
+			record.ID = "" // removed from the compacted slice below
+		}
+	}
+	if len(index.Records) > 0 {
+		compacted := index.Records[:0]
+		for _, record := range index.Records {
+			if record.ID != "" {
+				compacted = append(compacted, record)
+			}
+		}
+		index.Records = compacted
+	}
+	if !updated {
+		index.Records = append(index.Records, album.Record{
+			ID:   fmt.Sprintf("rx-gif-%s-%s", created.Format("20060102150405.000000000"), safeAlbumName(update.Profile)),
+			Type: "RX", ImagePath: path, ImageWidth: config.Width, ImageHeight: config.Height,
+			CreatedAt: created, Profile: update.Profile, Callsign: callsign, ImageID: uint16(update.ImageID),
+			SessionID: update.SessionID, PacketsReceived: update.PacketsReceived, PacketsExpected: update.PacketsExpected,
+			Quality: fmt.Sprintf("SSDV GIF · %d frames", frameCount), Status: "complete",
+		})
+	}
+	if err := storage.SaveJSON(indexPath, index); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	// Remove only superseded media that remains inside the application album.
+	root, rootErr := filepath.Abs(filepath.Join(dir, "album"))
+	if rootErr == nil {
+		for _, old := range oldPaths {
+			if old == "" || old == path {
+				continue
+			}
+			target, absErr := filepath.Abs(old)
+			if absErr != nil {
+				continue
+			}
+			rel, relErr := filepath.Rel(root, target)
+			if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				_ = os.Remove(target)
+			}
+		}
+	}
+	return nil
 }
 
 func decodeRXPreviewPNG(encoded string) ([]byte, error) {
