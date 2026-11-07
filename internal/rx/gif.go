@@ -430,6 +430,34 @@ func (m *Manager) ExportGIF(sessionID string) ([]byte, string, int, error) {
 	return m.exportGIF(sessionID)
 }
 
+// ReleaseGIFExport discards the composed PNG snapshots after the application
+// has successfully written the completed animation to its album. The compact
+// stream record remains so late duplicate packets can still be suppressed and
+// the next GIFStart can establish a fresh session.
+func (m *Manager) ReleaseGIFExport(sessionID string) bool {
+	if m == nil || strings.TrimSpace(sessionID) == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, stream := range m.gifStreams {
+		if stream.sessionID != sessionID || !stream.complete {
+			continue
+		}
+		if stream.frames == nil && stream.delays == nil && stream.canvas == nil && stream.pending == nil {
+			return false
+		}
+		stream.frames = nil
+		stream.delays = nil
+		stream.frameBytes = 0
+		stream.canvas = nil
+		stream.pending = nil
+		stream.lastUpdate = time.Now()
+		return true
+	}
+	return false
+}
+
 // RX stores composed PNG snapshots rather than raw SSDV packets, so the
 // exported file reflects exactly the frames reconstructed by this receiver.
 func (m *Manager) exportGIF(sessionID string) ([]byte, string, int, error) {

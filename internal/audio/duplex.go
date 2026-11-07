@@ -20,6 +20,11 @@ type CaptureStream interface {
 	StartCapture(context.Context, func([]float32)) error
 	StopCapture() error
 }
+
+// PlaybackStream.Play is synchronous. Implementations may read directly from
+// the supplied sample slice until Play returns; callers must keep the slice
+// alive and must not mutate it during playback. This contract avoids a second
+// full-duration copy for long image/GIF transmissions.
 type PlaybackStream interface {
 	Play(context.Context, []float32, int) error
 	StopPlayback() error

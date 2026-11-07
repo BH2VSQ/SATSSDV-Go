@@ -617,12 +617,15 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 		quality = "medium"
 	}
 
-	job := txqueue.Job{ID: rendered.ID, ImageName: rendered.Name, Profile: profileID, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
+	jobID, imageName, gifRect := rendered.ID, rendered.Name, rendered.GIFRect
+	job := txqueue.Job{ID: jobID, ImageName: imageName, Profile: profileID, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
 	// The GIF can be expensive to decode/packetize. Prepare it in the TX worker,
 	// not on the Qt event thread, then reuse the same burst for each repeat cycle.
 	prepared := false
 	var prepareErr error
 	var frames []gifmode.Frame
+	var archiveGIF []byte
+	var archiveWidth, archiveHeight int
 	var stats gifmode.Stats
 	var waveform []float32
 	var waveformRate int
@@ -631,7 +634,7 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 	var baseImageID uint8
 	sender := func(ctx context.Context, _ txqueue.Job) error {
 		if !prepared {
-			frames, prepareErr = gifmode.DecodeTemplate(gifData, quality, base, overlay, rendered.GIFRect)
+			frames, prepareErr = gifmode.DecodeTemplate(gifData, quality, base, overlay, gifRect)
 			if prepareErr != nil {
 				prepared = true
 				return prepareErr
@@ -639,6 +642,17 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 			if err := ctx.Err(); err != nil {
 				prepared = true
 				return err
+			}
+			archiveWidth = frames[0].Image.Bounds().Dx()
+			archiveHeight = frames[0].Image.Bounds().Dy()
+			archiveGIF, prepareErr = gifmode.EncodeGIF(frames)
+			if prepareErr != nil {
+				prepared = true
+				return fmt.Errorf("prepare TX GIF album preview: %w", prepareErr)
+			}
+			if len(archiveGIF) == 0 || len(archiveGIF) > 16*1024*1024 {
+				prepared = true
+				return errors.New("transmitted GIF preview is empty or exceeds the 16 MiB album limit")
 			}
 			a.mu.Lock()
 			currentCallsign = strings.TrimSpace(a.settings.Callsign)
@@ -664,6 +678,11 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 				return prepareErr
 			}
 			stats = packetStats
+			// The compressed album animation is now prepared and packetization is
+			// complete. Do not retain every full-resolution RGBA frame or the source
+			// GIF/template layers for the duration of a potentially long TX burst.
+			frames = nil
+			gifData, base, overlay = nil, nil, nil
 			airtime := gifmode.EstimateAirtime(stats.TotalPackets, parsedProfile.BitRate)
 			if airtime > 10*time.Minute {
 				prepareErr = fmt.Errorf("GIF template requires an estimated %s of airtime (%d packets); the GIF mode safety limit is 10 minutes", airtime.Round(time.Second), stats.TotalPackets)
@@ -682,10 +701,15 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 				return prepareErr
 			}
 			waveform, prepareErr = encoder.EncodePackets(packets)
+			packets = nil
 			if prepareErr != nil {
 				prepared = true
 				return fmt.Errorf("modulate GIF template packets: %w", prepareErr)
 			}
+			// Return temporary frame/packet allocations to the Go heap before the
+			// long playback phase. This runs once during TX preparation, not in the
+			// audio callback or between frames.
+			runtimedebug.FreeOSMemory()
 			waveformRate, prepareErr = encoder.SampleRate()
 			if prepareErr == nil {
 				prepareErr = transport.FilterTXWaveformInPlace(domain.TransportMode(profileID), waveform, waveformRate)
@@ -714,10 +738,10 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 		}); err != nil {
 			return err
 		}
-		if err := a.archiveTXGIF(frames, profileID, currentCallsign, baseImageID, stats, startedAt); err != nil {
+		if err := a.archiveTXGIFData(archiveGIF, archiveWidth, archiveHeight, profileID, currentCallsign, baseImageID, stats, startedAt); err != nil {
 			return fmt.Errorf("archive transmitted GIF: %w", err)
 		}
-		a.emit("tx:gif-sent", map[string]any{"fileName": rendered.Name, "frames": stats.Frames, "packetsSent": stats.TotalPackets, "startedAt": startedAt})
+		a.emit("tx:gif-sent", map[string]any{"fileName": imageName, "frames": stats.Frames, "packetsSent": stats.TotalPackets, "startedAt": startedAt})
 		return nil
 	}
 	return a.startTransmissionWithSender(job, repeat, intervalSeconds, sender)
@@ -886,13 +910,12 @@ func (a *App) archiveTXImage(img image.Image, job txqueue.Job, callsign string, 
 	return nil
 }
 
-func (a *App) archiveTXGIF(frames []gifmode.Frame, profileID, callsign string, imageID uint8, stats gifmode.Stats, transmissionStartedAt time.Time) error {
-	data, err := gifmode.EncodeGIF(frames)
-	if err != nil {
-		return err
-	}
+func (a *App) archiveTXGIFData(data []byte, width, height int, profileID, callsign string, imageID uint8, stats gifmode.Stats, transmissionStartedAt time.Time) error {
 	if len(data) == 0 || len(data) > 16*1024*1024 {
 		return errors.New("transmitted GIF preview is empty or exceeds the 16 MiB album limit")
+	}
+	if width <= 0 || height <= 0 {
+		return errors.New("transmitted GIF preview has invalid dimensions")
 	}
 	dir, err := a.requireDataDir()
 	if err != nil {
@@ -920,7 +943,7 @@ func (a *App) archiveTXGIF(frames []gifmode.Frame, profileID, callsign string, i
 	}
 	index.Records = append(index.Records, album.Record{
 		ID:   fmt.Sprintf("tx-gif-%s-%d", created.Format("20060102150405.000000000"), imageID),
-		Type: "TX", ImagePath: path, ImageWidth: frames[0].Image.Bounds().Dx(), ImageHeight: frames[0].Image.Bounds().Dy(),
+		Type: "TX", ImagePath: path, ImageWidth: width, ImageHeight: height,
 		CreatedAt: created, Profile: profileID, Callsign: callsign, ImageID: uint16(imageID),
 		PacketsReceived: stats.TotalPackets, PacketsExpected: stats.TotalPackets,
 		Quality: fmt.Sprintf("SSDV GIF · %d frames", stats.Frames), Status: "sent",
@@ -1163,6 +1186,9 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 				update.GIFSaveError = err.Error()
 			} else {
 				update.GIFSaved = true
+				// Once the compressed GIF is safely archived, keep only session
+				// metadata for duplicate suppression; release all PNG frame snapshots.
+				a.rxManager.ReleaseGIFExport(update.SessionID)
 			}
 		}
 	} else if update.PNGBase64 != "" && (update.ArchivePreview || update.Complete) && previewPNG != nil {
@@ -1348,6 +1374,8 @@ func (a *App) setLatestRXGIF(data []byte) {
 	copyOfData := append([]byte(nil), data...)
 	a.rxPreviewMu.Lock()
 	a.rxPreviewGIF = copyOfData
+	// A completed animation supersedes the last progressive PNG snapshot.
+	a.rxPreviewPNG = nil
 	a.rxPreviewMu.Unlock()
 }
 

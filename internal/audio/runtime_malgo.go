@@ -263,7 +263,10 @@ func (m *MalgoRuntime) PlayWithProgress(ctx context.Context, samples []float32, 
 		}
 		m.playback = dev
 	}
-	job := &playbackJob{done: make(chan struct{}), samples: append([]float32(nil), samples...)}
+	// PlayWithProgress is synchronous: the caller keeps samples alive and must not
+	// mutate them until this method returns. The playback callback only reads the
+	// slice, so borrowing it avoids a second full-duration waveform allocation.
+	job := &playbackJob{done: make(chan struct{}), samples: samples}
 	m.job = job
 	dev := m.playback
 	m.playbackMu.Unlock()

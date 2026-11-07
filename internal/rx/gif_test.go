@@ -392,3 +392,33 @@ func TestGIFManagerDeduplicatesRepeatedControlAndAcceptsRepeatedTX(t *testing.T)
 		t.Fatalf("repeated burst export failed: count=%d err=%v", count, exportErr)
 	}
 }
+
+func TestReleaseGIFExportDropsFrameSnapshotsButKeepsDuplicateSuppressionState(t *testing.T) {
+	canvas := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	stream := &gifStreamSession{
+		sessionID: "completed-session", complete: true,
+		frames: [][]byte{{1, 2, 3}, {4, 5, 6}}, delays: []int{10, 20},
+		frameBytes: 6, canvas: canvas,
+		lastEndImageID: 42, hasLastEnd: true,
+	}
+	manager := &Manager{gifStreams: map[string]*gifStreamSession{"station": stream}}
+
+	if manager.ReleaseGIFExport("still-active") {
+		t.Fatal("ReleaseGIFExport released an unknown session")
+	}
+	if len(stream.frames) != 2 {
+		t.Fatal("ReleaseGIFExport modified a different session")
+	}
+	if !manager.ReleaseGIFExport("completed-session") {
+		t.Fatal("ReleaseGIFExport did not release the completed session")
+	}
+	if stream.frames != nil || stream.delays != nil || stream.frameBytes != 0 || stream.canvas != nil || stream.pending != nil {
+		t.Fatalf("GIF frame buffers were retained: frames=%d delays=%d bytes=%d canvas=%v pending=%v", len(stream.frames), len(stream.delays), stream.frameBytes, stream.canvas != nil, stream.pending != nil)
+	}
+	if !stream.complete || !stream.hasLastEnd || stream.lastEndImageID != 42 || stream.sessionID != "completed-session" {
+		t.Fatal("release removed metadata required for duplicate suppression")
+	}
+	if manager.ReleaseGIFExport("completed-session") {
+		t.Fatal("second release unexpectedly reported retained frame data")
+	}
+}

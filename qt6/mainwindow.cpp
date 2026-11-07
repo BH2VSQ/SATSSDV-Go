@@ -112,7 +112,9 @@ public:
         }
 
         m_movie = new QMovie(m_movieBuffer, QByteArrayLiteral("gif"), this);
-        m_movie->setCacheMode(QMovie::CacheAll);
+        // Keep only the current decoded frame. CacheAll retains every full-size frame
+        // and makes long RX animations consume memory proportional to frame count.
+        m_movie->setCacheMode(QMovie::CacheNone);
         if (!m_movie->isValid() || !m_movie->jumpToFrame(0)) {
             if (errorMessage) {
                 const QString detail = m_movie->lastErrorString();
