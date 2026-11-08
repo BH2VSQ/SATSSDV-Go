@@ -116,3 +116,150 @@ func TestEstimateBandSNRRejectsNoiseOnlyLegacySingleGuard(t *testing.T) {
 		t.Fatalf("single-guard noise-only input returned valid SNR: %+v", got)
 	}
 }
+
+func TestBandSNRTrackerNeverPublishesWithoutModemLock(t *testing.T) {
+	tracker := &BandSNRTracker{}
+	const sampleRate = 48000
+	low, high := 450.0, 3000.0
+	for i := 0; i < 30; i++ {
+		noise := make([]float32, 4096)
+		rng := rand.New(rand.NewSource(int64(0x9910 + i)))
+		for j := range noise {
+			noise[j] = float32(rng.NormFloat64() * 0.01)
+		}
+		bins, err := Spectrum(noise, sampleRate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := tracker.EstimateWithLock(bins, low, high, true, false)
+		if got.Valid {
+			t.Fatalf("unlocked noise spectrum was published as SNR: %+v", got)
+		}
+	}
+}
+
+func TestBandSNRTrackerDoesNotLearnDigitalSilenceAsNoiseFloor(t *testing.T) {
+	tracker := &BandSNRTracker{}
+	silence := make([]float32, 4096)
+	for i := 0; i < 30; i++ {
+		bins, err := Spectrum(silence, 48000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracker.EstimateWithLock(bins, 450, 3000, false, false)
+	}
+	if tracker.Ready() {
+		t.Fatal("digital silence was accepted as an idle-noise baseline")
+	}
+}
+
+func TestBandSNRTrackerHidesSNRWhenCurrentWindowReturnsToNoise(t *testing.T) {
+	tracker := &BandSNRTracker{}
+	const sampleRate = 48000
+	low, high := 450.0, 3000.0
+	for i := 0; i < snrNoiseLearningFrames+2; i++ {
+		noise := make([]float32, 4096)
+		rng := rand.New(rand.NewSource(int64(0x1d1e + i)))
+		for j := range noise {
+			noise[j] = float32(rng.NormFloat64() * 0.01)
+		}
+		bins, err := Spectrum(noise, sampleRate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracker.EstimateWithEvidence(bins, low, high, false, false, false)
+	}
+	if !tracker.Ready() {
+		t.Fatal("noise baseline did not finish learning")
+	}
+	rng := rand.New(rand.NewSource(0x77a0))
+	for frame := 0; frame < 50; frame++ {
+		noise := make([]float32, 4096)
+		for j := range noise {
+			noise[j] = float32(rng.NormFloat64() * 0.01)
+		}
+		current, err := Spectrum(noise, sampleRate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := tracker.EstimateWithEvidence(current, low, high, false, true, true)
+		if got.Valid {
+			t.Fatalf("noise-only window %d reused stale packet evidence as SNR: %+v", frame, got)
+		}
+	}
+}
+
+func TestBandSNRTrackerRebasesGainStepEvenWhenDemodulatorLockIsStale(t *testing.T) {
+	const sampleRate = 48000
+	tracker := &BandSNRTracker{}
+	const lowHz, highHz = 450.0, 3000.0
+	for frame := 0; frame < snrNoiseLearningFrames+2; frame++ {
+		noise := make([]float32, 4096)
+		rng := rand.New(rand.NewSource(int64(0x62617365 + frame)))
+		for i := range noise {
+			noise[i] = float32(rng.NormFloat64() * 0.001)
+		}
+		bins, err := Spectrum(noise, sampleRate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tracker.EstimateWithEvidence(bins, lowHz, highHz, false, false, false)
+	}
+	if !tracker.Ready() {
+		t.Fatal("initial idle-noise baseline did not become ready")
+	}
+	initialBandPower := 0.0
+	for i, frequency := range tracker.frequencies {
+		if frequency >= lowHz && frequency <= highHz {
+			initialBandPower += tracker.noisePower[i]
+		}
+	}
+
+	// Simulate a 26 dB input/AGC noise-floor rise while an FSK/GMSK lock flag
+	// remains latched from an earlier packet. A current FFT with no modem
+	// feature must rebase the noise spectrum rather than compare against the
+	// obsolete low-gain reference and later publish an inflated SNR.
+	for frame := 0; frame < snrGainShiftConfirm+2; frame++ {
+		noise := make([]float32, 4096)
+		rng := rand.New(rand.NewSource(int64(0x61676300 + frame)))
+		for i := range noise {
+			noise[i] = float32(rng.NormFloat64() * 0.02)
+		}
+		bins, err := Spectrum(noise, sampleRate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := tracker.EstimateWithEvidence(bins, lowHz, highHz, false, true, true)
+		if got.Valid {
+			t.Fatalf("idle noise with stale modem/CRC evidence was published: %+v", got)
+		}
+	}
+	if tracker.gainShiftFrames != 0 {
+		t.Fatalf("gain-step detector did not settle after confirmations: remaining=%d", tracker.gainShiftFrames)
+	}
+
+	var ratios []float64
+	for i, frequency := range tracker.frequencies {
+		if frequency < lowHz || frequency > highHz || tracker.noisePower[i] <= 0 {
+			continue
+		}
+		// The updated baseline should now match the new gain within a few dB.
+		ratio := 10 * math.Log10(tracker.noisePower[i])
+		if finiteSNR(ratio) {
+			ratios = append(ratios, ratio)
+		}
+	}
+	if len(ratios) < 16 {
+		t.Fatalf("too few in-channel baseline bins after gain step: %d", len(ratios))
+	}
+	updatedBandPower := 0.0
+	for i, frequency := range tracker.frequencies {
+		if frequency >= lowHz && frequency <= highHz {
+			updatedBandPower += tracker.noisePower[i]
+		}
+	}
+	gotGainDB := 10 * math.Log10(updatedBandPower/initialBandPower)
+	if math.Abs(gotGainDB-20*math.Log10(20)) > 1.5 {
+		t.Fatalf("noise reference did not follow the 26 dB input-gain step: tracked %.2f dB", gotGainDB)
+	}
+}

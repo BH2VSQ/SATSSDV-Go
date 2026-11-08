@@ -69,6 +69,13 @@ func (d *ARCSSD2400Demodulator) CarrierOffsetHz() float64 {
 	return d.cfoPhase * float64(19200) / (2 * math.Pi * phaseLagSamples)
 }
 
+// CarrierLocked reports whether the AFC estimator has converged on a
+// phase-consistent carrier offset. A returned lock is used as signal-presence
+// evidence for diagnostics, not as proof that a CCSDS packet has passed CRC.
+func (d *ARCSSD2400Demodulator) CarrierLocked() bool {
+	return d != nil && d.cfoLocked
+}
+
 // Feed returns recovered MSB-first channel bits. The returned bits may be
 // passed to FindDataUnitsInBits after enough samples have accumulated.
 func (d *ARCSSD2400Demodulator) Feed(samples []float32, sampleRate int) ([]bool, error) {

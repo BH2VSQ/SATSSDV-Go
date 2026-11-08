@@ -77,8 +77,13 @@ func TestSoftFECMARYStreamRoundTripAllConstellations(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if wireCount != 10 {
-						t.Fatalf("physical packet count=%d, want 8+2 parity", wireCount)
+					wantWireCount := map[domain.TransportMode]int{
+						domain.SSDVQPSK1600:  8,
+						domain.SSDV8PSK1600:  9,
+						domain.SSDV16QAM1600: 10,
+					}[profile]
+					if wireCount != wantWireCount {
+						t.Fatalf("physical packet count=%d, want %d for balanced FEC", wireCount, wantWireCount)
 					}
 
 					dec, err := NewStreamDecoder(profile, audioRate)
@@ -98,8 +103,9 @@ func TestSoftFECMARYStreamRoundTripAllConstellations(t *testing.T) {
 						}
 						got = append(got, decoded...)
 					}
-					if dec.marySDF3PacketsOK < uint64(len(packets)) || dec.marySDF3PacketsBad != 0 {
-						t.Fatalf("SDF3 receiver state mode=%d chunks=%d/%d resync=%d error=%q diag=%+v", dec.maryFECMode, dec.marySDF3PacketsOK, dec.marySDF3PacketsBad, dec.marySDF3Resyncs, dec.marySDF3LastError, dec.Diagnostics())
+					wireGroups := uint64((wireCount + 9) / 10)
+					if dec.marySDF3PacketsOK < wireGroups || dec.marySDF3PacketsBad != 0 {
+						t.Fatalf("SDF3 receiver state mode=%d groups=%d/%d resync=%d error=%q diag=%+v", dec.maryFECMode, dec.marySDF3PacketsOK, wireGroups, dec.marySDF3Resyncs, dec.marySDF3LastError, dec.Diagnostics())
 					}
 					if len(got) != len(packets) {
 						t.Fatalf("decoded %d/%d image packets", len(got), len(packets))
@@ -448,7 +454,7 @@ func TestSDF3MARYReacquiresAfterDroppedPacketAndUsesPacketFEC(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(string(profile)+"/"+tc.name, func(t *testing.T) {
 				packets := makeSoftFECTestPackets(t, 8)
-				enc, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+				enc, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 1, MARYFECProfile: MARYFECRobust})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -593,7 +599,7 @@ func TestSoftFECMARYDecoderReacquiresAfterSilence(t *testing.T) {
 		copy(second[i][224:], parity)
 	}
 	profile := domain.SSDVQPSK1600
-	enc, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+	enc, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYFECProfile: MARYFECRobust})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -620,8 +626,8 @@ func TestSoftFECMARYDecoderReacquiresAfterSilence(t *testing.T) {
 		}
 	}
 	feed(firstWave)
-	if dec.marySDF3PacketsOK != 10 {
-		t.Fatalf("first SDF3 burst decoded %d/10 physical units: %+v", dec.marySDF3PacketsOK, dec.Diagnostics())
+	if dec.marySDF3PacketsOK != 1 {
+		t.Fatalf("first SDF3 burst decoded %d/2 groups: %+v", dec.marySDF3PacketsOK, dec.Diagnostics())
 	}
 	noise := make([]float32, 7200)
 	noiseSource := rand.New(rand.NewSource(0xface))
@@ -633,8 +639,8 @@ func TestSoftFECMARYDecoderReacquiresAfterSilence(t *testing.T) {
 		t.Fatalf("decoder was not re-armed after silence: mode=%d", dec.maryFECMode)
 	}
 	feed(secondWave)
-	if dec.marySDF3PacketsOK != 20 || dec.marySDF3LastError != "" {
-		t.Fatalf("second burst state: chunks=%d error=%q diag=%+v", dec.marySDF3PacketsOK, dec.marySDF3LastError, dec.Diagnostics())
+	if dec.marySDF3PacketsOK != 2 || dec.marySDF3LastError != "" {
+		t.Fatalf("second burst state: groups=%d error=%q diag=%+v", dec.marySDF3PacketsOK, dec.marySDF3LastError, dec.Diagnostics())
 	}
 	if len(got) != 16 {
 		t.Fatalf("received %d packets across two bursts, want 16", len(got))

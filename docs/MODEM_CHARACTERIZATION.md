@@ -3,8 +3,9 @@
 The opt-in `TestModeNoiseAndOffsetCharacterization` test exercises all eight
 transport modes using `Encoder.StreamPackets()` and the production streaming
 receiver. In particular, QPSK/8PSK/16QAM are measured using the current SDF3
-per-data-unit training, repeated descriptor, K=7 rate-1/2 convolutional FEC,
-interleaver and soft-decision Viterbi receive path. The legacy `EncodePackets()`
+grouped training and descriptor, modulation-specific K=7 FEC profile
+(rate 3/4 QPSK, rate 2/3 8PSK, rate 1/2 16QAM), interleaver and
+soft-decision Viterbi receive path. The legacy `EncodePackets()`
 M-ary waveform is not used for this report.
 
 The AWGN sweep uses 30, 24, 18, 12, 9, 6, 3 and 0 dB. The default is ten
@@ -28,7 +29,7 @@ multipath, time-varying multipath or hardware AGC/compression. Validate with
 recorded receiver WAV/IQ captures and actual satellite passes before publishing
 operational sensitivity or Doppler limits.
 
-The live RX SNR value uses a temporal in-channel idle-noise profile and is not RF-calibrated. See [RX SNR estimation](RX_SNR_ESTIMATION.md) for the calculation, display gates, calibration tests and limitations.
+The live audio SNR display is currently enabled only for AFSK 1200, where two separated tone groups leave a usable noise reference. QPSK/8PSK/16QAM, GMSK 2400 and Auto RX intentionally show `SNR --` until a training/pilot-based or calibrated noise estimator is implemented. See [RX SNR estimation](RX_SNR_ESTIMATION.md) for scope and limitations.
 
 Manual run from the repository root (PowerShell):
 

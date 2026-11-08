@@ -1,6 +1,11 @@
 package transport
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
+)
 
 func TestStreamDecoderStartsNewImageWhenPacketZeroReturns(t *testing.T) {
 	d := &StreamDecoder{}
@@ -59,5 +64,31 @@ func TestStreamDecoderDoesNotRollOverWhenPacketZeroArrivesLate(t *testing.T) {
 	packet.PacketID = 12
 	if d.markNew(packet) {
 		t.Fatal("late packet 0 incorrectly created a new session and cleared duplicate history")
+	}
+}
+
+func TestStreamDiagnosticsRequireRecentlyValidatedPacket(t *testing.T) {
+	decoder, err := NewStreamDecoder(domain.SSDVCCSDS2400, 19200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decoder.Diagnostics(); got.ValidPacketRecent {
+		t.Fatalf("new decoder claims a recent valid packet: %+v", got)
+	}
+	// Carrier acquisition by itself is deliberately insufficient evidence.
+	if decoder.gmsk2400.CarrierLocked() && decoder.Diagnostics().ValidPacketRecent {
+		t.Fatal("AFC lock alone must not validate a packet")
+	}
+	decoder.noteValidPackets([]ReceivedPacket{{PacketID: 1}})
+	if got := decoder.Diagnostics(); !got.ValidPacketRecent {
+		t.Fatalf("recent integrity-checked packet was not exposed: %+v", got)
+	}
+	decoder.lastValidPacketAt = time.Now().Add(-4 * time.Second)
+	if got := decoder.Diagnostics(); got.ValidPacketRecent {
+		t.Fatalf("stale packet remained valid for SNR gating: %+v", got)
+	}
+	decoder.Reset()
+	if got := decoder.Diagnostics(); got.ValidPacketRecent {
+		t.Fatalf("reset retained recent-packet evidence: %+v", got)
 	}
 }

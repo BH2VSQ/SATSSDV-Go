@@ -157,7 +157,7 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 	blockRMS := audioBlockRMS(samples)
 	silenceRatio := 0.10
 	if d.packetizedMode {
-		// SDF3 packet boundaries contain a deliberate quiet guard. Use a wider
+		// SDF3 group boundaries contain a deliberate quiet guard. Use a wider
 		// threshold so ordinary RF/audio noise does not hide the guard and keep
 		// the modem locked across the next training word.
 		silenceRatio = 0.20
@@ -828,8 +828,9 @@ func (d *StreamDemodulator) Diagnostics() StreamDiagnostics {
 	if d == nil {
 		return StreamDiagnostics{}
 	}
-	return StreamDiagnostics{
+	status := StreamDiagnostics{
 		ReacquireCount: d.reacquireCount, PacketizedMode: d.packetizedMode, Locked: d.locked, BufferedSamples: len(d.baseband), SignalRMS: d.signalRMS,
 		SilenceSamples: d.silenceSamples, BurstGeneration: d.burstGeneration,
 	}
+	return status
 }

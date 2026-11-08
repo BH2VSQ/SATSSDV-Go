@@ -81,6 +81,8 @@ type App struct {
 	rxSNRTracker       dsp.BandSNRTracker
 	rxSNRProfile       string
 	rxSNRSampleRate    int
+	rxModemLocked      atomic.Bool
+	rxPacketValidated  atomic.Bool
 	txSpectrumMu       sync.Mutex
 	txSpectrumLastEmit time.Time
 	txProgressMu       sync.Mutex
@@ -1304,6 +1306,16 @@ func rxAudioSNRPassband(profileID string, sampleRate int) (float64, float64) {
 }
 
 func (a *App) estimateTrackedRXAudioSNR(bins []dsp.SpectrumBin, profileID string, sampleRate int) dsp.BandSNR {
+	// AFSK1200 leaves separated mark/space clusters and intervening guard
+	// bins. Wideband M-ary/GMSK spectra do not leave a dependable in-band noise
+	// reference; return unavailable rather than extrapolate from a stale idle
+	// profile and display an implausibly high number.
+	if profileID == domain.AutoReceiveProfile || strings.Contains(profileID, "1600") || strings.Contains(profileID, "2400") {
+		return dsp.BandSNR{}
+	}
+	if profileID != string(domain.SSDVAX25) && profileID != string(domain.SSDVCCSDS1200) && profileID != string(domain.PCSICCSDS1200) {
+		return dsp.BandSNR{}
+	}
 	low, high := rxAudioSNRPassband(profileID, sampleRate)
 	if high <= low {
 		return dsp.BandSNR{}
@@ -1319,7 +1331,7 @@ func (a *App) estimateTrackedRXAudioSNR(bins []dsp.SpectrumBin, profileID string
 		a.rxSNRProfile = profileID
 		a.rxSNRSampleRate = sampleRate
 	}
-	return a.rxSNRTracker.Estimate(bins, low, high, signalHint)
+	return a.rxSNRTracker.EstimateWithEvidence(bins, low, high, signalHint, a.rxModemLocked.Load(), a.rxPacketValidated.Load())
 }
 
 func (a *App) resetRXAudioSNRTracker() {
@@ -1328,6 +1340,8 @@ func (a *App) resetRXAudioSNRTracker() {
 	}
 	a.rxSNRMu.Lock()
 	a.rxSNRTracker.Reset()
+	a.rxModemLocked.Store(false)
+	a.rxPacketValidated.Store(false)
 	a.rxSNRProfile = ""
 	a.rxSNRSampleRate = 0
 	a.rxSNRMu.Unlock()
@@ -1385,9 +1399,13 @@ func (a *App) handleRXAudio(samples []float32) {
 		}
 		rms := math.Sqrt(sum / float64(len(window)))
 		db := 20 * math.Log10(math.Max(rms, 1e-12))
+		snrReason := ""
+		if profileID == domain.AutoReceiveProfile || strings.Contains(profileID, "1600") || strings.Contains(profileID, "2400") {
+			snrReason = "wideband-noise-reference-unavailable"
+		}
 		a.emit("rx:level", map[string]interface{}{
 			"rmsDbfs": db, "peak": float64(peak),
-			"snrDb": snr.SNRDB, "snrValid": snr.Valid,
+			"snrDb": snr.SNRDB, "snrValid": snr.Valid, "snrReason": snrReason,
 			"noiseFloorDbfs": snr.NoiseFloorDBFS, "signalBandDbfs": snr.SignalBandDBFS,
 			"snrEvidenceBins": snr.EvidenceBins,
 		})
@@ -1465,6 +1483,64 @@ func (a *App) recordRXError(stage string, err error) {
 	a.rxStats.lastErrorMu.Unlock()
 }
 
+func rxDecoderHasModemLock(decoder interface{}) bool {
+	switch value := decoder.(type) {
+	case interface {
+		Diagnostics() transport.DecoderDiagnostics
+	}:
+		d := value.Diagnostics()
+		return d.MARYLocked || d.FSKLocked || d.GMSKLocked
+	case interface {
+		Diagnostics() transport.AutoDecoderDiagnostics
+	}:
+		d := value.Diagnostics()
+		if d.FSK1200Locked || d.GMSK2400Locked || d.LockedProfile != "" {
+			return true
+		}
+		for _, candidate := range d.MARYCandidates {
+			if candidate.MARYLocked {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func rxDecoderHasRecentValidPacket(decoder interface{}) bool {
+	switch value := decoder.(type) {
+	case interface {
+		Diagnostics() transport.DecoderDiagnostics
+	}:
+		return value.Diagnostics().ValidPacketRecent
+	case interface {
+		Diagnostics() transport.AutoDecoderDiagnostics
+	}:
+		return value.Diagnostics().ValidPacketRecent
+	}
+	return false
+}
+
+// rxDecoderHasFreshValidPacket is stricter than the UI's general "recent"
+// packet indicator. SNR display is only permitted briefly after a packet has
+// passed its parser/CRC checks; a packet from several seconds ago must not
+// validate a new noise/interference window.
+func rxDecoderHasFreshValidPacket(decoder interface{}) bool {
+	const maxAgeMS = int64(1200)
+	switch value := decoder.(type) {
+	case interface {
+		Diagnostics() transport.DecoderDiagnostics
+	}:
+		age := value.Diagnostics().LastPacketAgeMS
+		return value.Diagnostics().ValidPacketRecent && age >= 0 && age <= maxAgeMS
+	case interface {
+		Diagnostics() transport.AutoDecoderDiagnostics
+	}:
+		age := value.Diagnostics().LastPacketAgeMS
+		return value.Diagnostics().ValidPacketRecent && age >= 0 && age <= maxAgeMS
+	}
+	return false
+}
+
 func rxDecoderDiagnostics(decoder interface{}) interface{} {
 	switch value := decoder.(type) {
 	case interface {
@@ -1536,11 +1612,15 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 			a.rxStats.decoderBlocks.Add(1)
 			if block == nil {
 				a.rxStats.decoderResets.Add(1)
+				a.rxModemLocked.Store(false)
+				a.rxPacketValidated.Store(false)
 			}
 			a.mu.Lock()
 			profileID, rate := a.settings.RXProfile, a.settings.AudioSampleRate
 			a.mu.Unlock()
 			if profileID != activeProfile || rate != activeRate {
+				a.rxModemLocked.Store(false)
+				a.rxPacketValidated.Store(false)
 				activeProfile, activeRate = profileID, rate
 				var err error
 				if profileID == domain.AutoReceiveProfile {
@@ -1561,6 +1641,13 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 				continue
 			}
 			packets, err, panicMessage, panicStack := safeFeedRXDecoder(decoder, block)
+			if err == nil {
+				a.rxModemLocked.Store(rxDecoderHasModemLock(decoder))
+				a.rxPacketValidated.Store(rxDecoderHasFreshValidPacket(decoder))
+			} else {
+				a.rxModemLocked.Store(false)
+				a.rxPacketValidated.Store(false)
+			}
 			if err != nil {
 				a.rxStats.decoderErrors.Add(1)
 				a.recordRXError("decoder-feed", err)

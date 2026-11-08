@@ -3,6 +3,7 @@ package transport
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
@@ -102,5 +103,25 @@ func TestAutoReceiverDigitalSilenceGateIsBelowUsableAudio(t *testing.T) {
 	}
 	if belowAutoNoiseFloor([]float32{0, 1.01e-6, 0}) {
 		t.Fatal("audio above the -120 dBFS floor must be passed to acquisition")
+	}
+}
+
+func TestAutoDiagnosticsRequireRecentlyValidatedPacket(t *testing.T) {
+	decoder, err := NewAutoStreamDecoder(48000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decoder.Diagnostics(); got.ValidPacketRecent {
+		t.Fatalf("new auto decoder claims a recent packet: %+v", got)
+	}
+	// Front-end carrier/symbol lock flags are diagnostic only. They must not
+	// be conflated with a successfully parsed image packet.
+	decoder.lastPacketAt = time.Now().Add(-4 * time.Second)
+	if got := decoder.Diagnostics(); got.ValidPacketRecent {
+		t.Fatalf("stale packet remained valid for SNR gating: %+v", got)
+	}
+	decoder.lastPacketAt = time.Now()
+	if got := decoder.Diagnostics(); !got.ValidPacketRecent {
+		t.Fatalf("recent validated packet was not exposed: %+v", got)
 	}
 }

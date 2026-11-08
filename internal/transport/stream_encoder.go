@@ -109,49 +109,61 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 	if err != nil {
 		return 0, err
 	}
-	wirePackets, err := buildMARYWirePackets(packets)
+	codeProfile, parityShards := e.maryFECSettings(profile)
+	wirePackets, err := buildMARYWirePacketsWithParity(packets, parityShards)
 	if err != nil {
 		return 0, err
 	}
-
-	// SDF3 protects each CCSDS data unit independently. Every unit receives a
-	// fresh convolutional encoder/interleaver, a repeated CRC-protected header,
-	// and a new training word. This bounds the damage from a radio fade or lost
-	// audio block to one unit and gives the receiver a fresh symbol-acquisition
-	// point before the next one. The receiver retains SDF2 and legacy support.
-	training, err := mod.Start()
-	if err != nil {
-		return 0, err
-	}
-	if err := sink.write(training); err != nil {
-		return 0, err
+	groupSize := e.cfg.MARYBurstGroupSize
+	if groupSize < 1 {
+		groupSize = 10
 	}
 
-	for index, packet := range wirePackets {
+	// SDF3 still gives the receiver an independent CRC/FEC boundary and a
+	// fresh acquisition word, but now one burst protects a small group of
+	// consecutive CCSDS data units instead of repeating a 96-symbol preamble,
+	// 3x descriptor and 200 ms guard for every individual 260-byte frame.
+	// The group header carries its exact byte length, and the receiver scans
+	// the decoded group for each valid CCSDS ASM/SSDV CRC so intact frames can
+	// still be salvaged if the group CRC reports a partial fade.
+	for groupStart := 0; groupStart < len(wirePackets); groupStart += groupSize {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		if index > 0 {
-			// The 200 ms guard leaves at least 100 ms of complete low-energy
-			// callback blocks even when the audio API splits the stream into
-			// arbitrary blocks up to 40 ms. The receiver needs 100 ms to release
-			// carrier lock before the next independent training word.
+		groupEnd := min(len(wirePackets), groupStart+groupSize)
+		if groupStart == 0 {
+			training, startErr := mod.Start()
+			if startErr != nil {
+				return 0, startErr
+			}
+			if err := sink.write(training); err != nil {
+				return 0, err
+			}
+		} else {
+			// A single quiet guard is paid per group. Keep enough low-energy
+			// time for the continuous RX stream to release carrier lock before
+			// the next independent training word.
 			if err := sink.writeMARYSilence(profile.SampleRate / 5); err != nil {
 				return 0, err
 			}
-			reacquire, trainingErr := mod.WriteTraining()
-			if trainingErr != nil {
-				return 0, trainingErr
+			training, trainErr := mod.WriteTraining()
+			if trainErr != nil {
+				return 0, trainErr
 			}
-			if err := sink.write(reacquire); err != nil {
+			if err := sink.write(training); err != nil {
 				return 0, err
 			}
 		}
-		unit, buildErr := ccsds.BuildDataUnit(packet)
-		if buildErr != nil {
-			return 0, fmt.Errorf("build CCSDS data unit %d: %w", index, buildErr)
+
+		rawGroup := make([]byte, 0, (groupEnd-groupStart)*(4+ccsds.PayloadLength))
+		for index := groupStart; index < groupEnd; index++ {
+			unit, buildErr := ccsds.BuildDataUnit(wirePackets[index])
+			if buildErr != nil {
+				return 0, fmt.Errorf("build CCSDS data unit %d: %w", index, buildErr)
+			}
+			rawGroup = append(rawGroup, unit...)
 		}
-		header, headerErr := fec.NewPacketBurstHeader(unit).MarshalBinary()
+		header, headerErr := fec.NewPacketBurstHeaderWithProfile(rawGroup, codeProfile).MarshalBinary()
 		if headerErr != nil {
 			return 0, headerErr
 		}
@@ -167,17 +179,31 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 			return 0, err
 		}
 
-		conv := fec.NewConvStreamEncoder()
 		interleaver := fec.NewBlockInterleaver()
-		coded, encodeErr := conv.WriteBytes(unit)
-		if encodeErr != nil {
-			return 0, encodeErr
+		var coded []byte
+		switch codeProfile {
+		case fec.PacketFECProfileRate34:
+			coded, err = fec.EncodeConvRate3of4(rawGroup)
+			if err != nil {
+				return 0, err
+			}
+		case fec.PacketFECProfileRate23:
+			coded, err = fec.EncodeConvRate2of3(rawGroup)
+			if err != nil {
+				return 0, err
+			}
+		default:
+			conv := fec.NewConvStreamEncoder()
+			coded, err = conv.WriteBytes(rawGroup)
+			if err != nil {
+				return 0, err
+			}
+			tail, closeErr := conv.Close()
+			if closeErr != nil {
+				return 0, closeErr
+			}
+			coded = append(coded, tail...)
 		}
-		tail, encodeErr := conv.Close()
-		if encodeErr != nil {
-			return 0, encodeErr
-		}
-		coded = append(coded, tail...)
 		interleaved, interleaveErr := interleaver.Write(coded)
 		if interleaveErr != nil {
 			return 0, interleaveErr
@@ -210,17 +236,24 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 // eight adjacent FEC-enabled SSDV image packets. Control and non-FEC packets are
 // passed through unchanged; group metadata records packet IDs explicitly.
 func buildMARYWirePackets(packets [][]byte) ([][]byte, error) {
-	out := make([][]byte, 0, len(packets)+((len(packets)+7)/8)*2)
+	return buildMARYWirePacketsWithParity(packets, 2)
+}
+
+func buildMARYWirePacketsWithParity(packets [][]byte, parityShards int) ([][]byte, error) {
+	if parityShards < 0 || parityShards > 2 {
+		return nil, errors.New("M-ary packet parity must be between zero and two shards")
+	}
+	out := make([][]byte, 0, len(packets)+((len(packets)+7)/8)*parityShards)
 	group := make([][]byte, 0, 8)
 	var groupCall uint32
 	var groupImage uint8
 	flush := func() error {
-		if len(group) >= 2 {
+		if parityShards > 0 && len(group) >= 2 {
 			parity, err := fec.BuildPacketParityPayloads(group)
 			if err != nil {
 				return err
 			}
-			out = append(out, parity...)
+			out = append(out, parity[:parityShards]...)
 		}
 		group = group[:0]
 		return nil
@@ -348,16 +381,20 @@ func (e *Encoder) EstimateOutputSamples(packetCount int) (int64, error) {
 		byteCount := int64(e.cfg.PreambleSize + e.cfg.TrailerSize + packetCount*(4+ccsds.PayloadLength))
 		native = byteCount * 8 * int64(profile.SampleRate/profile.BitRate)
 	case "CCSDS-MARY":
-		// Packet count-only estimate assumes two parity frames per group of
-		// eight SSDV frames and the rate-1/2 inner code with block interleaving.
-		wirePackets := packetCount + 2*((packetCount+7)/8)
-		rawBytes := int64(e.cfg.PreambleSize + e.cfg.TrailerSize + wirePackets*(4+ccsds.PayloadLength))
-		codeBits := 2 * (rawBytes*8 + fec.ConvMemory)
-		codeBytes := (codeBits + 7) / 8
-		interleavedBytes := ((codeBytes + fec.InterleaveBlockBytes - 1) / fec.InterleaveBlockBytes) * fec.InterleaveBlockBytes
-		modBits := int64(fec.BurstHeaderWireBits) + interleavedBytes*8
-		symbols := int64(maryTrainingSymbols) + (modBits+int64(profile.BitsPerSymbol)-1)/int64(profile.BitsPerSymbol)
-		native = symbols * int64(profile.SampleRate/profile.SymbolRate)
+		codeProfile, parityShards := e.maryFECSettings(profile)
+		wirePackets := packetCount + parityShards*((packetCount+7)/8)
+		groupSize := e.cfg.MARYBurstGroupSize
+		groupCount := (wirePackets + groupSize - 1) / groupSize
+		for start := 0; start < wirePackets; start += groupSize {
+			count := min(groupSize, wirePackets-start)
+			header := fec.NewPacketBurstHeaderWithProfile(make([]byte, count*(4+ccsds.PayloadLength)), codeProfile)
+			modBits := int64(fec.BurstHeaderWireBits) + header.InterleavedBytes()*8
+			symbols := int64(maryTrainingSymbols) + (modBits+int64(profile.BitsPerSymbol)-1)/int64(profile.BitsPerSymbol)
+			native += symbols * int64(profile.SampleRate/profile.SymbolRate)
+		}
+		if groupCount > 1 {
+			native += int64(groupCount-1) * int64(profile.SampleRate/5)
+		}
 	case "AX.25 UI / HDLC":
 		bits := int64(ax25.DefaultBurstPreambleFlags+ax25.DefaultBurstTrailerFlags) * 8
 		// The AX.25 estimate is deliberately conservative because bit stuffing
@@ -386,20 +423,28 @@ func (e *Encoder) EstimateOutputSamplesForPackets(packets [][]byte) (int64, erro
 		return 0, err
 	}
 	if profile.LinkLayer == "CCSDS-MARY" {
-		wirePackets, wireErr := buildMARYWirePackets(packets)
+		codeProfile, parityShards := e.maryFECSettings(profile)
+		wirePackets, wireErr := buildMARYWirePacketsWithParity(packets, parityShards)
 		if wireErr != nil {
 			return 0, wireErr
 		}
-		interleavedBytes, sizeErr := fec.ExpectedInterleavedBytes(4 + ccsds.PayloadLength)
-		if sizeErr != nil {
-			return 0, sizeErr
+		groupSize := e.cfg.MARYBurstGroupSize
+		if groupSize < 1 {
+			groupSize = 10
 		}
-		modBits := int64(fec.BurstHeaderWireBits + interleavedBytes*8)
-		symbolsPerUnit := (modBits + int64(profile.BitsPerSymbol) - 1) / int64(profile.BitsPerSymbol)
-		samplesPerUnit := (symbolsPerUnit + maryTrainingSymbols) * int64(profile.SampleRate/profile.SymbolRate)
-		native := int64(len(wirePackets)) * samplesPerUnit
-		if len(wirePackets) > 1 {
-			native += int64(len(wirePackets)-1) * int64(profile.SampleRate/5)
+		unitsPerGroup := int64(groupSize)
+		groupCount := (int64(len(wirePackets)) + unitsPerGroup - 1) / unitsPerGroup
+		native := int64(0)
+		for start := 0; start < len(wirePackets); start += groupSize {
+			count := min(groupSize, len(wirePackets)-start)
+			rawBytes := uint32(count * (4 + ccsds.PayloadLength))
+			header := fec.NewPacketBurstHeaderWithProfile(make([]byte, rawBytes), codeProfile)
+			modBits := int64(fec.BurstHeaderWireBits) + header.InterleavedBytes()*8
+			symbols := (modBits + int64(profile.BitsPerSymbol) - 1) / int64(profile.BitsPerSymbol)
+			native += (symbols + maryTrainingSymbols) * int64(profile.SampleRate/profile.SymbolRate)
+		}
+		if groupCount > 1 {
+			native += (groupCount - 1) * int64(profile.SampleRate/5)
 		}
 		targetRate := e.cfg.AudioSampleRate
 		if targetRate <= 0 {
@@ -527,7 +572,8 @@ func (e *Encoder) EstimateWirePacketCount(packets [][]byte) (int, error) {
 		return 0, err
 	}
 	if profile.LinkLayer == "CCSDS-MARY" {
-		wire, buildErr := buildMARYWirePackets(packets)
+		_, parityShards := e.maryFECSettings(profile)
+		wire, buildErr := buildMARYWirePacketsWithParity(packets, parityShards)
 		if buildErr != nil {
 			return 0, buildErr
 		}

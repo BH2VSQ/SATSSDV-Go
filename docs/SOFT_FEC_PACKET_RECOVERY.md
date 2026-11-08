@@ -8,14 +8,16 @@ specified in `SGV2_PROTOCOL.md`.
 
 ## Scope and compatibility
 
-- New M-ary transmissions produced by `Encoder.StreamPackets` use the SDF2
-  soft-FEC burst descriptor, convolutional inner code, byte interleaver and
-  SPF2 packet-erasure parity frames.
-- The new M-ary receiver first probes for SDF2. If no SDF2 marker is found, it
-  falls back to the original hard-decision CCSDS-MARY path, so previously
-  recorded SGV1/uncoded M-ary bursts remain receivable.
-- An older receiver does not understand the SDF2 envelope and must not be
-  expected to decode new M-ary FEC bursts. The legacy `EncodePackets` API remains
+- New M-ary transmissions produced by `Encoder.StreamPackets` use SDF3
+  independently protected groups of up to ten CCSDS data units. Each group
+  has one repeated descriptor, the selected K=7 convolutional-code profile and
+  a 64-byte block interleaver; SPF2 packet-erasure parity depends on the
+  balanced/robust FEC policy.
+- The receiver probes for SDF3 first, then supports the earlier SDF2 burst
+  format, and finally falls back to the original hard-decision CCSDS-MARY
+  path. Previously recorded SGV1/uncoded M-ary bursts remain receivable.
+- A receiver predating SDF3 rate profiles 3/4 does not understand the new
+  balanced on-air coding profiles and must not be expected to decode them. The legacy `EncodePackets` API remains
   available for code that explicitly needs the old uncoded format, but the
   current Qt transmit path uses `StreamPackets` and does not expose a GUI
   compatibility toggle. Interoperation with an old receiver therefore requires
@@ -42,15 +44,15 @@ shared by both APIs. This is soft-decision demapping of symbol reliability, not
 an estimate of a calibrated RF noise variance. The AWGN tests are reproducible
 software simulations and do not define real-radio SNR thresholds.
 
-## SDF2 burst descriptor
+## SDF3 group descriptor
 
-The logical descriptor is 18 bytes:
+The logical descriptor is 18 bytes. Byte 5 now identifies the convolutional-code profile: 2 = K=7 rate 1/2, 3 = punctured K=7 rate 3/4, and 4 = punctured K=7 rate 2/3. The receiver accepts all three profiles, including earlier SDF3 rate-1/2 groups.
 
 | Offset | Size | Meaning |
 |---|---:|---|
-| 0 | 4 | ASCII `SDF2` |
+| 0 | 4 | ASCII `SDF3` |
 | 4 | 1 | Descriptor version, currently 1 |
-| 5 | 1 | Inner-code profile, 1 = K=7 rate 1/2, generators 171/133 octal |
+| 5 | 1 | Inner-code profile: 2 = rate 1/2, 3 = rate 3/4, 4 = rate 2/3; K=7 generators 171/133 octal |
 | 6 | 2 | Interleaver block size, 64 bytes |
 | 8 | 4 | Number of raw bytes after the descriptor |
 | 12 | 4 | CRC32/IEEE of the complete raw byte stream |
@@ -63,41 +65,54 @@ word and precedes the encoded data stream.
 
 ## Inner code and interleaver
 
-The complete randomized CCSDS byte stream (preamble, ASM/data units and
-trailer) is protected by a terminated convolutional code:
+The grouped CCSDS byte stream (ASM/data units) is protected by a terminated
+K=7 convolutional mother code using generator polynomials 171 and 133 octal,
+with six zero termination bits and MSB-first bit order. The encoder supports
+three on-air profiles:
 
-- constraint length K=7;
-- rate 1/2;
-- generator polynomials 171 and 133 octal;
-- six zero termination bits;
-- MSB-first input and output bit order.
+- Profile 2: rate 1/2, no puncturing.
+- Profile 3: rate 3/4, keep (A,B), then A, then B in a repeating three-input
+  pattern. Punctured bits are restored as zero-reliability LLRs.
+- Profile 4: rate 2/3, keep (A,B), then A in a repeating two-input pattern.
+  Punctured bits are also restored as zero-reliability LLRs.
+
+The default **balanced** profile is selected by modulation:
+
+| Modulation | Inner code | Packet parity after each 8 SSDV packets |
+|---|---:|---:|
+| QPSK | rate 3/4 | 0 shards (SSDV RS8 remains enabled) |
+| 8PSK | rate 2/3 | 1 shard (recovers one whole lost packet) |
+| 16QAM | rate 1/2 | 2 shards (recovers up to two whole lost packets) |
+
+Applications that need the previous maximum-redundancy behavior can select
+`transport.MARYFECRobust` in `transport.Config`; this uses rate 1/2 plus both
+packet-erasure parity shards for every M-ary constellation. The default
+`transport.MARYFECBalanced` trades some coding margin for higher useful image
+throughput. The SSDV packet-level RS8 FEC remains enabled in both policies.
 
 Encoded bytes are interleaved in 64-byte blocks using an 8x8 byte transpose.
 The receiver reverses the transpose in the soft domain and feeds LLRs directly
-to a bounded-traceback soft-decision Viterbi decoder. The burst CRC32 validates
-the full decoded CCSDS stream after Viterbi decoding.
-
-At rate 1/2, the inner code approximately doubles the coded bit count before
-interleaver padding. This is a robustness/throughput trade-off; the current
-implementation does not yet expose selectable punctured rates.
+to the bounded-traceback soft-decision Viterbi decoder. Punctured observations
+are represented by zero LLRs rather than hard guesses. The burst CRC32
+validates the full decoded CCSDS group after Viterbi decoding.
 
 ## SPF2 packet-erasure parity
 
-For M-ary transmissions, each group of up to eight adjacent ordinary
-FEC-enabled SSDV data packets of the same callsign and image ID is followed by
-two parity data units (`SPF2`). These are systematic 8+2 packet-erasure groups.
+M-ary packet-erasure parity is selected by the FEC policy and modulation.
+The balanced defaults emit zero shards for QPSK, one shard for 8PSK, and two
+shards for 16QAM after each group of up to eight adjacent ordinary FEC-enabled
+SSDV data packets of the same callsign and image ID. `MARYFECRobust` always
+emits both parity data units (`SPF2`), forming a systematic 8+2 group.
 
 Each parity payload identifies the source packet IDs explicitly. It protects
 SSDV bytes 2..223 (222 bytes); the fixed leading sync/type bytes are recreated,
 and the existing RS8 parity bytes are regenerated after recovery.
 
-The receiver can recover:
-
-- any one missing data packet when at least one valid parity shard arrives;
-- any two missing data packets when both independent parity shards arrive.
-
-It cannot recover more than two erasures in a group, nor can it recover a
-missing parity shard and two missing data packets. Reconstructed packets are
+With one parity shard the receiver can recover one missing data packet. With
+two independent parity shards it can recover any two missing data packets. A
+zero-parity group relies on each packet's own RS8 code and CRC, but cannot
+recreate a completely erased packet. No configuration can recover more packet
+erasures than the number of available parity shards. Reconstructed packets are
 passed through the regular SSDV parser, including RS8 and packet CRC validation,
 and are marked `fecRecovered` in the receive event.
 
@@ -108,9 +123,13 @@ caches expire after two minutes and incomplete parity groups after 30 seconds.
 
 - noiseless streaming TX/RX round trips for QPSK, 8PSK and 16QAM at both
   44.1 kHz and 48 kHz audio rates;
-- deterministic AWGN software loopback at 18 dB for all three profiles;
+- deterministic AWGN software loopback at 18 dB for all three balanced
+  modulation-specific profiles;
+- fixed ±200 Hz carrier offset and ±150 Hz linear drift tests at 18 dB for
+  balanced QPSK, 8PSK and 16QAM;
+- actual encoder sample-count checks against the airtime estimator;
 - old uncoded M-ary waveform reception through the legacy fallback;
-- SDF2 header repetition and CRC validation;
+- SDF3 header repetition and CRC validation for rate 1/2, rate 2/3 and rate 3/4;
 - one- and two-packet erasure recovery, including restoration accepted by the
   normal SSDV RS8 parser;
 - re-acquisition of a second M-ary burst after an inter-burst low-energy gap;

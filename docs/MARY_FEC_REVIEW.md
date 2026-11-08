@@ -2,6 +2,8 @@
 
 Date: 2026-11-07
 
+> Historical audit. Its implementation-status statements describe the state at the time of review and are superseded by the current balanced/robust per-modulation FEC policy in `SOFT_FEC_PACKET_RECOVERY.md` and the airtime results in `MODEM_THROUGHPUT.md`.
+
 This document records the baseline audit performed before the soft-decision
 FEC implementation. The recommendations below have since been implemented in
 the M-ary streaming path; see `SOFT_FEC_PACKET_RECOVERY.md` for the current

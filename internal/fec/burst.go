@@ -305,30 +305,48 @@ func ExpectedInterleavedBytes(rawBytes uint32) (int, error) {
 	return int(blocks * InterleaveBlockBytes), nil
 }
 
-// PacketBurstHeader describes one independently protected CCSDS data unit in
-// the loss-resilient SDF3 M-ary stream. Unlike BurstHeader (SDF2), its length
-// and CRC apply to exactly one 260-byte CCSDS data unit, allowing the receiver
-// to discard a damaged unit and reacquire the next one without losing the
-// remainder of a long image transmission.
+// PacketBurstHeader describes one independently protected SDF3 group of one
+// or more consecutive CCSDS data units. Its length and CRC cover the complete
+// group (up to 4096 bytes). The receiver scans a decoded group for individual
+// valid CCSDS/SSDV packets, so a partial group fade need not discard every
+// otherwise-valid frame in the group.
+const (
+	PacketFECProfileRate12 uint8 = 2 // K=7, rate 1/2, generators 171/133.
+	PacketFECProfileRate34 uint8 = 3 // K=7, punctured rate 3/4, generators 171/133.
+	PacketFECProfileRate23 uint8 = 4 // K=7, punctured rate 2/3, generators 171/133.
+)
+
 type PacketBurstHeader struct {
-	RawBytes uint32
-	CRC32    uint32
+	RawBytes    uint32
+	CRC32       uint32
+	CodeProfile uint8
 }
 
 var packetBurstMagic = [4]byte{'S', 'D', 'F', '3'}
 
 func NewPacketBurstHeader(raw []byte) PacketBurstHeader {
-	return PacketBurstHeader{RawBytes: uint32(len(raw)), CRC32: crc32.ChecksumIEEE(raw)}
+	return NewPacketBurstHeaderWithProfile(raw, PacketFECProfileRate12)
+}
+
+func NewPacketBurstHeaderWithProfile(raw []byte, codeProfile uint8) PacketBurstHeader {
+	return PacketBurstHeader{RawBytes: uint32(len(raw)), CRC32: crc32.ChecksumIEEE(raw), CodeProfile: codeProfile}
 }
 
 func (h PacketBurstHeader) MarshalBinary() ([]byte, error) {
 	if h.RawBytes == 0 || h.RawBytes > 4096 {
-		return nil, errors.New("SDF3 packet payload length is outside 1..4096 bytes")
+		return nil, errors.New("SDF3 group payload length is outside 1..4096 bytes")
 	}
 	out := make([]byte, BurstHeaderSize)
 	copy(out[:4], packetBurstMagic[:])
 	out[4] = BurstVersion
-	out[5] = 2 // K=7, rate 1/2, generators 171/133; independently terminated per unit.
+	codeProfile := h.CodeProfile
+	if codeProfile == 0 {
+		codeProfile = PacketFECProfileRate12 // Preserve the original SDF3 profile for zero-value callers.
+	}
+	if codeProfile != PacketFECProfileRate12 && codeProfile != PacketFECProfileRate34 && codeProfile != PacketFECProfileRate23 {
+		return nil, errors.New("unsupported SDF3 group FEC profile")
+	}
+	out[5] = codeProfile
 	binary.BigEndian.PutUint16(out[6:8], InterleaveBlockBytes)
 	binary.BigEndian.PutUint32(out[8:12], h.RawBytes)
 	binary.BigEndian.PutUint32(out[12:16], h.CRC32)
@@ -338,23 +356,31 @@ func (h PacketBurstHeader) MarshalBinary() ([]byte, error) {
 
 func ParsePacketBurstHeader(data []byte) (PacketBurstHeader, error) {
 	if len(data) < BurstHeaderSize || string(data[:4]) != string(packetBurstMagic[:]) {
-		return PacketBurstHeader{}, errors.New("SDF3 packet marker not found")
+		return PacketBurstHeader{}, errors.New("SDF3 group marker not found")
 	}
-	if data[4] != BurstVersion || data[5] != 2 || binary.BigEndian.Uint16(data[6:8]) != InterleaveBlockBytes {
-		return PacketBurstHeader{}, errors.New("unsupported SDF3 packet FEC profile")
+	if data[4] != BurstVersion || (data[5] != PacketFECProfileRate12 && data[5] != PacketFECProfileRate34 && data[5] != PacketFECProfileRate23) || binary.BigEndian.Uint16(data[6:8]) != InterleaveBlockBytes {
+		return PacketBurstHeader{}, errors.New("unsupported SDF3 group FEC profile")
 	}
 	if got, want := binary.BigEndian.Uint16(data[16:18]), burstHeaderCRC16(data[:16]); got != want {
 		return PacketBurstHeader{}, errors.New("SDF3 packet header CRC mismatch")
 	}
-	h := PacketBurstHeader{RawBytes: binary.BigEndian.Uint32(data[8:12]), CRC32: binary.BigEndian.Uint32(data[12:16])}
+	h := PacketBurstHeader{RawBytes: binary.BigEndian.Uint32(data[8:12]), CRC32: binary.BigEndian.Uint32(data[12:16]), CodeProfile: data[5]}
 	if h.RawBytes == 0 || h.RawBytes > 4096 {
-		return PacketBurstHeader{}, errors.New("SDF3 packet length is invalid")
+		return PacketBurstHeader{}, errors.New("SDF3 group length is invalid")
 	}
 	return h, nil
 }
 
 func (h PacketBurstHeader) CodedBits() int64 {
-	return 2 * (int64(h.RawBytes)*8 + ConvMemory)
+	inputBits := int64(h.RawBytes)*8 + ConvMemory
+	switch h.CodeProfile {
+	case PacketFECProfileRate34:
+		return ConvRate3of4CodedBitCount(inputBits)
+	case PacketFECProfileRate23:
+		return ConvRate2of3CodedBitCount(inputBits)
+	default:
+		return 2 * inputBits
+	}
 }
 
 func (h PacketBurstHeader) CodedBytes() int64 { return (h.CodedBits() + 7) / 8 }

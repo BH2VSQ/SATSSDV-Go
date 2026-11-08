@@ -40,10 +40,13 @@ type AutoStreamDecoder struct {
 }
 
 type AutoDecoderDiagnostics struct {
-	LockedProfile   string               `json:"lockedProfile"`
-	LastPacketAgeMS int64                `json:"lastPacketAgeMs"`
-	LastError       string               `json:"lastError,omitempty"`
-	MARYCandidates  []DecoderDiagnostics `json:"maryCandidates,omitempty"`
+	LockedProfile     string               `json:"lockedProfile"`
+	FSK1200Locked     bool                 `json:"fsk1200Locked"`
+	GMSK2400Locked    bool                 `json:"gmsk2400Locked"`
+	LastPacketAgeMS   int64                `json:"lastPacketAgeMs"`
+	ValidPacketRecent bool                 `json:"validPacketRecent"`
+	LastError         string               `json:"lastError,omitempty"`
+	MARYCandidates    []DecoderDiagnostics `json:"maryCandidates,omitempty"`
 }
 
 func NewAutoStreamDecoder(inputSampleRate int) (*AutoStreamDecoder, error) {
@@ -196,9 +199,14 @@ func (d *AutoStreamDecoder) Diagnostics() AutoDecoderDiagnostics {
 	if d == nil {
 		return AutoDecoderDiagnostics{}
 	}
-	status := AutoDecoderDiagnostics{LockedProfile: string(d.lockedProfile), LastError: d.lastError}
+	status := AutoDecoderDiagnostics{
+		LockedProfile: string(d.lockedProfile), LastError: d.lastError,
+		FSK1200Locked:  d.fsk1200 != nil && d.fsk1200.Locked(),
+		GMSK2400Locked: d.gmsk2400 != nil && d.gmsk2400.CarrierLocked(),
+	}
 	if !d.lastPacketAt.IsZero() {
 		status.LastPacketAgeMS = time.Since(d.lastPacketAt).Milliseconds()
+		status.ValidPacketRecent = status.LastPacketAgeMS >= 0 && status.LastPacketAgeMS <= int64(3*time.Second/time.Millisecond)
 	}
 	for _, mode := range []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600} {
 		if decoder := d.mary[mode]; decoder != nil {

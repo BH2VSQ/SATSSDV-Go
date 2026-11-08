@@ -65,6 +65,179 @@ func (e *ConvStreamEncoder) Close() ([]byte, error) {
 	return out, nil
 }
 
+// ConvRate3of4CodedBitCount returns the number of transmitted bits when the
+// K=7 mother code is punctured with the (A,B),(A,-),(-,B) rate-3/4 pattern.
+// inputBits includes the six zero termination bits.
+func ConvRate3of4CodedBitCount(inputBits int64) int64 {
+	if inputBits <= 0 {
+		return 0
+	}
+	groups, rem := inputBits/3, inputBits%3
+	coded := groups * 4
+	switch rem {
+	case 1:
+		coded += 2
+	case 2:
+		coded += 3
+	}
+	return coded
+}
+
+// ConvRate2of3CodedBitCount returns the transmitted-bit count for the
+// puncturing pattern (A,B),(A,-), repeating every two trellis input bits.
+func ConvRate2of3CodedBitCount(inputBits int64) int64 {
+	if inputBits <= 0 {
+		return 0
+	}
+	groups, rem := inputBits/2, inputBits%2
+	coded := groups * 3
+	if rem != 0 {
+		coded += 2
+	}
+	return coded
+}
+
+// EncodeConvRate2of3 applies the K=7 rate-2/3 puncturing pattern
+// (keep both outputs for even input steps, keep only generator A for odd
+// input steps). The same soft-decision Viterbi decoder can be used after
+// UnpunctureConvRate2of3Soft inserts zero-reliability erased observations.
+func EncodeConvRate2of3(data []byte) ([]byte, error) {
+	enc := NewConvStreamEncoder()
+	body, err := enc.WriteBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	tail, err := enc.Close()
+	if err != nil {
+		return nil, err
+	}
+	mother := append(body, tail...)
+	inputBits := int64(len(data)*8 + ConvMemory)
+	if int64(len(mother))*8 < inputBits*2 {
+		return nil, errors.New("convolutional mother code is shorter than expected")
+	}
+	codedBits := ConvRate2of3CodedBitCount(inputBits)
+	out := make([]byte, (codedBits+7)/8)
+	outPos := int64(0)
+	readMother := func(pos int64) bool { return mother[pos/8]&(1<<uint(7-pos%8)) != 0 }
+	for step := int64(0); step < inputBits; step++ {
+		a, b := readMother(2*step), readMother(2*step+1)
+		putPackedBit(out, int(outPos), a)
+		outPos++
+		if step%2 == 0 {
+			putPackedBit(out, int(outPos), b)
+			outPos++
+		}
+	}
+	if outPos != codedBits {
+		return nil, errors.New("rate-2/3 puncturing produced an unexpected bit count")
+	}
+	return out, nil
+}
+
+// UnpunctureConvRate2of3Soft restores rate-2/3 LLRs to the rate-1/2 mother
+// stream. The omitted generator-B observations are represented by zero LLRs.
+func UnpunctureConvRate2of3Soft(punctured []float32, inputBits int64) ([]float32, error) {
+	if inputBits <= 0 || inputBits > int64(^uint(0)>>1)/2 {
+		return nil, errors.New("invalid rate-2/3 input bit count")
+	}
+	if int64(len(punctured)) != ConvRate2of3CodedBitCount(inputBits) {
+		return nil, errors.New("rate-2/3 soft input has an unexpected punctured bit count")
+	}
+	out := make([]float32, int(inputBits*2))
+	read := 0
+	for step := int64(0); step < inputBits; step++ {
+		out[2*step] = punctured[read]
+		read++
+		if step%2 == 0 {
+			out[2*step+1] = punctured[read]
+			read++
+		}
+	}
+	return out, nil
+}
+
+// EncodeConvRate3of4 encodes data with the same K=7, 171/133 mother code as
+// ConvStreamEncoder, then applies the systematic 3/4 puncture pattern
+// (keep A/B for input 0, A only for input 1, B only for input 2).
+// The decoder remains soft-decision: punctured observations are restored as
+// zero-reliability LLRs rather than hard guessed bits.
+func EncodeConvRate3of4(data []byte) ([]byte, error) {
+	enc := NewConvStreamEncoder()
+	body, err := enc.WriteBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	tail, err := enc.Close()
+	if err != nil {
+		return nil, err
+	}
+	mother := append(body, tail...)
+	inputBits := int64(len(data)*8 + ConvMemory)
+	wantMotherBits := inputBits * 2
+	if int64(len(mother))*8 < wantMotherBits {
+		return nil, errors.New("convolutional mother code is shorter than expected")
+	}
+	codedBits := ConvRate3of4CodedBitCount(inputBits)
+	out := make([]byte, (codedBits+7)/8)
+	outPos := int64(0)
+	readMother := func(pos int64) bool {
+		return mother[pos/8]&(1<<uint(7-pos%8)) != 0
+	}
+	for step := int64(0); step < inputBits; step++ {
+		a, b := readMother(2*step), readMother(2*step+1)
+		switch step % 3 {
+		case 0:
+			putPackedBit(out, int(outPos), a)
+			outPos++
+			putPackedBit(out, int(outPos), b)
+			outPos++
+		case 1:
+			putPackedBit(out, int(outPos), a)
+			outPos++
+		case 2:
+			putPackedBit(out, int(outPos), b)
+			outPos++
+		}
+	}
+	if outPos != codedBits {
+		return nil, errors.New("rate-3/4 puncturing produced an unexpected bit count")
+	}
+	return out, nil
+}
+
+// UnpunctureConvRate3of4Soft restores a rate-3/4 stream to the K=7 mother-code
+// LLR stream expected by ViterbiDecoder. A zero LLR represents an erased
+// observation and contributes no preference to either branch metric.
+func UnpunctureConvRate3of4Soft(punctured []float32, inputBits int64) ([]float32, error) {
+	if inputBits <= 0 || inputBits > int64(^uint(0)>>1)/2 {
+		return nil, errors.New("invalid rate-3/4 input bit count")
+	}
+	want := ConvRate3of4CodedBitCount(inputBits)
+	if int64(len(punctured)) != want {
+		return nil, errors.New("rate-3/4 soft input has an unexpected punctured bit count")
+	}
+	out := make([]float32, int(inputBits*2))
+	read := 0
+	for step := int64(0); step < inputBits; step++ {
+		switch step % 3 {
+		case 0:
+			out[2*step] = punctured[read]
+			out[2*step+1] = punctured[read+1]
+			read += 2
+		case 1:
+			out[2*step] = punctured[read]
+			out[2*step+1] = 0
+			read++
+		case 2:
+			out[2*step] = 0
+			out[2*step+1] = punctured[read]
+			read++
+		}
+	}
+	return out, nil
+}
+
 // BlockInterleaver transposes each 8x8 byte block. It retains at most 63 bytes
 // between calls; Close zero-pads the final partial block. The receiver knows
 // the unpadded coded-bit count from the FEC burst header.

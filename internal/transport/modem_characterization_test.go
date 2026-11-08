@@ -15,6 +15,7 @@ import (
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
 )
@@ -32,7 +33,7 @@ var characterizationMARYCFOs = []int{-300, -200, -100, 0, 100, 200, 300}
 // TestModeNoiseAndOffsetCharacterization is opt-in because it performs many
 // end-to-end packet decodes. All profiles are transmitted through StreamPackets
 // and decoded through the production streaming receiver. M-ary therefore uses
-// the current SDF3 per-unit soft-FEC path, not the legacy EncodePackets path.
+// the current SDF3 grouped soft-FEC path, not the legacy EncodePackets path.
 func TestModeNoiseAndOffsetCharacterization(t *testing.T) {
 	if os.Getenv("SATSSDV_CHARACTERIZATION") != "1" {
 		t.Skip("set SATSSDV_CHARACTERIZATION=1 to run the full sweep")
@@ -57,7 +58,7 @@ func TestModeNoiseAndOffsetCharacterization(t *testing.T) {
 		"",
 		fmt.Sprintf("AWGN SNR is defined from generated waveform RMS and injected white-Gaussian-noise RMS over the PCM buffer. %d deterministic seeds are tested per SNR point; success requires one valid packet with the expected packet ID.", trialCount),
 		"",
-		"The receiver uses the production streaming decoder. QPSK/8PSK/16QAM transmit SDF3 packetized convolutional soft-FEC units. Legacy AX.25/CCSDS modes use their production streaming paths.",
+		"The receiver uses the production streaming decoder. QPSK/8PSK/16QAM transmit SDF3 grouped convolutional soft-FEC units. Legacy AX.25/CCSDS modes use their production streaming paths.",
 		"",
 		"Constant audio-IF frequency shift is tested separately from AWGN. Only the contiguous pass interval around zero is counted; isolated successes beyond a failing point are excluded.",
 		"",
@@ -103,7 +104,13 @@ func TestModeNoiseAndOffsetCharacterization(t *testing.T) {
 			fmt.Sprintf("- Audio rate: %d Hz; bit rate: %d bit/s; symbol rate: %d baud; bits/symbol: %d.", sampleRate, profile.BitRate, profile.SymbolRate, profile.BitsPerSymbol),
 		)
 		if profile.LinkLayer == "CCSDS-MARY" {
-			lines = append(lines, "- TX format: SDF3 per-unit training + repeated descriptor + K=7 rate-1/2 convolutional FEC + soft-decision Viterbi RX.")
+			codeProfile, parityShards := encoder.maryFECSettings(profile)
+			codeRate := map[uint8]string{
+				fec.PacketFECProfileRate12: "1/2",
+				fec.PacketFECProfileRate23: "2/3",
+				fec.PacketFECProfileRate34: "3/4",
+			}[codeProfile]
+			lines = append(lines, fmt.Sprintf("- TX format: SDF3 grouped (max %d CCSDS units/group; this fixture carries one unit); K=7 rate-%s soft-decision Viterbi; %d packet-erasure parity shards per 8 source SSDV packets.", encoder.cfg.MARYBurstGroupSize, codeRate, parityShards))
 		}
 		if profile.MarkFrequency != 0 || profile.SpaceFrequency != 0 {
 			lines = append(lines, fmt.Sprintf("- FSK tones: mark %d Hz, space %d Hz.", profile.MarkFrequency, profile.SpaceFrequency))

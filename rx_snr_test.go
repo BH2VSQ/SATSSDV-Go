@@ -9,6 +9,7 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ccsds"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/mary"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/transport"
 )
 
 func TestEstimateRXAudioSNRRejectsIdleNoiseForAllProfiles(t *testing.T) {
@@ -412,7 +413,7 @@ func TestBandSNRTrackerDoesNotLearnAnAlreadyDetectedBurstAsNoise(t *testing.T) {
 		}
 	}
 	// Once the burst ends, real idle audio can populate the baseline.
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 30; i++ {
 		got := feedSNRTracker(t, tracker, makeSNRNoise(4096, 0.008, int64(0xa000+i)), profile, sampleRate, false)
 		if got.Valid {
 			t.Fatalf("idle baseline warmup produced a valid SNR: %+v", got)
@@ -521,17 +522,23 @@ func TestTrackedRXAudioSNRCalibrationSweep(t *testing.T) {
 					t.Fatal(err)
 				}
 				hint := estimateRXAudioSNR(bins, string(tc.profile), sampleRate).Valid
-				got := feedSNRTracker(t, tracker, mixed, string(tc.profile), sampleRate, hint)
+				low, high := rxAudioSNRPassband(string(tc.profile), sampleRate)
+				// This calibration fixture represents an already synchronized and
+				// integrity-validated modem packet. Signal-shape hinting is tested
+				// separately because it is deliberately not the UI validity gate.
+				got := tracker.EstimateWithEvidence(bins, low, high, hint, true, true)
 				if target == 0 && got.Valid {
 					t.Fatalf("noise-dominated %0.0f dB sample unexpectedly displayed SNR (hint=%t): %+v", target, hint, got)
 				}
-				if target >= 6 {
+				if target >= 6 && hint {
 					if !got.Valid {
-						t.Fatalf("%0.0f dB signal not recognized: hint=%t result=%+v", target, hint, got)
+						t.Fatalf("%0.0f dB signal with positive current-window evidence was not recognized: %+v", target, got)
 					}
 					if math.Abs(got.SNRDB-expectedSNR) > 2.5 {
 						t.Fatalf("target %0.0f dB: got %.2f dB, measured %.2f dB: %+v", target, got.SNRDB, expectedSNR, got)
 					}
+				} else if !hint && got.Valid {
+					t.Fatalf("frame without signal-shape evidence showed SNR: %+v", got)
 				}
 				t.Logf("target=%2.0f dB measured=%.2f hint=%t valid=%t estimate=%.2f", target, expectedSNR, hint, got.Valid, got.SNRDB)
 			}
@@ -616,7 +623,11 @@ func TestBandSNRTrackerDoesNotReportNoiseGainStepAsSignal(t *testing.T) {
 		// idle. The noise level rises by 26 dB across the whole audio spectrum.
 		for frame := 0; frame < 40; frame++ {
 			noise := makeSNRNoise(4096, 0.02, int64(0x6a7000+frame))
-			got := feedSNRTracker(t, tracker, noise, profile, sampleRate, forcedHint)
+			bins := mustSpectrumForSNRTest(t, noise, sampleRate)
+			low, high := rxAudioSNRPassband(profile, sampleRate)
+			// A false spectral hint must not authorize publication; no modem
+			// acquisition or CRC-validated packet exists in this noise-only case.
+			got := tracker.EstimateWithEvidence(bins, low, high, forcedHint, false, false)
 			if got.Valid || got.SNRDB > 3.0 {
 				t.Fatalf("noise gain step (forcedHint=%t) frame %d was reported as a modem signal: %+v", forcedHint, frame, got)
 			}
@@ -675,5 +686,150 @@ func TestBandSNRTrackerRecoversAfterNoiseGainStep(t *testing.T) {
 	}
 	if math.Abs(got.SNRDB-expected) > 2.5 {
 		t.Fatalf("post-AGC SNR %.2f dB differs from measured in-channel SNR %.2f dB: %+v", got.SNRDB, expected, got)
+	}
+}
+
+type rxSNRStreamDiagnosticsStub struct{ status transport.DecoderDiagnostics }
+
+func (s rxSNRStreamDiagnosticsStub) Diagnostics() transport.DecoderDiagnostics { return s.status }
+
+type rxSNRAutoDiagnosticsStub struct {
+	status transport.AutoDecoderDiagnostics
+}
+
+func (s rxSNRAutoDiagnosticsStub) Diagnostics() transport.AutoDecoderDiagnostics { return s.status }
+
+func TestRXSNREvidenceRequiresRecentlyValidatedPacket(t *testing.T) {
+	for _, status := range []transport.DecoderDiagnostics{
+		{FSKLocked: true},
+		{GMSKLocked: true},
+		{MARYLocked: true},
+	} {
+		if !rxDecoderHasModemLock(rxSNRStreamDiagnosticsStub{status: status}) {
+			t.Fatalf("modem acquisition flag was not exposed for noise-baseline freezing: %+v", status)
+		}
+	}
+	if rxDecoderHasRecentValidPacket(rxSNRStreamDiagnosticsStub{status: transport.DecoderDiagnostics{FSKLocked: true}}) {
+		t.Fatal("carrier/symbol acquisition without a valid packet was accepted as SNR display evidence")
+	}
+	if !rxDecoderHasRecentValidPacket(rxSNRStreamDiagnosticsStub{status: transport.DecoderDiagnostics{ValidPacketRecent: true}}) {
+		t.Fatal("recent validated stream packet was not accepted as SNR evidence")
+	}
+	if !rxDecoderHasModemLock(rxSNRAutoDiagnosticsStub{status: transport.AutoDecoderDiagnostics{FSK1200Locked: true}}) {
+		t.Fatal("auto FSK acquisition flag was not exposed for baseline freezing")
+	}
+	if rxDecoderHasRecentValidPacket(rxSNRAutoDiagnosticsStub{status: transport.AutoDecoderDiagnostics{FSK1200Locked: true}}) {
+		t.Fatal("automatic FSK acquisition without a packet was accepted as SNR evidence")
+	}
+	if !rxDecoderHasRecentValidPacket(rxSNRAutoDiagnosticsStub{status: transport.AutoDecoderDiagnostics{ValidPacketRecent: true}}) {
+		t.Fatal("recent validated auto packet was not accepted as SNR evidence")
+	}
+}
+
+func TestLiveRXAudioSNRIsUnavailableForWidebandProfiles(t *testing.T) {
+	app := &App{}
+	for _, profile := range []string{
+		domain.AutoReceiveProfile,
+		string(domain.SSDVQPSK1600),
+		string(domain.SSDV8PSK1600),
+		string(domain.SSDV16QAM1600),
+		string(domain.SSDVCCSDS2400),
+		string(domain.PCSICCSDS2400),
+	} {
+		got := app.estimateTrackedRXAudioSNR(nil, profile, 48000)
+		if got.Valid || got.SNRDB != 0 {
+			t.Fatalf("wideband profile %s must not publish an uncalibrated spectrum-only SNR: %+v", profile, got)
+		}
+	}
+}
+
+func TestRXSNREvidenceRequiresFreshCRCValidPacket(t *testing.T) {
+	for _, tc := range []struct {
+		ageMS int64
+		want  bool
+	}{
+		{ageMS: 0, want: true},
+		{ageMS: 1000, want: true},
+		{ageMS: 1200, want: true},
+		{ageMS: 1201, want: false},
+		{ageMS: 3000, want: false},
+	} {
+		status := transport.DecoderDiagnostics{ValidPacketRecent: true, LastPacketAgeMS: tc.ageMS}
+		got := rxDecoderHasFreshValidPacket(rxSNRStreamDiagnosticsStub{status: status})
+		if got != tc.want {
+			t.Fatalf("stream packet age %d ms: got fresh=%t want %t", tc.ageMS, got, tc.want)
+		}
+		autoStatus := transport.AutoDecoderDiagnostics{ValidPacketRecent: true, LastPacketAgeMS: tc.ageMS}
+		got = rxDecoderHasFreshValidPacket(rxSNRAutoDiagnosticsStub{status: autoStatus})
+		if got != tc.want {
+			t.Fatalf("auto packet age %d ms: got fresh=%t want %t", tc.ageMS, got, tc.want)
+		}
+	}
+	if rxDecoderHasFreshValidPacket(rxSNRStreamDiagnosticsStub{status: transport.DecoderDiagnostics{LastPacketAgeMS: 0}}) {
+		t.Fatal("zero age without ValidPacketRecent was accepted as a CRC-valid packet")
+	}
+}
+
+func makeSyntheticAFSK1200Audio(samples, sampleRate, bitRate int, markHz, spaceHz int, seed int64, amplitude float64) []float32 {
+	constTau := 2 * math.Pi
+	sps := sampleRate / bitRate
+	rng := rand.New(rand.NewSource(seed))
+	out := make([]float32, samples)
+	phase := 0.0
+	frequency := markHz
+	for i := range out {
+		if i%sps == 0 {
+			if rng.Intn(2) == 0 {
+				frequency = markHz
+			} else {
+				frequency = spaceHz
+			}
+		}
+		out[i] = float32(amplitude * math.Sin(phase))
+		phase += constTau * float64(frequency) / float64(sampleRate)
+		if phase >= constTau {
+			phase -= constTau
+		}
+	}
+	return out
+}
+
+func TestLiveRXAudioSNRRemainsAvailableForAFSK1200(t *testing.T) {
+	const sampleRate = 19200
+	profile := string(domain.SSDVCCSDS1200)
+	app := &App{}
+	signal := makeSyntheticAFSK1200Audio(4096, sampleRate, 1200, 1200, 2200, 0x4146534b, 0.25)
+	noise := makeSNRNoise(4096, 1, 0x4146534c)
+	signalPower := spectralBandPower(t, signal, profile, sampleRate)
+	noisePower := spectralBandPower(t, noise, profile, sampleRate)
+	const targetSNR = 12.0
+	noiseGain := math.Sqrt(signalPower / (noisePower * math.Pow(10, targetSNR/10)))
+	for frame := 0; frame < 24; frame++ {
+		baseline := makeSNRNoise(4096, noiseGain, int64(0x41465350+frame))
+		bins := mustSpectrumForSNRTest(t, baseline, sampleRate)
+		got := app.estimateTrackedRXAudioSNR(bins, profile, sampleRate)
+		if got.Valid {
+			t.Fatalf("idle baseline frame %d unexpectedly produced SNR: %+v", frame, got)
+		}
+	}
+	app.rxModemLocked.Store(true)
+	app.rxPacketValidated.Store(true)
+	mixed := make([]float32, 4096)
+	finalNoise := makeSNRNoise(4096, noiseGain, 0x4146535f)
+	for i := range mixed {
+		mixed[i] = signal[i] + finalNoise[i]
+	}
+	bins := mustSpectrumForSNRTest(t, mixed, sampleRate)
+	hint := estimateRXAudioSNR(bins, profile, sampleRate)
+	if !hint.Valid {
+		t.Fatalf("synthetic AFSK dual-tone spectrum was not recognized: %+v", hint)
+	}
+	got := app.estimateTrackedRXAudioSNR(bins, profile, sampleRate)
+	if !got.Valid {
+		t.Fatalf("AFSK1200 live audio SNR not shown after sync/CRC evidence: %+v", got)
+	}
+	expected := 10 * math.Log10(spectralBandPower(t, signal, profile, sampleRate)/spectralBandPower(t, finalNoise, profile, sampleRate))
+	if math.Abs(got.SNRDB-expected) > 3.0 {
+		t.Fatalf("AFSK1200 live SNR %.2f dB differs from in-channel synthetic %.2f dB: %+v", got.SNRDB, expected, got)
 	}
 }

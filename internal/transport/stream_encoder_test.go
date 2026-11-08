@@ -82,6 +82,72 @@ func TestStreamPacketsMatchesWholeWaveformForAllSSDVProfiles(t *testing.T) {
 	}
 }
 
+func TestMARYGroupedFECReducesTXAirtimeOverPerFrameSDF3(t *testing.T) {
+	packets := makeSoftFECTestPackets(t, 8)
+	for _, profile := range []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600} {
+		t.Run(string(profile), func(t *testing.T) {
+			perFrame, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			grouped, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldSamples, err := perFrame.EstimateOutputSamplesForPackets(packets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newSamples, err := grouped.EstimateOutputSamplesForPackets(packets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if newSamples >= oldSamples {
+				t.Fatalf("grouped SDF3 airtime %d samples did not improve over per-frame %d", newSamples, oldSamples)
+			}
+			reduction := 100 * (1 - float64(newSamples)/float64(oldSamples))
+			if reduction < 15 {
+				t.Fatalf("grouping reduced airtime by only %.1f%% (old=%d new=%d)", reduction, oldSamples, newSamples)
+			}
+			t.Logf("group size 10 reduced estimated airtime by %.1f%%", reduction)
+		})
+	}
+}
+
+func TestBalancedMARYProfilesOutrunCCSDS2400ForEightPackets(t *testing.T) {
+	packets := makeSoftFECTestPackets(t, 8)
+	ccsdsEncoder, err := NewEncoder(Config{Profile: domain.SSDVCCSDS2400, AudioSampleRate: 48000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ccsdsSamples, err := ccsdsEncoder.EstimateOutputSamplesForPackets(packets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ccsdsSeconds := float64(ccsdsSamples) / 48000
+	t.Logf("SSDV CCSDS 2400 baseline: %.3f s for 8 image packets", ccsdsSeconds)
+
+	for _, profile := range []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600} {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYFECProfile: MARYFECBalanced})
+			if err != nil {
+				t.Fatal(err)
+			}
+			count, err := encoder.EstimateOutputSamplesForPackets(packets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seconds := float64(count) / 48000
+			throughput := float64(len(packets)*256*8) / seconds
+			t.Logf("balanced airtime %.3f s; useful SSDV payload rate %.0f bit/s; improvement vs CCSDS2400 %.1f%%", seconds, throughput, 100*(1-seconds/ccsdsSeconds))
+			if seconds >= ccsdsSeconds {
+				t.Fatalf("balanced %s still slower than CCSDS 2400: %.3f s >= %.3f s", profile, seconds, ccsdsSeconds)
+			}
+		})
+	}
+}
+
 func TestStreamPacketsHonorsCancellationBetweenDataUnits(t *testing.T) {
 	packets := [][]byte{makeTestSSDVPacket(t), makeTestSSDVPacket(t), makeTestSSDVPacket(t)}
 	encoder, err := NewEncoder(Config{Profile: domain.SSDVCCSDS1200})

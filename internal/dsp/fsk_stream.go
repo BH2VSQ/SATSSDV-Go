@@ -143,6 +143,13 @@ func (d *FSKStreamDemodulator) Feed(samples []float32) []bool {
 	return out
 }
 
+// Locked reports whether the streaming receiver acquired and is currently
+// tracking a symbol phase/frequency hypothesis. It is used only as independent
+// signal-presence evidence for RX diagnostics; it does not certify a frame.
+func (d *FSKStreamDemodulator) Locked() bool {
+	return d != nil && d.locked
+}
+
 func (d *FSKStreamDemodulator) findBestPhase(samples []float32) (int, int, float64, float64) {
 	bestPhase, bestOffset := 0, 0
 	bestScore, bestPower := math.Inf(-1), 0.0

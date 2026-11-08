@@ -1,113 +1,40 @@
-# RX audio SNR estimation
+# RX audio SNR measurement and validity
 
-## Purpose and measurement definition
+## What the live number represents
 
-The RX workbench SNR indicator reports an **in-channel audio SNR estimate**.
-It is not calibrated RF input SNR, carrier-to-noise density, Eb/N0, receiver
-sensitivity, or a substitute for a calibrated noise-source measurement.
+The live RX SNR number is currently enabled only for the AFSK 1200 profiles (SSDV AX.25, SSDV CCSDS 1200 and PCSI CCSDS 1200). It is an **audio-channel estimate**, not calibrated RF SNR, C/N0, Eb/N0, receiver sensitivity, or an antenna-system noise figure. It must not be compared directly with a calibrated S-meter or an SDR RF SNR readout.
 
-The estimator integrates the selected modem receive passband and compares it
-with the idle-noise power measured in that same passband. It does not estimate
-the channel noise from a distant audio band, because sound-card and receiver
-filter responses can make the noise power at those frequencies substantially
-different.
+AFSK 1200 provides two separated mark/space tone groups with intervening spectral regions that can serve as a noise reference. The stateless detector requires two separated spectral clusters; the live tracker also requires an idle-channel noise profile, current decoder synchronization and a fresh CRC-valid packet. The packet evidence used for SNR is limited to 1.2 seconds, even though the general RX diagnostics retain their separate three-second recent-packet indicator.
 
-For the selected receive channel, the calculation is:
+The displayed audio estimate integrates linear FFT-bin power in the configured AFSK channel and subtracts the corresponding per-bin idle-noise estimate:
 
 ```text
-Pnoise  = sum of learned idle-noise power for the in-channel FFT bins
-Ptotal  = sum of current power for the same FFT bins
+Pnoise  = sum of learned idle-noise power for the in-band FFT bins
+Ptotal  = sum of current power in those same bins
 Psignal = max(Ptotal - Pnoise, 0)
 SNR(dB) = 10 * log10(Psignal / Pnoise)
 ```
 
-`Spectrum()` reports a Hann-windowed magnitude in dBFS. The implementation
-converts each bin to linear power before integrating it. The displayed result
-therefore refers to the configured modem audio passband, not the whole audio
-spectrum.
+`Spectrum()` provides Hann-windowed amplitude in dBFS. The tracker converts each bin to linear power before integration. The UI shows `SNR --` until the baseline and all evidence are available. Values below 3 dB are suppressed.
 
-## Noise-floor tracking
+## Why M-ary, GMSK and Auto currently show `SNR --`
 
-`dsp.BandSNRTracker` maintains an idle-noise power estimate for every FFT bin.
-When RX starts, the tracker learns at least 12 noise-only windows before it
-publishes an SNR. The UI emits a 4096-sample spectrum at up to 15 updates per
-second, so this warm-up is typically around 0.8 seconds. During this period,
-the UI displays `SNR -- dB`.
+QPSK, 8PSK, 16QAM and GMSK occupy most of their configured audio analysis bands. There are not enough reliably signal-free FFT bins to estimate the current noise floor from the same window. An idle-noise profile learned before the pass can also become invalid if the receiver AGC/input gain changes while a signal occupies the band. The resulting signal/noise ratio can be grossly overstated.
 
-A separate spectral-shape detector is used only as a warm-up guard. If a
-recognizable modem-shaped signal is already present, that window is not added
-to the idle-noise profile. Once the tracker is ready, the displayed SNR comes
-from the temporal in-channel noise profile, not from the instantaneous
-sideband/guard-band estimator.
+For this reason, live numeric SNR is deliberately disabled for QPSK, 8PSK, 16QAM, CCSDS 2400 GMSK and Auto RX. The UI explains that the estimate is unavailable instead of presenting an attractive but unsupported number. Re-enabling those profiles requires a modem-derived estimate from known training/pilot symbols or a calibrated receiver noise measurement; simply changing a frequency guard or gain coefficient is not sufficient.
 
-During idle reception, the noise profile follows ordinary changes slowly
-(4% exponential update per accepted idle window). A near-full-passband rise,
-which is more consistent with broadband noise or an AGC/audio gain transition
-than a modem signal, is rejected as a signal and followed faster (25% update).
-When a modem-like signal is accepted, the idle profile is held so the received
-signal is not learned as noise.
+## Noise-baseline learning (AFSK 1200)
 
-## Signal-presence safeguards
+The AFSK tracker learns the actual receive-channel noise profile over 24 noise-only FFT windows. At the current 4096-sample, 48 kHz diagnostic window size, each window is about 85 ms. The UI emits the spectrum up to 15 times per second, so the initial warm-up generally takes about 1.6 seconds after the first valid window. Until then, the UI shows `SNR --`.
 
-An SNR number is not displayed merely because current channel power exceeds
-the learned noise estimate. The candidate must also satisfy these safeguards:
+A current modem-like two-tone spectrum is never learned as idle noise. When the current window no longer contains the feature, the tracker follows the idle noise even if a legacy demodulator retains an old carrier-lock state. A coherent gain step across the idle channel is followed after repeated confirmation. An unknown gain change during active reception still invalidates the assumptions of an idle-profile estimator; fixed gain during a pass is recommended.
 
-- At least 150 Hz of estimated 90%-occupied excess bandwidth.
-- The occupied bandwidth must remain below 82% of the configured receive
-  passband. A near-full-band rise is treated as broadband noise/AGC change.
-- The estimated in-channel SNR must be at least 3 dB.
-- The warm-up detector rejects random noise and single narrowband tones. For
-  AFSK 1200 it looks for separated mark/space tone groups; other modes use a
-  wider spectral feature.
+## Tests and limits
 
-These are conservative display gates. A real signal below about 3 dB may be
-present and partially decodable while the UI still shows `SNR -- dB`. An
-unusual modem waveform that occupies almost the entire configured passband
-may also be rejected by the broadband-noise safeguard.
+The regression suite covers white/colored idle noise, digital silence, narrowband tone interference, current-window return to noise after a valid packet, fresh-packet age gating, AFSK two-tone evidence and known synthetic audio SNR. Generic DSP tracker tests also exercise synthetic broad-band signals, but those do **not** authorize the live UI to show M-ary/GMSK SNR.
 
-## Calibration and regression coverage
+Synthetic tests are useful for software regression only. Recorded satellite audio is still needed to characterize actual receiver noise, AGC behavior, compression, audio filtering and Doppler. Absolute RF SNR/Eb/N0 requires a defined measurement bandwidth and RF calibration.
 
-`rx_snr_test.go` checks:
+## Recommended operational use
 
-- White and colored idle noise across the supported RX profiles.
-- Single-tone interference and AFSK mark/space evidence.
-- 1000 deterministic noise windows with the signal hint forcibly asserted.
-- QPSK, 8PSK, 16QAM, AFSK 1200 and GMSK 2400 against directly measured
-  in-channel signal/noise power.
-- Linear audio gain invariance, a 26 dB idle-noise gain step, and recovery of a
-  real modem SNR estimate after the idle-noise profile adapts to that gain step.
-- Burst-present-at-start behavior, ensuring a recognized burst is not learned
-  as the idle-noise profile.
-
-In the deterministic M-ary calibration sweep, the measured estimates at
-6/9/12/18/24 dB were:
-
-| Mode | 6 dB | 9 dB | 12 dB | 18 dB | 24 dB |
-|---|---:|---:|---:|---:|---:|
-| QPSK | 5.67 | 8.51 | 12.07 | 17.73 | 23.68 |
-| 8PSK | 5.03 | 8.13 | 11.27 | 17.77 | 23.95 |
-| 16QAM | 5.84 | 8.86 | 11.94 | 17.87 | 23.49 |
-
-These are synthetic baseband calibration tests. The expected value is computed
-from the same selected receive channel for both signal and noise. A whole-audio
-band injected SNR is not directly comparable to this channel-integrated result.
-The 0–3 dB points are intentionally not treated as dependable display values
-in the current regression policy.
-
-## Operating recommendations and limitations
-
-For a meaningful baseline, start RX while the channel is idle and allow the
-noise profile to finish learning before the satellite signal arrives. If RX
-starts during a weak or unusual burst that the shape detector cannot recognize,
-that burst could contaminate the initial noise profile. Resetting RX, or
-waiting for an idle interval before the next pass, relearns the profile.
-
-The tracker handles common stationary colored-noise spectra and broad level
-changes, but cannot perfectly distinguish every time-varying interferer,
-narrowband noise source, compression effect, or receiver AGC behavior from a
-modem signal. The 82% occupancy gate is a deliberate false-positive trade-off.
-
-Before using the displayed value as an operational station metric, compare it
-against recorded WAV/IQ captures and a calibrated RF/noise measurement. The UI
-is intended for relative monitoring of the selected audio channel, not as an
-absolute receiver sensitivity instrument.
+Use the AFSK live estimate only as a relative audio-channel indication and keep receiver gain fixed during a pass. For M-ary/GMSK, rely on decode success, CRC/FEC statistics and acquisition diagnostics until a training-symbol/pilot-based estimator is implemented and validated against recordings.

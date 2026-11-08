@@ -67,7 +67,7 @@ jobs:
         env:
           SATSSDV_CHARACTERIZATION: "1"
           SATSSDV_CHARACTERIZATION_TRIALS: "2"
-          MODEM_REPORT_PATH: modem-characterization-report.md
+          MODEM_REPORT_PATH: ${{ github.workspace }}/modem-characterization-report.md
         run: go test -count=1 -v ./internal/transport -run '^TestModeNoiseAndOffsetCharacterization$'
       - uses: actions/upload-artifact@v4
         with:

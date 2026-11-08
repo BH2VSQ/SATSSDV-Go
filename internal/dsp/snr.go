@@ -305,18 +305,25 @@ func finiteSNR(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 // kHz outside the modem band has the same level as in-band noise, and prevents
 // transmitter sidebands from contaminating an adjacent guard-band estimate.
 type BandSNRTracker struct {
-	frequencies []float64
-	noisePower  []float64
-	frames      int
+	frequencies     []float64
+	noisePower      []float64
+	frames          int
+	gainShiftFrames int
+	gainShiftDB     float64
 }
 
 const (
-	snrNoiseLearningFrames = 12
+	snrNoiseLearningFrames = 24
 	snrNoiseAdaptAlpha     = 0.04
-	snrSignalHoldDB        = 2.0
 	snrDisplayMinDB        = 3.0
-	snrMinOccupiedHz       = 150.0
-	snrMaxOccupiedFraction = 0.82
+	snrGainShiftThreshold  = 4.5
+	snrGainShiftMaxMAD     = 6.5
+	snrGainShiftConfirm    = 3
+	// A passband whose total FFT power is below this floor is effectively
+	// digital silence for this estimator. Never learn a near-zero baseline:
+	// doing so makes the next ordinary receiver-noise sample look like an
+	// enormous SNR improvement.
+	snrMinimumBaselinePower = 1e-18
 )
 
 // Reset discards the learned idle-noise spectrum. Call it when the RX audio
@@ -334,16 +341,39 @@ func (t *BandSNRTracker) Reset() {
 	t.frequencies = nil
 	t.noisePower = nil
 	t.frames = 0
+	t.gainShiftFrames = 0
+	t.gainShiftDB = 0
 }
 
 // Estimate returns an audio SNR measured only inside [signalLowHz, signalHighHz].
-// It compares each in-channel FFT-bin power with the corresponding bin in a
-// temporally learned idle-noise profile. signalHint is a separate shape-based
-// detector result used during warm-up: a recognizable modem-shaped burst must
-// not be learned as idle noise. Until 12 noise frames have been learned, Valid
-// remains false rather than publishing an uncalibrated guess. The estimate is
-// relative to the current audio input path; it is not RF SNR or Eb/N0.
+// This compatibility entry point treats signalHint as a confirmed-signal flag;
+// live RX code must use EstimateWithLock and pass an actual modem acquisition
+// state. A spectral shape alone is never sufficient to publish live SNR.
 func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz float64, signalHint bool) BandSNR {
+	return t.EstimateWithLock(bins, signalLowHz, signalHighHz, signalHint, signalHint)
+}
+
+// EstimateWithLock measures audio in-channel SNR against a temporally learned
+// noise profile. The profile is learned whenever the current FFT window has no
+// independent modem-like feature, even if a legacy FSK/GMSK lock flag remains
+// latched. `signalLocked` must come from the production demodulator, not from
+// this spectrum estimator. A value is published only when both current-window
+// spectral evidence and decoder lock are present. A real RF-calibrated SNR
+// still requires a calibrated receiver path.
+func (t *BandSNRTracker) EstimateWithLock(bins []SpectrumBin, signalLowHz, signalHighHz float64, signalHint, signalLocked bool) BandSNR {
+	return t.EstimateWithEvidence(bins, signalLowHz, signalHighHz, signalHint, signalLocked, signalLocked)
+}
+
+// EstimateWithEvidence separates three different conditions:
+//   - signalHint: spectrum looks modem-like, so do not learn it as idle noise;
+//   - signalAcquired: the production demodulator has acquired timing/carrier;
+//   - packetValidated: a full frame passed protocol/CRC checks, permitting a
+//     numeric SNR value to be shown to the operator.
+//
+// Carrier lock alone is insufficient for display because CW interference and
+// impulsive noise can occasionally produce a front-end lock. Conversely, a
+// valid but not-yet-decoded preamble must freeze the noise baseline.
+func (t *BandSNRTracker) EstimateWithEvidence(bins []SpectrumBin, signalLowHz, signalHighHz float64, signalHint, signalAcquired, packetValidated bool) BandSNR {
 	result := BandSNR{}
 	if t == nil || len(bins) < 16 || !finiteSNR(signalLowHz) || !finiteSNR(signalHighHz) ||
 		signalLowHz < 0 || signalHighHz <= signalLowHz {
@@ -352,6 +382,8 @@ func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz 
 
 	frequencies := make([]float64, len(bins))
 	powers := make([]float64, len(bins))
+	bandPower := 0.0
+	bandBins := 0
 	for i, bin := range bins {
 		if !finiteSNR(bin.FrequencyHz) || !finiteSNR(bin.MagnitudeDBFS) ||
 			bin.MagnitudeDBFS < -200 || bin.MagnitudeDBFS > 40 || bin.FrequencyHz < 0 {
@@ -368,12 +400,28 @@ func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz 
 			t.Reset()
 			return result
 		}
+		if frequencies[i] >= signalLowHz && frequencies[i] <= signalHighHz {
+			bandPower += powers[i]
+			bandBins++
+		}
+	}
+	if bandBins < 8 {
+		return result
+	}
+	if bandPower < snrMinimumBaselinePower {
+		// Do not turn a muted/zero-input interval into an unrealistically low
+		// noise reference. Keep the profile unready until real receiver noise is
+		// present, or discard a previously learned floor if the input disappeared.
+		if !signalAcquired {
+			t.Reset()
+		}
+		return result
 	}
 
 	if len(t.frequencies) != len(frequencies) || len(t.noisePower) != len(powers) {
 		t.frequencies = append(t.frequencies[:0], frequencies...)
 		t.noisePower = make([]float64, len(powers))
-		if !signalHint {
+		if !signalHint && !signalAcquired {
 			copy(t.noisePower, powers)
 			t.frames = 1
 		} else {
@@ -385,7 +433,7 @@ func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz 
 		if math.Abs(frequencies[i]-t.frequencies[i]) > 1e-6 {
 			t.frequencies = append(t.frequencies[:0], frequencies...)
 			t.noisePower = make([]float64, len(powers))
-			if !signalHint {
+			if !signalHint && !signalAcquired {
 				copy(t.noisePower, powers)
 				t.frames = 1
 			} else {
@@ -397,7 +445,10 @@ func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz 
 
 	if t.frames < snrNoiseLearningFrames {
 		if signalHint {
-			// Do not let an already-present burst become the learned noise floor.
+			// Never teach a modem-like spectrum as idle noise, even before the
+			// decoder has acquired synchronization. A current window without the
+			// independent modem feature is eligible for noise learning even when
+			// an FSK/GMSK decoder retains a stale carrier-lock flag.
 			return result
 		}
 		t.frames++
@@ -407,8 +458,25 @@ func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz 
 		return result
 	}
 
-	signal := make([]snrPowerBin, 0, len(bins)/4)
-	noise := make([]snrPowerBin, 0, len(bins)/4)
+	// Keep tracking actual idle-channel noise whenever the current spectrum
+	// no longer contains the modem feature. FSK/GMSK implementations can retain
+	// lock after PTT drops, so lock by itself must not freeze an old noise floor.
+	if !signalHint {
+		t.updateIdleNoise(powers, frequencies, signalLowHz, signalHighHz)
+		return result
+	}
+	// A live numeric value requires the current-window spectral feature, modem
+	// synchronization and a recently CRC-validated packet. None alone is enough.
+	if !signalAcquired || !packetValidated {
+		// A previously valid packet is not evidence that the *current* FFT
+		// window still contains the wanted signal. Requiring both current
+		// spectral evidence and a recently CRC-validated packet suppresses a
+		// stale high SNR display after the receiver returns to idle noise.
+		return result
+	}
+
+	signal := make([]snrPowerBin, 0, bandBins)
+	noise := make([]snrPowerBin, 0, bandBins)
 	for i, frequency := range frequencies {
 		if frequency >= signalLowHz && frequency <= signalHighHz {
 			signal = append(signal, snrPowerBin{frequency: frequency, power: powers[i]})
@@ -419,56 +487,28 @@ func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz 
 		return result
 	}
 
-	// Compare every in-channel bin against its own learned idle-noise power.
-	// This preserves the receiver/audio frequency response instead of assuming
-	// that a distant guard band has the same absolute noise PSD.
+	// The per-bin idle-noise profile is deliberately not scaled from spectral
+	// bins while a signal is active: M-ary sidebands can occupy the entire
+	// audio channel, so they are not an independent AGC reference.
+	const noiseGain = 1.0
 	expectedNoise := 0.0
 	observedPower := 0.0
 	excess := make([]float64, len(signal))
-	longestRun, currentRun := 0, 0
 	for i := range signal {
-		expected := noise[i].power
+		expected := noise[i].power * noiseGain
 		expectedNoise += expected
 		observedPower += signal[i].power
 		excess[i] = math.Max(0, signal[i].power-expected)
-		if signal[i].power >= expected*6.3095734448 {
-			currentRun++
-			if currentRun > longestRun {
-				longestRun = currentRun
-			}
-		} else {
-			currentRun = 0
-		}
 	}
-	occupied := occupiedBandwidth90(signal, excess)
-	result.EvidenceBins = longestRun
-	result.OccupiedBandwidth90Hz = occupied
+	result.OccupiedBandwidth90Hz = occupiedBandwidth90(signal, excess)
 	result.NoiseFloorDBFS = 10 * math.Log10(math.Max(expectedNoise/float64(len(signal)), 1e-24))
 	result.SignalBandDBFS = 10 * math.Log10(math.Max(observedPower, 1e-24))
 	if expectedNoise <= 0 || observedPower <= expectedNoise {
-		t.updateNoise(powers)
 		return result
 	}
 	result.SNRDB = 10 * math.Log10((observedPower-expectedNoise)/expectedNoise)
 	if !finiteSNR(result.SNRDB) {
-		t.updateNoise(powers)
 		return BandSNR{}
-	}
-
-	// Modem waveforms occupy a bounded portion of the configured passband.
-	// A sudden broadband noise/AGC rise tends to fill almost the whole channel;
-	// treating that as a modem would produce a false high-SNR report. Reject
-	// near-full-band excess and let the idle floor follow it more quickly.
-	maxOccupied := (signalHighHz - signalLowHz) * snrMaxOccupiedFraction
-	if result.OccupiedBandwidth90Hz > maxOccupied {
-		result.SNRDB = 0
-		t.updateNoiseFast(powers)
-		return result
-	}
-	candidate := occupied >= snrMinOccupiedHz && result.SNRDB >= snrSignalHoldDB
-	if !candidate {
-		t.updateNoise(powers)
-		return result
 	}
 	if result.SNRDB < snrDisplayMinDB {
 		return result
@@ -477,15 +517,77 @@ func (t *BandSNRTracker) Estimate(bins []SpectrumBin, signalLowHz, signalHighHz 
 	return result
 }
 
-func (t *BandSNRTracker) updateNoise(powers []float64) {
-	t.updateNoiseAlpha(powers, snrNoiseAdaptAlpha)
+// updateIdleNoise follows the noise floor while the current FFT window has
+// no modem-like signal feature. If the median per-bin level moves coherently,
+// treat it as an audio/AGC gain change and scale the learned noise spectrum
+// after three consecutive confirmations. This avoids displaying an enormous
+// SNR against a noise floor learned at a much lower receiver gain.
+func (t *BandSNRTracker) updateIdleNoise(powers, frequencies []float64, lowHz, highHz float64) {
+	shiftDB, madDB, ok := t.noiseGainShift(powers, frequencies, lowHz, highHz)
+	if ok && math.Abs(shiftDB) >= snrGainShiftThreshold && madDB <= snrGainShiftMaxMAD {
+		if t.gainShiftFrames == 0 || math.Abs(shiftDB-t.gainShiftDB) > 3.0 {
+			t.gainShiftDB = shiftDB
+			t.gainShiftFrames = 1
+		} else {
+			t.gainShiftDB += (shiftDB - t.gainShiftDB) / float64(t.gainShiftFrames+1)
+			t.gainShiftFrames++
+		}
+		if t.gainShiftFrames >= snrGainShiftConfirm {
+			scale := math.Pow(10, t.gainShiftDB/10)
+			for i := range t.noisePower {
+				t.noisePower[i] *= scale
+			}
+			t.gainShiftFrames = 0
+			t.gainShiftDB = 0
+		}
+		return
+	}
+	t.gainShiftFrames = 0
+	t.gainShiftDB = 0
+	t.updateNoise(powers)
 }
 
-// updateNoiseFast is used only after a near-full-band noise/AGC transition has
-// been rejected as a modem. The receiver should relearn the changed idle floor
-// faster than the normal slow background adaptation.
-func (t *BandSNRTracker) updateNoiseFast(powers []float64) {
-	t.updateNoiseAlpha(powers, 0.25)
+func (t *BandSNRTracker) noiseGainShift(powers, frequencies []float64, lowHz, highHz float64) (medianDB, madDB float64, ok bool) {
+	if t == nil || len(powers) != len(t.noisePower) || len(frequencies) != len(powers) {
+		return 0, 0, false
+	}
+	deltas := make([]float64, 0, len(powers)/4)
+	for i, frequency := range frequencies {
+		if frequency < lowHz || frequency > highHz || t.noisePower[i] <= 0 || powers[i] <= 0 {
+			continue
+		}
+		delta := 10 * math.Log10(powers[i]/t.noisePower[i])
+		if finiteSNR(delta) {
+			deltas = append(deltas, delta)
+		}
+	}
+	if len(deltas) < 16 {
+		return 0, 0, false
+	}
+	sort.Float64s(deltas)
+	medianDB = medianFloat64(deltas)
+	deviations := make([]float64, len(deltas))
+	for i, value := range deltas {
+		deviations[i] = math.Abs(value - medianDB)
+	}
+	sort.Float64s(deviations)
+	madDB = medianFloat64(deviations)
+	return medianDB, madDB, true
+}
+
+func medianFloat64(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	middle := len(values) / 2
+	if len(values)%2 == 0 {
+		return (values[middle-1] + values[middle]) * 0.5
+	}
+	return values[middle]
+}
+
+func (t *BandSNRTracker) updateNoise(powers []float64) {
+	t.updateNoiseAlpha(powers, snrNoiseAdaptAlpha)
 }
 
 func (t *BandSNRTracker) updateNoiseAlpha(powers []float64, alpha float64) {

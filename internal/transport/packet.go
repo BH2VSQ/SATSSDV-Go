@@ -9,6 +9,7 @@ import (
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/pcsi"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
@@ -21,14 +22,24 @@ const (
 	DefaultCCSDSTrailerBytes  = 150
 )
 
+const (
+	// MARYFECBalanced uses punctured K=7 rate-3/4 soft-decision FEC and
+	// modulation-specific packet erasure parity to favour throughput.
+	MARYFECBalanced = iota
+	// MARYFECRobust retains K=7 rate-1/2 FEC and two packet parity shards.
+	MARYFECRobust
+)
+
 type Config struct {
-	Profile         domain.TransportMode
-	Source          ax25.Address
-	Destination     ax25.Address
-	Digipeaters     []ax25.Address
-	PreambleSize    int
-	TrailerSize     int
-	AudioSampleRate int // zero keeps the profile's native modem sample rate
+	Profile            domain.TransportMode
+	Source             ax25.Address
+	Destination        ax25.Address
+	Digipeaters        []ax25.Address
+	PreambleSize       int
+	TrailerSize        int
+	AudioSampleRate    int // zero keeps the profile's native modem sample rate
+	MARYBurstGroupSize int // 1..15 CCSDS units per independently coded SDF3 group; zero defaults to 10.
+	MARYFECProfile     int // MARYFECBalanced (default) or MARYFECRobust.
 }
 
 type Encoder struct{ cfg Config }
@@ -49,10 +60,37 @@ func NewEncoder(cfg Config) (*Encoder, error) {
 	if cfg.TrailerSize == 0 {
 		cfg.TrailerSize = DefaultCCSDSTrailerBytes
 	}
+	if cfg.MARYBurstGroupSize == 0 {
+		cfg.MARYBurstGroupSize = 10
+	}
+	if cfg.MARYBurstGroupSize < 1 || cfg.MARYBurstGroupSize > 15 {
+		return nil, errors.New("M-ary SDF3 group size must be between 1 and 15 CCSDS units")
+	}
+	if cfg.MARYFECProfile != MARYFECBalanced && cfg.MARYFECProfile != MARYFECRobust {
+		return nil, errors.New("M-ary FEC profile must be balanced or robust")
+	}
 	if cfg.PreambleSize < 0 || cfg.PreambleSize > 4096 || cfg.TrailerSize < 0 || cfg.TrailerSize > 4096 {
 		return nil, errors.New("CCSDS preamble/trailer size must be between 0 and 4096 bytes")
 	}
 	return &Encoder{cfg: cfg}, nil
+}
+
+// maryFECSettings maps the selected FEC policy and modulation to an on-air
+// code profile and packet-erasure parity count. Balanced mode keeps the
+// soft-decision inner code but trades some coding margin for throughput;
+// robust mode preserves the previous rate-1/2 plus 8+2 parity configuration.
+func (e *Encoder) maryFECSettings(profile domain.Profile) (uint8, int) {
+	if e != nil && e.cfg.MARYFECProfile == MARYFECRobust {
+		return fec.PacketFECProfileRate12, 2
+	}
+	switch profile.BitsPerSymbol {
+	case 2:
+		return fec.PacketFECProfileRate34, 0 // QPSK: 3/4 inner code; SSDV RS8 remains enabled.
+	case 3:
+		return fec.PacketFECProfileRate23, 1 // 8PSK: 2/3 inner code plus one erasure shard.
+	default:
+		return fec.PacketFECProfileRate12, 2 // 16QAM: retain strongest inner and packet FEC.
+	}
 }
 
 // EncodePacket encodes one packet as a complete transmission burst.

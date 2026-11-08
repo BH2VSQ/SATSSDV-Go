@@ -2224,10 +2224,15 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         if (m_rxSnrLabel) {
             if (p.value(QStringLiteral("snrValid")).toBool()) {
                 m_rxSnrLabel->setText(uiText(QStringLiteral("SNR %1 dB")).arg(p.value(QStringLiteral("snrDb")).toDouble(), 0, 'f', 1));
-                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("In-channel audio SNR · idle noise profile · not RF-calibrated · noise %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 audio SNR estimate · two separated tone groups + decoder sync + CRC-valid packet in last 1.2 s · wideband M-ary/GMSK and Auto intentionally show -- because this audio spectrum has no independent noise-only reference · not RF-calibrated · noise %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
             } else {
                 m_rxSnrLabel->setText(uiText(QStringLiteral("SNR -- dB")));
-                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Learning the in-channel idle noise floor or waiting for a recognizable modem signal")));
+                const QString reason = p.value(QStringLiteral("snrReason")).toString();
+                if (reason == QStringLiteral("wideband-noise-reference-unavailable")) {
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("SNR unavailable: this wideband modem occupies the audio analysis band, so the audio spectrum has no independent noise-only reference. A numeric value would be misleading. This is not RF SNR or Eb/N0.")));
+                } else {
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 audio SNR is waiting for an idle-noise baseline, two-tone spectrum evidence, modem synchronization and a fresh CRC-valid packet")));
+                }
             }
         }
     } else if(name==QStringLiteral("rx:spectrum")||name==QStringLiteral("tx:spectrum")){
