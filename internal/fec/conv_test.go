@@ -547,3 +547,102 @@ func TestConvRate5of6RoundTripSoftViterbi(t *testing.T) {
 		t.Fatal("rate-5/6 soft Viterbi decode differs from source")
 	}
 }
+
+func TestSoftDepuncturerStreamingMatchesWholeStream(t *testing.T) {
+	payload := make([]byte, 513)
+	for i := range payload {
+		payload[i] = byte((i*97 + i/7 + 31) & 0xff)
+	}
+	inputBits := int64(len(payload)*8 + ConvMemory)
+
+	for _, profile := range []uint8{PacketFECProfileRate12, PacketFECProfileRate34, PacketFECProfileRate23, PacketFECProfileRate56} {
+		t.Run(map[uint8]string{2: "rate-1/2", 3: "rate-3/4", 4: "rate-2/3", 5: "rate-5/6"}[profile], func(t *testing.T) {
+			var coded []byte
+			var err error
+			switch profile {
+			case PacketFECProfileRate12:
+				enc := NewConvStreamEncoder()
+				body, encodeErr := enc.WriteBytes(payload)
+				if encodeErr != nil {
+					t.Fatal(encodeErr)
+				}
+				tail, closeErr := enc.Close()
+				if closeErr != nil {
+					t.Fatal(closeErr)
+				}
+				coded = append(body, tail...)
+			case PacketFECProfileRate34:
+				coded, err = EncodeConvRate3of4(payload)
+			case PacketFECProfileRate23:
+				coded, err = EncodeConvRate2of3(payload)
+			case PacketFECProfileRate56:
+				coded, err = EncodeConvRate5of6(payload)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			codedCount := inputBits * 2
+			switch profile {
+			case PacketFECProfileRate34:
+				codedCount = ConvRate3of4CodedBitCount(inputBits)
+			case PacketFECProfileRate23:
+				codedCount = ConvRate2of3CodedBitCount(inputBits)
+			case PacketFECProfileRate56:
+				codedCount = ConvRate5of6CodedBitCount(inputBits)
+			}
+			punctured := make([]float32, codedCount)
+			for i := int64(0); i < codedCount; i++ {
+				if coded[i/8]&(1<<uint(7-i%8)) != 0 {
+					punctured[i] = -9
+				} else {
+					punctured[i] = 9
+				}
+			}
+
+			var want []float32
+			switch profile {
+			case PacketFECProfileRate12:
+				want = append([]float32(nil), punctured...)
+			case PacketFECProfileRate34:
+				want, err = UnpunctureConvRate3of4Soft(punctured, inputBits)
+			case PacketFECProfileRate23:
+				want, err = UnpunctureConvRate2of3Soft(punctured, inputBits)
+			case PacketFECProfileRate56:
+				want, err = UnpunctureConvRate5of6Soft(punctured, inputBits)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dep, err := NewSoftDepuncturer(profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []float32
+			for pos := 0; pos < len(punctured); {
+				n := []int{17, 511, 29, 128, 7, 1024}[pos%6]
+				if pos+n > len(punctured) {
+					n = len(punctured) - pos
+				}
+				part, feedErr := dep.Feed(punctured[pos : pos+n])
+				if feedErr != nil {
+					t.Fatal(feedErr)
+				}
+				got = append(got, part...)
+				pos += n
+			}
+			if err := dep.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("streaming depunctured %d values, want %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("LLR mismatch at %d: got %v want %v", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}

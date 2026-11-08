@@ -2082,7 +2082,15 @@ void MainWindow::handleEvent(const QJsonObject &event) {
     const QString name=event.value(QStringLiteral("name")).toString(); const QJsonValue payloadValue=event.value(QStringLiteral("payload"));
     if(name==QStringLiteral("rx:image")){
         const auto payload=payloadValue.toObject();
-        if (payload.value(QStringLiteral("hasPreview")).toBool() || payload.value(QStringLiteral("gifEnd")).toBool()) {
+        const QString eventPreview = payload.value(QStringLiteral("previewDataUrl")).toString();
+        if (!eventPreview.isEmpty()) {
+            // Use the immutable preview attached to this packet event. Fetching
+            // the shared latest-image slot races event polling and collapses
+            // several packet updates into only the newest snapshot.
+            m_lastRXPreviewIsGIF = false;
+            showImage(eventPreview, m_rxPreview);
+            refreshInlineTemplateEditor();
+        } else if (payload.value(QStringLiteral("gifEnd")).toBool()) {
             refreshLatestRXPreview();
         }
         m_templateImageCache.remove(QStringLiteral("last-rx"));

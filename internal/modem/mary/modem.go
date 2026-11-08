@@ -8,6 +8,7 @@ import (
 	"errors"
 	"math"
 	"math/cmplx"
+	"time"
 )
 
 const trainingSymbols = 96
@@ -42,6 +43,7 @@ type StreamDemodulator struct {
 	evmSignalPower  float64
 	evmErrorPower   float64
 	evmSymbols      uint64
+	lastEVMSymbolAt time.Time
 	cosLUT          []float64
 	sinLUT          []float64
 }
@@ -87,6 +89,7 @@ func (d *StreamDemodulator) Reset() {
 	d.evmSignalPower = 0
 	d.evmErrorPower = 0
 	d.evmSymbols = 0
+	d.lastEVMSymbolAt = time.Time{}
 	d.burstGeneration++
 }
 
@@ -314,9 +317,10 @@ func (d *StreamDemodulator) releaseAcquisition() {
 	d.amplitudeScale = 1
 	d.sampleCount = 0
 	d.silenceSamples = 0
-	d.evmSignalPower = 0
-	d.evmErrorPower = 0
-	d.evmSymbols = 0
+	// Keep the rolling EVM statistics across acquisition releases. SDF3
+	// inserts guard intervals between independently trained groups; clearing
+	// them here made the UI revert to SNR -- at every group boundary. Reset()
+	// still clears these statistics when the user restarts RX.
 	// A released burst no longer defines the receive level. Clearing the
 	// envelope lets the next SDF3 unit reacquire even when its downlink level
 	// is much lower than the preceding unit.
@@ -550,9 +554,6 @@ func (d *StreamDemodulator) applyTrainingLock(start int, candidate trainingCandi
 	d.stepRotation = cmplx.Rect(1, -d.phaseStep)
 	d.cursor = start + trainingSymbols*d.sps
 	d.symbolIndex = 0
-	d.evmSignalPower = 0
-	d.evmErrorPower = 0
-	d.evmSymbols = 0
 	d.reacquireCount++
 }
 
@@ -611,6 +612,9 @@ func (d *StreamDemodulator) decodeSymbolCount(count int) []float32 {
 		d.symbolIndex++
 	}
 	d.cursor += count * d.sps
+	if count > 0 {
+		d.lastEVMSymbolAt = time.Now()
+	}
 	return out
 }
 
@@ -887,6 +891,7 @@ type StreamDiagnostics struct {
 	SNRDB           float64
 	SNRSamples      uint64
 	SNRValid        bool
+	SNRHoldover     bool // fresh EVM retained briefly while carrier lock is released between SDF3 groups.
 }
 
 func finiteEVM(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
@@ -899,7 +904,8 @@ func (d *StreamDemodulator) Diagnostics() StreamDiagnostics {
 		ReacquireCount: d.reacquireCount, PacketizedMode: d.packetizedMode, Locked: d.locked, BufferedSamples: len(d.baseband), SignalRMS: d.signalRMS,
 		SilenceSamples: d.silenceSamples, BurstGeneration: d.burstGeneration, SNRSamples: d.evmSymbols,
 	}
-	if d.locked && d.evmSymbols >= 48 && d.evmSignalPower > 1e-8 {
+	if d.evmSymbols >= 48 && d.evmSignalPower > 1e-8 && !d.lastEVMSymbolAt.IsZero() && time.Since(d.lastEVMSymbolAt) <= 2*time.Second {
+		status.SNRHoldover = !d.locked
 		evm2 := d.evmErrorPower / d.evmSignalPower
 		if evm2 < 1e-6 {
 			evm2 = 1e-6 // cap display at 60 dB for the numerical noise floor.

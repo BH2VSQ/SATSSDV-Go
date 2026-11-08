@@ -60,30 +60,35 @@ type StreamDecoder struct {
 	// image ID is reused by a transmitter or after its 8-bit ID wraps.
 	imageStates map[string]*packetDedupState
 
-	maryFECMode         int8 // -1 undecided, 0 legacy hard-decision, 1 soft-FEC burst
-	maryHeaderSoft      []float32
-	maryFECHeader       fec.BurstHeader
-	maryFECDecoder      *fec.ViterbiDecoder
-	maryFECSoft         []float32
-	maryFECBlocksDone   int64
-	maryFECBitsDone     int64
-	maryFECDecodedBits  int64
-	maryFECDecodedBytes uint32
-	maryFECByte         byte
-	maryFECByteBits     uint8
-	maryFECCRC          uint32
-	maryFECFinished     bool
-	maryFECError        error
-	maryPacketHeader    *fec.PacketBurstHeader
-	maryPacketSoft      []float32
-	maryPacketBodyBits  int
-	marySDF3PacketsOK   uint64
-	marySDF3PacketsBad  uint64
-	marySDF3Resyncs     uint64
-	marySDF3LastError   string
-	inputSamples        uint64
-	decodedPackets      uint64
-	lastValidPacketAt   time.Time
+	maryFECMode                  int8 // -1 undecided, 0 legacy hard-decision, 1 soft-FEC burst
+	maryHeaderSoft               []float32
+	maryFECHeader                fec.BurstHeader
+	maryFECDecoder               *fec.ViterbiDecoder
+	maryFECSoft                  []float32
+	maryFECBlocksDone            int64
+	maryFECBitsDone              int64
+	maryFECDecodedBits           int64
+	maryFECDecodedBytes          uint32
+	maryFECByte                  byte
+	maryFECByteBits              uint8
+	maryFECCRC                   uint32
+	maryFECFinished              bool
+	maryFECError                 error
+	maryPacketHeader             *fec.PacketBurstHeader
+	maryPacketSoft               []float32 // at most one interleaver block plus a possible resync header.
+	maryPacketBodyBits           int       // interleaved bits remaining in the active SDF3 group.
+	marySDF3InterleavedRemaining int
+	marySDF3CodedRemaining       int64
+	marySDF3Depuncturer          *fec.SoftDepuncturer
+	marySDF3Viterbi              *fec.ViterbiDecoder
+	marySDF3RawBits              []bool
+	marySDF3PacketsOK            uint64
+	marySDF3PacketsBad           uint64
+	marySDF3Resyncs              uint64
+	marySDF3LastError            string
+	inputSamples                 uint64
+	decodedPackets               uint64
+	lastValidPacketAt            time.Time
 
 	packetFECRecent        map[string]map[uint16][]byte
 	packetFECRecentOrder   map[string][]uint16
@@ -109,6 +114,7 @@ type DecoderDiagnostics struct {
 	MARYSNRDB           float64 `json:"marySnrDb"`
 	MARYEVMSamples      uint64  `json:"maryEvmSamples"`
 	MARYSNRValid        bool    `json:"marySnrValid"`
+	MARYSNRHoldover     bool    `json:"marySnrHoldover"`
 	FECMode             string  `json:"fecMode"`
 	FECBufferedBits     int     `json:"fecBufferedBits"`
 	FECExpectedBits     int     `json:"fecExpectedBits"`
@@ -147,6 +153,7 @@ func (d *StreamDecoder) Diagnostics() DecoderDiagnostics {
 		status.MARYSNRDB = modem.SNRDB
 		status.MARYEVMSamples = modem.SNRSamples
 		status.MARYSNRValid = modem.SNRValid
+		status.MARYSNRHoldover = modem.SNRHoldover
 	}
 	switch d.maryFECMode {
 	case -1:
@@ -389,6 +396,11 @@ func (d *StreamDecoder) resetMARYFEC() {
 	d.maryPacketHeader = nil
 	d.maryPacketSoft = nil
 	d.maryPacketBodyBits = 0
+	d.marySDF3InterleavedRemaining = 0
+	d.marySDF3CodedRemaining = 0
+	d.marySDF3Depuncturer = nil
+	d.marySDF3Viterbi = nil
+	d.marySDF3RawBits = nil
 }
 
 func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
@@ -409,8 +421,12 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 			remaining := append([]float32(nil), d.maryHeaderSoft[headerBits:]...)
 			d.maryHeaderSoft = nil
 			if parseErr == nil {
-				d.maryPacketHeader = &packetHeader
-				d.maryPacketBodyBits = int(packetHeader.InterleavedBits())
+				if startErr := d.startMARYSDF3Group(packetHeader); startErr != nil {
+					d.marySDF3PacketsBad++
+					d.marySDF3LastError = startErr.Error()
+					d.maryFECFinished = true
+					return nil
+				}
 			} else {
 				// The first SDF3 group header may itself be damaged. Enter the
 				// grouped scanner anyway; it will find the next valid group header
@@ -466,6 +482,21 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 // explicit when a malformed first SDF3 descriptor is retained for resync.
 func headerBytesToLLRs(values []float32) []float32 { return values }
 
+func (d *StreamDecoder) startMARYSDF3Group(header fec.PacketBurstHeader) error {
+	depuncturer, err := fec.NewSoftDepuncturer(header.CodeProfile)
+	if err != nil {
+		return err
+	}
+	d.maryPacketHeader = &header
+	d.maryPacketBodyBits = int(header.InterleavedBits())
+	d.marySDF3InterleavedRemaining = int(header.InterleavedBits())
+	d.marySDF3CodedRemaining = header.CodedBits()
+	d.marySDF3Depuncturer = depuncturer
+	d.marySDF3Viterbi = fec.NewViterbiDecoder()
+	d.marySDF3RawBits = make([]bool, 0, int(header.RawBytes)*8+fec.ConvMemory)
+	return nil
+}
+
 func (d *StreamDecoder) consumeMARYPacketizedSoft(llrs []float32) []ReceivedPacket {
 	if len(llrs) > 0 {
 		d.maryPacketSoft = append(d.maryPacketSoft, llrs...)
@@ -485,60 +516,146 @@ func (d *StreamDecoder) consumeMARYPacketizedSoft(llrs []float32) []ReceivedPack
 				d.marySDF3Resyncs++
 			}
 			d.maryPacketSoft = d.maryPacketSoft[offset+fec.BurstHeaderWireBits:]
-			d.maryPacketHeader = &header
-			d.maryPacketBodyBits = int(header.InterleavedBits())
+			if err := d.startMARYSDF3Group(header); err != nil {
+				d.marySDF3PacketsBad++
+				d.marySDF3LastError = err.Error()
+				d.maryPacketHeader = nil
+				continue
+			}
 		}
 
-		// A valid next SDF3 descriptor before the advertised body length means
-		// the current radio/audio chunk was truncated. Abandon only that one CCSDS
-		// unit and immediately continue at the next independently protected unit.
-		if offset, next, ok := findSDF3PacketHeader(d.maryPacketSoft); ok && offset < d.maryPacketBodyBits {
+		// If another CRC-valid SDF3 descriptor appears before the advertised
+		// body is complete, the previous group was truncated. Reacquire at the
+		// new descriptor rather than allowing the old body length to consume it.
+		if offset, next, ok := findSDF3PacketHeader(d.maryPacketSoft); ok && offset < d.marySDF3InterleavedRemaining {
 			d.marySDF3PacketsBad++
 			d.marySDF3LastError = "previous SDF3 group truncated before next header"
 			d.maryPacketSoft = d.maryPacketSoft[offset+fec.BurstHeaderWireBits:]
-			d.maryPacketHeader = &next
-			d.maryPacketBodyBits = int(next.InterleavedBits())
+			d.maryPacketHeader = nil
 			d.marySDF3Resyncs++
+			if err := d.startMARYSDF3Group(next); err != nil {
+				d.marySDF3PacketsBad++
+				d.marySDF3LastError = err.Error()
+				d.maryPacketHeader = nil
+			}
 			continue
 		}
-		if len(d.maryPacketSoft) < d.maryPacketBodyBits {
+
+		// The encoder emits complete 64-byte interleaver blocks. Decode each
+		// block immediately, preserving puncture phase and Viterbi trellis state
+		// across callbacks. This lets complete CCSDS/SSDV frames escape the FEC
+		// group as soon as the 48-bit Viterbi traceback delay has been satisfied.
+		if d.marySDF3InterleavedRemaining <= 0 {
 			return packets
 		}
+		if len(d.maryPacketSoft) < fec.InterleaveBlockBits {
+			return packets
+		}
+		block := d.maryPacketSoft[:fec.InterleaveBlockBits]
+		d.maryPacketSoft = d.maryPacketSoft[fec.InterleaveBlockBits:]
+		d.marySDF3InterleavedRemaining -= fec.InterleaveBlockBits
+		d.maryPacketBodyBits = d.marySDF3InterleavedRemaining
 
+		deinterleaved, err := fec.DeinterleaveSoftBlock(block)
+		if err != nil {
+			d.failMARYSDF3Group(err)
+			return packets
+		}
+		use := int64(len(deinterleaved))
+		if use > d.marySDF3CodedRemaining {
+			use = d.marySDF3CodedRemaining
+		}
+		if use < 0 {
+			d.failMARYSDF3Group(errors.New("SDF3 coded-bit counter underflow"))
+			return packets
+		}
+		if use > 0 {
+			mother, depunctureErr := d.marySDF3Depuncturer.Feed(deinterleaved[:int(use)])
+			if depunctureErr != nil {
+				d.failMARYSDF3Group(depunctureErr)
+				return packets
+			}
+			decoded, decodeErr := d.marySDF3Viterbi.Feed(mother)
+			if decodeErr != nil {
+				d.failMARYSDF3Group(decodeErr)
+				return packets
+			}
+			if len(decoded) > 0 {
+				d.marySDF3RawBits = append(d.marySDF3RawBits, decoded...)
+				packets = append(packets, d.consumeCCSDSBits(decoded)...)
+			}
+			d.marySDF3CodedRemaining -= use
+		}
+		if d.marySDF3InterleavedRemaining > 0 {
+			continue
+		}
+
+		// Finish the convolutional trellis only at the advertised group end.
+		// Frames already accepted by their own CCSDS and SSDV integrity checks
+		// remain usable even if the enclosing group CRC later detects a fade.
+		if d.marySDF3CodedRemaining != 0 {
+			d.failMARYSDF3Group(fmt.Errorf("SDF3 group is missing %d coded bits", d.marySDF3CodedRemaining))
+			return packets
+		}
+		if err := d.marySDF3Depuncturer.Finish(); err != nil {
+			d.failMARYSDF3Group(err)
+			return packets
+		}
+		tail, flushErr := d.marySDF3Viterbi.Flush()
+		if flushErr != nil {
+			d.failMARYSDF3Group(flushErr)
+			return packets
+		}
+		if len(tail) > 0 {
+			d.marySDF3RawBits = append(d.marySDF3RawBits, tail...)
+			packets = append(packets, d.consumeCCSDSBits(tail)...)
+		}
 		header := *d.maryPacketHeader
-		body := d.maryPacketSoft[:d.maryPacketBodyBits]
-		d.maryPacketSoft = d.maryPacketSoft[d.maryPacketBodyBits:]
+		expectedBits := int(header.RawBytes) * 8
+		wantTrellisBits := expectedBits + fec.ConvMemory
+		if len(d.marySDF3RawBits) != wantTrellisBits {
+			d.failMARYSDF3Group(fmt.Errorf("SDF3 Viterbi produced %d bits, expected %d", len(d.marySDF3RawBits), wantTrellisBits))
+			return packets
+		}
+		raw := softBitsToBytes(d.marySDF3RawBits[:expectedBits])
+		gotCRC := crc32.ChecksumIEEE(raw)
+		d.maryFECFinished = true
 		d.maryPacketHeader = nil
 		d.maryPacketBodyBits = 0
-		raw, err := decodeSDF3PacketBody(header, body)
-		if err != nil {
+		d.marySDF3InterleavedRemaining = 0
+		d.marySDF3CodedRemaining = 0
+		d.marySDF3Depuncturer = nil
+		d.marySDF3Viterbi = nil
+		d.marySDF3RawBits = nil
+		d.maryPacketSoft = nil
+		if gotCRC != header.CRC32 {
 			d.marySDF3PacketsBad++
-			d.marySDF3LastError = err.Error()
-			// A group CRC failure does not mean every CCSDS frame in the group
-			// is bad. Keep scanning the decoded bytes: the CCSDS ASM, image packet
-			// CRC and SSDV RS8 checks validate each physical frame independently.
-			// This salvages unaffected frames after a short fade or burst error.
-			if errors.Is(err, errSDF3GroupCRC) && len(raw) > 0 {
-				packets = append(packets, d.consumeCCSDSBits(softBytesToBits(raw))...)
-			}
+			d.marySDF3LastError = fmt.Sprintf("%v: got %08x want %08x", errSDF3GroupCRC, gotCRC, header.CRC32)
 		} else {
 			d.marySDF3PacketsOK++
 			d.marySDF3LastError = ""
-			packets = append(packets, d.consumeCCSDSBits(softBytesToBits(raw))...)
 		}
-
-		// SDF3 advertises the exact end of each independently protected group.
-		// Do not depend on an audio-level silence threshold to release the old
-		// carrier lock: a real receiver has continuous RF noise during the guard,
-		// and at low channel SNR that noise may be comparable to the old threshold.
-		// If this callback already contains a complete next group header, keep
-		// scanning it; otherwise force a clean symbol/carrier re-acquisition now.
-		if _, _, nextReady := findSDF3PacketHeader(d.maryPacketSoft); !nextReady {
-			d.maryPacketSoft = nil
-			d.mary.Rearm()
-			return packets
-		}
+		return packets
 	}
+}
+
+func (d *StreamDecoder) failMARYSDF3Group(err error) {
+	if d == nil {
+		return
+	}
+	d.marySDF3PacketsBad++
+	if err != nil {
+		d.marySDF3LastError = err.Error()
+	}
+	d.maryPacketHeader = nil
+	d.maryPacketBodyBits = 0
+	d.marySDF3InterleavedRemaining = 0
+	d.marySDF3CodedRemaining = 0
+	d.marySDF3Depuncturer = nil
+	d.marySDF3Viterbi = nil
+	d.marySDF3RawBits = nil
+	d.maryPacketSoft = nil
+	d.maryFECFinished = true
 }
 
 func findSDF3PacketHeader(llrs []float32) (int, fec.PacketBurstHeader, bool) {

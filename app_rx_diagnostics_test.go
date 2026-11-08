@@ -76,11 +76,15 @@ func TestRXDecoderMARYSNRRequiresLiveSynchronizedEstimate(t *testing.T) {
 }
 
 func TestRXDecoderMARYSNRReadsAutoCandidates(t *testing.T) {
-	auto := transport.AutoDecoderDiagnostics{MARYCandidates: []transport.DecoderDiagnostics{
-		{Profile: "ssdv-qpsk-1600", MARYLocked: false, MARYSNRValid: true, MARYSNRDB: 99},
-		{Profile: "ssdv-8psk-1600", MARYLocked: true, MARYSNRValid: true, MARYSNRDB: 14.5},
+	auto := transport.AutoDecoderDiagnostics{LockedProfile: "ssdv-8psk-1600", MARYCandidates: []transport.DecoderDiagnostics{
+		{Profile: "ssdv-qpsk-1600", MARYLocked: true, MARYSNRValid: true, MARYSNRDB: 99},
+		{Profile: "ssdv-8psk-1600", MARYLocked: false, MARYSNRHoldover: true, MARYSNRValid: true, MARYSNRDB: 14.5},
 	}}
 	if got, ok := rxDecoderMARYSNR(fixedAutoMARYSNRDiagnostics{diagnostics: auto}); !ok || got != 14.5 {
-		t.Fatalf("Auto RX did not forward a live M-ary estimate: got %.2f valid=%v", got, ok)
+		t.Fatalf("Auto RX did not forward the validated profile's live M-ary estimate: got %.2f valid=%v", got, ok)
+	}
+	auto.LockedProfile = ""
+	if got, ok := rxDecoderMARYSNR(fixedAutoMARYSNRDiagnostics{diagnostics: auto}); ok || got != 0 {
+		t.Fatalf("Auto RX exposed an unvalidated parallel candidate SNR: got %.2f valid=%v", got, ok)
 	}
 }
