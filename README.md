@@ -73,7 +73,7 @@ The Qt build is separately validated through CMake on Qt-enabled CI runners. The
 
 ## Notes on compatibility and limitations
 
-- The dedicated `modem-characterization` CI job sweeps AWGN SNR and constant audio-IF frequency offset for all eight transport profiles, then publishes a Markdown report artifact. These are synthetic audio-baseband results, not calibrated RF sensitivity or Eb/N0 values. The RX workbench SNR indicator is also an audio-band estimate.
+- The dedicated `modem-characterization` CI job sweeps AWGN SNR and constant audio-IF frequency offset for all eight transport profiles, then publishes a Markdown report artifact. These are synthetic audio-baseband results, not calibrated RF sensitivity or Eb/N0 values. The RX workbench SNR indicator uses a learned per-bin idle-noise profile in the selected modem audio channel. It displays `--` while learning or when a modem-like signal is not confidently distinguished from noise; it is not calibrated RF SNR or Eb/N0. See [RX SNR estimation](docs/RX_SNR_ESTIMATION.md) for calibration results and limitations.
 
 - Existing SSDV, PCSI-MMT, AX.25 and CCSDS packet/modulation paths remain independent of the experimental BCSI codec.
 - QPSK/8PSK/16QAM 1600 are project-specific and require the matching decoder. Their on-air performance still needs validation against recorded sound-card/electrical loopback and real RF captures.

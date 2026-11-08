@@ -28,7 +28,7 @@ multipath, time-varying multipath or hardware AGC/compression. Validate with
 recorded receiver WAV/IQ captures and actual satellite passes before publishing
 operational sensitivity or Doppler limits.
 
-The live RX SNR value is an audio-band estimate, not an RF-calibrated metric.
+The live RX SNR value uses a temporal in-channel idle-noise profile and is not RF-calibrated. See [RX SNR estimation](RX_SNR_ESTIMATION.md) for the calculation, display gates, calibration tests and limitations.
 
 Manual run from the repository root (PowerShell):
 

@@ -77,6 +77,10 @@ type App struct {
 	rxPreviewGIF       []byte
 	rxSpectrumWindow   []float32
 	rxSpectrumLastEmit time.Time
+	rxSNRMu            sync.Mutex
+	rxSNRTracker       dsp.BandSNRTracker
+	rxSNRProfile       string
+	rxSNRSampleRate    int
 	txSpectrumMu       sync.Mutex
 	txSpectrumLastEmit time.Time
 	txProgressMu       sync.Mutex
@@ -412,6 +416,7 @@ func (a *App) GetAudioDevices() (AudioDeviceLists, error) {
 }
 
 func (a *App) StartRX() error {
+	a.resetRXAudioSNRTracker()
 	a.mu.Lock()
 	d, ctx := a.audioDuplex, a.ctx
 	profileID, rate := a.settings.RXProfile, a.settings.AudioSampleRate
@@ -432,6 +437,7 @@ func (a *App) StartRX() error {
 	return nil
 }
 func (a *App) StopRX() error {
+	a.resetRXAudioSNRTracker()
 	a.mu.Lock()
 	d := a.audioDuplex
 	a.mu.Unlock()
@@ -1078,15 +1084,15 @@ func buildTXMetrics(startedAt, now time.Time, estimated time.Duration, totalFram
 }
 
 func emptyTXMetrics() map[string]any {
-    return map[string]any{
-        "estimatedSeconds": 0, "elapsedSeconds": 0, "remainingSeconds": 0,
-        "totalDataFrames": 0, "sentDataFrames": 0, "progress": 0.0,
-    }
+	return map[string]any{
+		"estimatedSeconds": 0, "elapsedSeconds": 0, "remainingSeconds": 0,
+		"totalDataFrames": 0, "sentDataFrames": 0, "progress": 0.0,
+	}
 }
 
 func (a *App) emitTXResetTelemetry() {
-    a.emit("tx:progress", 0.0)
-    a.emit("tx:metrics", emptyTXMetrics())
+	a.emit("tx:progress", 0.0)
+	a.emit("tx:metrics", emptyTXMetrics())
 }
 
 func (a *App) emitTXMetrics(startedAt time.Time, estimated time.Duration, totalFrames int, progress float64) {
@@ -1227,25 +1233,111 @@ func (a *App) TransmitPCM(samples []float32, waveformSampleRate int) error {
 }
 
 func estimateRXAudioSNR(bins []dsp.SpectrumBin, profileID string, sampleRate int) dsp.BandSNR {
-    nyquist := float64(sampleRate) / 2
-    signalLow, signalHigh, noiseLow := 650.0, 3100.0, 4000.0
-    switch {
-    case profileID == domain.AutoReceiveProfile:
-        signalLow, signalHigh, noiseLow = 350, 3800, 4400
-    case strings.Contains(profileID, "1600"):
-        signalLow, signalHigh, noiseLow = 150, 3800, 4500
-    case strings.Contains(profileID, "2400"):
-        signalLow, signalHigh, noiseLow = 650, 3600, 4300
-    }
-    noiseHigh := math.Min(9000, nyquist-50)
-    signalHigh = math.Min(signalHigh, noiseLow-100)
-    return dsp.EstimateBandSNR(bins, signalLow, signalHigh, noiseLow, noiseHigh)
+	if sampleRate <= 0 {
+		return dsp.BandSNR{}
+	}
+	nyquist := float64(sampleRate) / 2
+	// Keep the occupied modem band tight and estimate the local noise spectrum
+	// from guard bands on both sides. A single distant 4.5..9 kHz reference is
+	// not representative of the noise level around a 1.2/1.6/2.4 kHz modem
+	// signal after receiver and sound-card filtering.
+	signalLow, signalHigh := 650.0, 3100.0
+	guards := []dsp.FrequencyBand{{LowHz: 300, HighHz: 550}, {LowHz: 3300, HighHz: 4300}}
+	switch {
+	case profileID == domain.AutoReceiveProfile:
+		signalLow, signalHigh = 500, 3800
+		guards = []dsp.FrequencyBand{{LowHz: 200, HighHz: 400}, {LowHz: 4000, HighHz: 5200}}
+	case strings.Contains(profileID, "1600"):
+		// QPSK/8PSK/16QAM use a 1.6 kHz real audio carrier. Exclude the
+		// low-frequency rumble and upper audio noise outside the useful sidebands.
+		signalLow, signalHigh = 450, 3000
+		guards = []dsp.FrequencyBand{{LowHz: 250, HighHz: 400}, {LowHz: 3150, HighHz: 4400}}
+	case strings.Contains(profileID, "2400"):
+		// CCSDS 2400 GMSK is centred near 1.8 kHz and occupies a wider band.
+		signalLow, signalHigh = 450, 3900
+		guards = []dsp.FrequencyBand{{LowHz: 200, HighHz: 350}, {LowHz: 4100, HighHz: 5600}}
+	}
+	// Clamp each interval to Nyquist while preserving a usable guard width.
+	clamped := make([]dsp.FrequencyBand, 0, len(guards))
+	for _, band := range guards {
+		band.HighHz = math.Min(band.HighHz, nyquist-50)
+		if band.HighHz-band.LowHz >= 100 {
+			clamped = append(clamped, band)
+		}
+	}
+	signalHigh = math.Min(signalHigh, nyquist-100)
+
+	// AFSK 1200 must show both separated mark/space tone groups. M-ary and
+	// GMSK instead need a wider occupied cluster; one narrow whistle is not a
+	// valid modem signal. Auto mode accepts either recognized spectral shape.
+	isAFSK1200 := profileID == string(domain.SSDVAX25) ||
+		profileID == string(domain.SSDVCCSDS1200) || profileID == string(domain.PCSICCSDS1200)
+	if isAFSK1200 {
+		return dsp.EstimateBandSNRWithTonePairEvidence(bins, signalLow, signalHigh, clamped, 300)
+	}
+	wideband := dsp.EstimateBandSNRWithGuards(bins, signalLow, signalHigh, clamped)
+	if wideband.Valid || profileID != domain.AutoReceiveProfile {
+		return wideband
+	}
+	return dsp.EstimateBandSNRWithTonePairEvidence(bins, signalLow, signalHigh, clamped, 300)
+}
+
+func rxAudioSNRPassband(profileID string, sampleRate int) (float64, float64) {
+	if sampleRate <= 0 {
+		return 0, 0
+	}
+	nyquist := float64(sampleRate) / 2
+	low, high := 650.0, 3100.0
+	switch {
+	case profileID == domain.AutoReceiveProfile:
+		low, high = 500, 3800
+	case strings.Contains(profileID, "1600"):
+		low, high = 450, 3000
+	case strings.Contains(profileID, "2400"):
+		low, high = 450, 3900
+	}
+	high = math.Min(high, nyquist-100)
+	if high <= low {
+		return 0, 0
+	}
+	return low, high
+}
+
+func (a *App) estimateTrackedRXAudioSNR(bins []dsp.SpectrumBin, profileID string, sampleRate int) dsp.BandSNR {
+	low, high := rxAudioSNRPassband(profileID, sampleRate)
+	if high <= low {
+		return dsp.BandSNR{}
+	}
+	// The stateless sideband estimator is used only as a warm-up signal hint.
+	// The displayed SNR itself comes from the per-bin idle-noise profile learnt
+	// in the same modem passband over preceding noise-only windows.
+	signalHint := estimateRXAudioSNR(bins, profileID, sampleRate).Valid
+	a.rxSNRMu.Lock()
+	defer a.rxSNRMu.Unlock()
+	if a.rxSNRProfile != profileID || a.rxSNRSampleRate != sampleRate {
+		a.rxSNRTracker.Reset()
+		a.rxSNRProfile = profileID
+		a.rxSNRSampleRate = sampleRate
+	}
+	return a.rxSNRTracker.Estimate(bins, low, high, signalHint)
+}
+
+func (a *App) resetRXAudioSNRTracker() {
+	if a == nil {
+		return
+	}
+	a.rxSNRMu.Lock()
+	a.rxSNRTracker.Reset()
+	a.rxSNRProfile = ""
+	a.rxSNRSampleRate = 0
+	a.rxSNRMu.Unlock()
 }
 
 func (a *App) handleRXAudio(samples []float32) {
 	a.rxStats.audioBlocks.Add(1)
 	if samples == nil {
 		a.rxStats.inputDiscontinuities.Add(1)
+		a.resetRXAudioSNRTracker()
 		a.rxSpectrumMu.Lock()
 		a.rxSpectrumWindow = nil
 		a.rxSpectrumLastEmit = time.Time{}
@@ -1280,7 +1372,7 @@ func (a *App) handleRXAudio(samples []float32) {
 		bins, err := dsp.Spectrum(window, rate)
 		if err == nil {
 			a.emit("rx:spectrum", bins)
-			snr = estimateRXAudioSNR(bins, profileID, rate)
+			snr = a.estimateTrackedRXAudioSNR(bins, profileID, rate)
 		}
 		var sum float64
 		peak := float32(0)
@@ -1297,6 +1389,7 @@ func (a *App) handleRXAudio(samples []float32) {
 			"rmsDbfs": db, "peak": float64(peak),
 			"snrDb": snr.SNRDB, "snrValid": snr.Valid,
 			"noiseFloorDbfs": snr.NoiseFloorDBFS, "signalBandDbfs": snr.SignalBandDBFS,
+			"snrEvidenceBins": snr.EvidenceBins,
 		})
 	}
 	// Always forward every capture block to the ordered decoder queue. Only

@@ -2224,10 +2224,10 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         if (m_rxSnrLabel) {
             if (p.value(QStringLiteral("snrValid")).toBool()) {
                 m_rxSnrLabel->setText(uiText(QStringLiteral("SNR %1 dB")).arg(p.value(QStringLiteral("snrDb")).toDouble(), 0, 'f', 1));
-                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Audio-band estimate · noise floor %1 dBFS")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("In-channel audio SNR · idle noise profile · not RF-calibrated · noise %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
             } else {
                 m_rxSnrLabel->setText(uiText(QStringLiteral("SNR -- dB")));
-                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Waiting for a measurable signal")));
+                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Learning the in-channel idle noise floor or waiting for a recognizable modem signal")));
             }
         }
     } else if(name==QStringLiteral("rx:spectrum")||name==QStringLiteral("tx:spectrum")){
