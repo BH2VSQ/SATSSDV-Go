@@ -162,9 +162,25 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 		// the modem locked across the next training word.
 		silenceRatio = 0.20
 	}
-	silenceThreshold := math.Max(0.002, d.signalRMS*silenceRatio)
+	silenceThreshold := math.Max(1e-5, d.signalRMS*silenceRatio)
 	if d.signalRMS > 0 && blockRMS < silenceThreshold {
-		d.silenceSamples += len(samples)
+		// Audio callbacks can straddle the final symbol and the receiver's
+		// trailing noise/silence. Do not discard the complete callback just
+		// because its *average* RMS is low: retain every sample up to the last
+		// active sample, then count only the quiet suffix as an inter-burst gap.
+		sampleThreshold := silenceThreshold
+		activeSamples := trailingActivePrefix(samples, sampleThreshold, 5*d.sps)
+		if activeSamples > 0 {
+			d.appendAudioSamples(samples[:activeSamples])
+			if !d.locked {
+				d.tryAcquire()
+			}
+			if activeRMS := audioBlockRMS(samples[:activeSamples]); activeRMS > d.signalRMS {
+				d.signalRMS = activeRMS
+			}
+		}
+		quietSamples := len(samples) - activeSamples
+		d.silenceSamples += quietSamples
 		var ready []float32
 		if d.locked {
 			ready = d.decodeAvailableSoft()
@@ -178,12 +194,7 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 	if blockRMS > d.signalRMS {
 		d.signalRMS = blockRMS
 	}
-	for _, sample := range samples {
-		lutIndex := int(d.sampleCount % int64(len(d.cosLUT)))
-		v := complex(2*float64(sample)*d.cosLUT[lutIndex], -2*float64(sample)*d.sinLUT[lutIndex])
-		d.baseband = append(d.baseband, complex64(v))
-		d.sampleCount++
-	}
+	d.appendAudioSamples(samples)
 	if !d.locked {
 		d.tryAcquire()
 		if !d.locked {
@@ -203,6 +214,42 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 	// Keep the generic symbol slicer on its legacy path here; the guard releases
 	// acquisition and the following 96-symbol word performs a clean re-lock.
 	return d.decodeAvailableSoft()
+}
+
+// appendAudioSamples performs quadrature downconversion while preserving the
+// absolute audio sample index across arbitrary Feed boundaries.
+func (d *StreamDemodulator) appendAudioSamples(samples []float32) {
+	for _, sample := range samples {
+		lutIndex := int(d.sampleCount % int64(len(d.cosLUT)))
+		v := complex(2*float64(sample)*d.cosLUT[lutIndex], -2*float64(sample)*d.sinLUT[lutIndex])
+		d.baseband = append(d.baseband, complex64(v))
+		d.sampleCount++
+	}
+}
+
+// trailingActivePrefix returns the number of leading samples before the final
+// contiguous low-amplitude suffix. The suffix is treated as receiver gap/noise;
+// the prefix is retained even when the whole callback RMS falls below the gap
+// threshold.
+func trailingActivePrefix(samples []float32, threshold float64, windowSize int) int {
+	if windowSize < 1 {
+		windowSize = 1
+	}
+	end := len(samples)
+	for end > 0 {
+		start := end - windowSize
+		if start < 0 {
+			start = 0
+		}
+		// An RMS decision over one symbol-sized window rejects isolated noise
+		// peaks that would otherwise make a per-sample silence detector think
+		// the 200 ms SDF3 guard is still active RF.
+		if audioBlockRMS(samples[start:end]) >= threshold {
+			break
+		}
+		end = start
+	}
+	return end
 }
 
 // SetPacketizedMode raises the low-energy guard threshold for SDF3 packetized
@@ -259,6 +306,10 @@ func (d *StreamDemodulator) releaseAcquisition() {
 	d.amplitudeScale = 1
 	d.sampleCount = 0
 	d.silenceSamples = 0
+	// A released burst no longer defines the receive level. Clearing the
+	// envelope lets the next SDF3 unit reacquire even when its downlink level
+	// is much lower than the preceding unit.
+	d.signalRMS = 0
 	d.burstGeneration++
 }
 
@@ -284,19 +335,25 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 	}
 	var means [trainingSymbols]complex128
 	energy := 0.0
-	activeSymbols := 0
+	levels := [trainingSymbols]float64{}
 	for k := 0; k < trainingSymbols; k++ {
 		means[k] = symbolMean(d.baseband, start+k*d.sps, d.sps)
-		level := cmplx.Abs(means[k])
-		energy += level
-		if level > 0.01 {
+		levels[k] = cmplx.Abs(means[k])
+		energy += levels[k]
+	}
+	meanLevel := energy / trainingSymbols
+	// Do not impose an absolute PCM amplitude floor: satellite downlink audio
+	// levels vary substantially with receiver gain and squelch/AGC settings.
+	// Instead, require energy above the numerical floor and check the training
+	// word's normalized correlation below. The per-symbol activity test is
+	// relative to the measured preamble level so low-gain bursts remain usable.
+	activeSymbols := 0
+	for _, level := range levels {
+		if level > math.Max(1e-5, meanLevel*0.12) {
 			activeSymbols++
 		}
 	}
-	// A complete, energized training word is required. This rejects a
-	// preamble fragment at a callback boundary and prevents acquisition on
-	// idle receiver noise before a real burst arrives.
-	if energy/trainingSymbols < 0.008 || activeSymbols < trainingSymbols*9/10 {
+	if meanLevel < 1e-4 || activeSymbols < trainingSymbols*9/10 {
 		return trainingCandidate{}, false
 	}
 	var differential complex128
@@ -306,7 +363,10 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 	}
 	stepPhase := cmplx.Phase(differential)
 	frequencyOffset := stepPhase * float64(d.cfg.SymbolRate) / (2 * math.Pi)
-	if math.Abs(frequencyOffset) > float64(d.cfg.SymbolRate)*0.35 {
+	// The adjacent-symbol phase difference is unambiguous over +/-0.5 baud.
+	// Leave a small guard at the Nyquist boundary where estimator noise and
+	// symbol-clock error can make the sign ambiguous.
+	if math.Abs(frequencyOffset) > float64(d.cfg.SymbolRate)*0.48 {
 		return trainingCandidate{}, false
 	}
 
@@ -324,10 +384,13 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 			rotation *= stepRotation
 		}
 	} else {
-		// Correlate every sample in the known training word, not only the
-		// central half-symbol aperture. A center-only metric has a broad flat
-		// maximum for rectangular symbols and can lock several samples away
-		// from the true symbol edge after an arbitrary idle pre-roll.
+		// Refine the coarse symbol-to-symbol CFO estimate directly against all
+		// known training samples. The real-audio quadrature mixer leaves a
+		// conjugate image; symbol-mean differential estimation is slightly biased
+		// by that image, particularly for negative offsets. A narrow maximum-
+		// likelihood search over the known BPSK word removes the bias before the
+		// receiver starts slicing 8PSK/16QAM payload symbols.
+		stepPhase = d.refineTrainingStep(start, stepPhase)
 		rotation := complex(1.0, 0.0)
 		sampleRotation := cmplx.Rect(1, -stepPhase/float64(d.sps))
 		for k := 0; k < trainingSymbols; k++ {
@@ -342,6 +405,51 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 	}
 	score := cmplx.Abs(correlation) / (magnitude + 1e-15)
 	return trainingCandidate{phase: cmplx.Phase(correlation), phaseStep: stepPhase, amplitude: energy / trainingSymbols, score: score}, true
+}
+
+// refineTrainingStep performs a fine frequency search around the CFO estimate
+// obtained from adjacent training-symbol means. It maximizes the coherent
+// correlation of the entire known 96-symbol training word after de-rotation.
+// Searching a +/-12 Hz neighborhood at 1 Hz resolution keeps acquisition
+// bounded while correcting the several-hertz bias from mixer-image leakage.
+func (d *StreamDemodulator) refineTrainingStep(start int, coarseStep float64) float64 {
+	coarseHz := coarseStep * float64(d.cfg.SymbolRate) / (2 * math.Pi)
+	const searchSpanHz = 12.0
+	const searchStepHz = 1.0
+	minimumHz := math.Max(-float64(d.cfg.SymbolRate)*0.49, coarseHz-searchSpanHz)
+	maximumHz := math.Min(float64(d.cfg.SymbolRate)*0.49, coarseHz+searchSpanHz)
+	window := trainingSymbols * d.sps
+	if start < 0 || start+window > len(d.baseband) {
+		return coarseStep
+	}
+	magnitude := 0.0
+	for i := 0; i < window; i++ {
+		magnitude += cmplx.Abs(complex128(d.baseband[start+i]))
+	}
+	if magnitude <= 1e-15 {
+		return coarseStep
+	}
+	bestHz := coarseHz
+	bestCorrelation := -1.0
+	for frequencyHz := minimumHz; frequencyHz <= maximumHz+searchStepHz*0.25; frequencyHz += searchStepHz {
+		rotation := complex(1.0, 0.0)
+		sampleRotation := cmplx.Rect(1, -2*math.Pi*frequencyHz/float64(d.cfg.SampleRate))
+		var correlation complex128
+		for symbol := 0; symbol < trainingSymbols; symbol++ {
+			sign := complex(float64(trainingSequence[symbol]), 0)
+			base := start + symbol*d.sps
+			for sampleIndex := 0; sampleIndex < d.sps; sampleIndex++ {
+				correlation += complex128(d.baseband[base+sampleIndex]) * sign * rotation
+				rotation *= sampleRotation
+			}
+		}
+		score := cmplx.Abs(correlation) / magnitude
+		if score > bestCorrelation {
+			bestCorrelation = score
+			bestHz = frequencyHz
+		}
+	}
+	return 2 * math.Pi * bestHz / float64(d.cfg.SymbolRate)
 }
 
 func (d *StreamDemodulator) tryAcquire() {
@@ -380,7 +488,7 @@ func (d *StreamDemodulator) tryAcquire() {
 		}
 		// A high-confidence match is required before locking. The sample-level
 		// metric rejects the broad off-boundary plateau of the coarse score.
-		if bestStart < 0 || best.score < 0.76 {
+		if bestStart < 0 || best.score < 0.70 {
 			continue
 		}
 		d.applyTrainingLock(bestStart, best)
@@ -419,8 +527,19 @@ func (d *StreamDemodulator) decodeSymbolCount(count int) []float32 {
 	out := make([]float32, 0, count*d.cfg.BitsPerSymbol)
 	for n := 0; n < count; n++ {
 		base := d.cursor + n*d.sps
-		z := symbolMean(d.baseband, base, d.sps)
-		z *= d.phaseRotation
+		// Correct residual carrier rotation at sample rate before integrating
+		// the symbol. Rotating only the completed symbol mean leaves a residual
+		// phase ramp inside each symbol; with audio-IF Doppler that ramp also
+		// prevents the real-mixer image from cancelling over the symbol window.
+		stepPhase := cmplx.Phase(d.stepRotation) // negative estimated CFO, rad/symbol
+		center := float64(d.sps-1) * 0.5
+		var corrected complex128
+		for sampleIndex := 0; sampleIndex < d.sps; sampleIndex++ {
+			relative := (float64(sampleIndex) - center) / float64(d.sps)
+			localRotation := cmplx.Rect(1, stepPhase*relative)
+			corrected += complex128(d.baseband[base+sampleIndex]) * d.phaseRotation * localRotation
+		}
+		z := corrected / complex(float64(d.sps), 0)
 		z *= complex(d.amplitudeScale, 0)
 		decision := nearestConstellationPoint(z, d.cfg.BitsPerSymbol)
 		phaseError := cmplx.Phase(z * cmplx.Conj(decision))
@@ -479,8 +598,13 @@ func mapLabel(label, bitsPerSymbol int) complex64 {
 }
 
 func symbolMean(samples []complex64, base, sps int) complex128 {
-	start := base + sps/4
-	count := sps / 2
+	// The unfiltered quadrature mixer contains an image at approximately
+	// 2*CarrierHz. Averaging the complete symbol interval is intentional: at
+	// the supported 48 kHz / 1600 baud profile the 3200 Hz image completes
+	// exactly two cycles per symbol and largely cancels, while the desired
+	// symbol component remains coherent.
+	start := base
+	count := sps
 	var sum complex128
 	for i := 0; i < count; i++ {
 		sum += complex128(samples[start+i])

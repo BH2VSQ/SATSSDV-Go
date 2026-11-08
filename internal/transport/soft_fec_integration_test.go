@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/BH2VSQ/SATSSDV-Go/internal/domain"
+	"github.com/BH2VSQ/SATSSDV-Go/internal/dsp"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/fec"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ccsds"
@@ -168,6 +169,264 @@ func TestSoftFECMARYStreamRoundTripWithAWGN(t *testing.T) {
 			}
 			if len(got) != len(packets) {
 				t.Fatalf("at %.1f dB SNR decoded %d/%d packets: diag=%+v", snrDB, len(got), len(packets), dec.Diagnostics())
+			}
+		})
+	}
+}
+
+// TestSoftFECMARYWithAudioCFOAndAWGN exercises the current SDF3 production
+// transmitter and streaming receiver together. This deliberately does not use
+// EncodePackets, which is retained for legacy-format compatibility testing.
+func TestSoftFECMARYWithAudioCFOAndAWGN(t *testing.T) {
+	packets := makeSoftFECTestPackets(t, 8)
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var waveform []float32
+			_, err = encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+				waveform = append(waveform, block...)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var power float64
+			for _, sample := range waveform {
+				power += float64(sample * sample)
+			}
+			waveRMS := math.Sqrt(power / float64(len(waveform)))
+			const snrDB = 18.0
+			noiseRMS := waveRMS / math.Pow(10, snrDB/20)
+
+			for _, offsetHz := range []float64{-200, 0, 200} {
+				t.Run(fmt.Sprintf("snr-%.0fdB-cfo-%+0.fHz", snrDB, offsetHz), func(t *testing.T) {
+					shifted, shiftErr := dsp.ShiftFrequency(waveform, 48000, offsetHz)
+					if shiftErr != nil {
+						t.Fatal(shiftErr)
+					}
+					rng := rand.New(rand.NewSource(0x5eed + int64(len(profile))))
+					input := make([]float32, 2048, 2048+len(shifted)+4800)
+					for _, sample := range shifted {
+						input = append(input, sample+float32(rng.NormFloat64()*noiseRMS))
+					}
+					// Keep the receiver running after PTT drops so the resampler and
+					// symbol pipeline can drain the last complete SDF3 unit.
+					input = append(input, make([]float32, 4800)...)
+					decoder, decodeErr := NewStreamDecoder(profile, 48000)
+					if decodeErr != nil {
+						t.Fatal(decodeErr)
+					}
+					var received []ReceivedPacket
+					for offset := 0; offset < len(input); offset += 1920 {
+						end := min(len(input), offset+1920)
+						batch, feedErr := decoder.Feed(input[offset:end])
+						if feedErr != nil {
+							t.Fatalf("RX feed: %v", feedErr)
+						}
+						received = append(received, batch...)
+					}
+					if len(received) != len(packets) {
+						t.Fatalf("18 dB SNR / %+0.f Hz CFO decoded %d/%d packets: diag=%+v", offsetHz, len(received), len(packets), decoder.Diagnostics())
+					}
+					if decoder.marySDF3PacketsBad != 0 || decoder.marySDF3LastError != "" {
+						t.Fatalf("SDF3 physical-unit errors: bad=%d last=%q", decoder.marySDF3PacketsBad, decoder.marySDF3LastError)
+					}
+				})
+			}
+
+			// A changing residual offset models the sign-changing portion of a
+			// satellite Doppler curve rather than only a fixed tuning error.
+			for _, ramp := range [][2]float64{{-150, 150}, {150, -150}} {
+				t.Run(fmt.Sprintf("cfo-ramp-%+.0f-to-%+.0fHz", ramp[0], ramp[1]), func(t *testing.T) {
+					ramped, rampErr := dsp.ShiftFrequencyRamp(waveform, 48000, ramp[0], ramp[1])
+					if rampErr != nil {
+						t.Fatal(rampErr)
+					}
+					input := append(make([]float32, 2048), ramped...)
+					input = append(input, make([]float32, 4800)...)
+					decoder, decodeErr := NewStreamDecoder(profile, 48000)
+					if decodeErr != nil {
+						t.Fatal(decodeErr)
+					}
+					var received []ReceivedPacket
+					for offset := 0; offset < len(input); offset += 1920 {
+						batch, feedErr := decoder.Feed(input[offset:min(len(input), offset+1920)])
+						if feedErr != nil {
+							t.Fatalf("RX feed: %v", feedErr)
+						}
+						received = append(received, batch...)
+					}
+					if len(received) != len(packets) {
+						t.Fatalf("linear CFO drift %+0.f to %+0.f Hz decoded %d/%d packets: diag=%+v", ramp[0], ramp[1], len(received), len(packets), decoder.Diagnostics())
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestSoftFECMARYAcquiresAtLowPCMLevels ensures the preamble detector and
+// packetized-burst guard do not impose an absolute audio RMS floor that makes
+// low-gain satellite recordings impossible to acquire.
+func TestSoftFECMARYAcquiresAtLowPCMLevels(t *testing.T) {
+	packets := makeSoftFECTestPackets(t, 8)
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var waveform []float32
+			_, err = encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+				waveform = append(waveform, block...)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, gain := range []float32{0.01, 0.003, 0.001} {
+				t.Run(fmt.Sprintf("gain-%.3f", gain), func(t *testing.T) {
+					input := make([]float32, 2048, 2048+len(waveform)+4800)
+					for _, sample := range waveform {
+						input = append(input, sample*gain)
+					}
+					input = append(input, make([]float32, 4800)...)
+					decoder, decodeErr := NewStreamDecoder(profile, 48000)
+					if decodeErr != nil {
+						t.Fatal(decodeErr)
+					}
+					var received []ReceivedPacket
+					for offset := 0; offset < len(input); offset += 1920 {
+						batch, feedErr := decoder.Feed(input[offset:min(len(input), offset+1920)])
+						if feedErr != nil {
+							t.Fatalf("RX feed: %v", feedErr)
+						}
+						received = append(received, batch...)
+					}
+					if len(received) != len(packets) {
+						t.Fatalf("gain %.3f decoded %d/%d packets: diag=%+v", gain, len(received), len(packets), decoder.Diagnostics())
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestGMSKAFCWaitsForCoherentSignal verifies that idle audio noise cannot
+// permanently seed the CCSDS 2400-baud AFC. After 500 ms of noise the AFC must
+// remain unlocked, then acquire a shifted GMSK burst and decode its packet.
+func TestGMSKAFCWaitsForCoherentSignal(t *testing.T) {
+	packet := makeTestSSDVPacket(t)
+	for _, offsetHz := range []float64{-300, 300} {
+		t.Run(fmt.Sprintf("cfo-%+.0fHz", offsetHz), func(t *testing.T) {
+			encoder, err := NewEncoder(Config{Profile: domain.SSDVCCSDS2400, AudioSampleRate: 19200})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waveform, err := encoder.EncodePacket(packet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			shifted, err := dsp.ShiftFrequency(waveform, 19200, offsetHz)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rng := rand.New(rand.NewSource(int64(20261108 + int(offsetHz))))
+			input := make([]float32, 19200/2, 19200/2+len(shifted)+19200/10)
+			for i := range input {
+				input[i] = float32(rng.NormFloat64() * 0.01)
+			}
+			decoder, err := NewStreamDecoder(domain.SSDVCCSDS2400, 19200)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for offset := 0; offset < len(input); offset += 960 {
+				if _, err := decoder.Feed(input[offset:min(len(input), offset+960)]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := decoder.gmsk2400.CarrierOffsetHz(); got != 0 {
+				t.Fatalf("AFC locked to idle noise at %.1f Hz before a signal arrived", got)
+			}
+			input = append(input[:0], shifted...)
+			input = append(input, make([]float32, 19200/10)...)
+			var received []ReceivedPacket
+			for offset := 0; offset < len(input); offset += 960 {
+				batch, feedErr := decoder.Feed(input[offset:min(len(input), offset+960)])
+				if feedErr != nil {
+					t.Fatal(feedErr)
+				}
+				received = append(received, batch...)
+			}
+			if len(received) != 1 || received[0].PacketID != 12 {
+				t.Fatalf("GMSK failed after idle noise at %+g Hz: packets=%d AFC=%.1f diagnostics=%+v", offsetHz, len(received), decoder.gmsk2400.CarrierOffsetHz(), decoder.Diagnostics())
+			}
+			if got := decoder.gmsk2400.CarrierOffsetHz(); math.Abs(got-offsetHz) > 80 {
+				t.Fatalf("GMSK AFC estimate %.1f Hz, want %+g Hz ±80 Hz", got, offsetHz)
+			}
+		})
+	}
+}
+
+// TestSDF3MARYRecoversWeakPacketAfterStrongPacket exercises a live RX stream
+// whose signal level drops sharply between two independently trained SDF3
+// bursts. The gap also ends with a callback that contains both signal and
+// silence, which must not discard the final symbol(s) of the first burst.
+func TestSDF3MARYRecoversWeakPacketAfterStrongPacket(t *testing.T) {
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	packets := makeSoftFECTestPackets(t, 2)
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			encodeOne := func(packet []byte) []float32 {
+				t.Helper()
+				encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var waveform []float32
+				if _, err := encoder.StreamPackets(context.Background(), [][]byte{packet}, func(block []float32) error {
+					waveform = append(waveform, block...)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return waveform
+			}
+			strong := encodeOne(packets[0])
+			weak := encodeOne(packets[1])
+			input := make([]float32, 2413, 2413+len(strong)+9600+len(weak)+4800)
+			input = append(input, strong...)
+			input = append(input, make([]float32, 9600)...) // 200 ms inter-burst gap.
+			for _, sample := range weak {
+				input = append(input, sample*0.003)
+			}
+			input = append(input, make([]float32, 4800)...)
+
+			decoder, err := NewStreamDecoder(profile, 48000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var received []ReceivedPacket
+			for offset := 0; offset < len(input); offset += 960 {
+				batch, feedErr := decoder.Feed(input[offset:min(len(input), offset+960)])
+				if feedErr != nil {
+					t.Fatal(feedErr)
+				}
+				received = append(received, batch...)
+			}
+			if len(received) != 2 {
+				t.Fatalf("strong-to-weak stream decoded %d/2 packets: diagnostics=%+v SDF3=%d/%d last=%q", len(received), decoder.Diagnostics(), decoder.marySDF3PacketsOK, decoder.marySDF3PacketsBad, decoder.marySDF3LastError)
+			}
+			if received[0].PacketID != 100 || received[1].PacketID != 101 {
+				t.Fatalf("strong-to-weak packet IDs out of order: %d, %d", received[0].PacketID, received[1].PacketID)
 			}
 		})
 	}

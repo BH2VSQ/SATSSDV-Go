@@ -25,7 +25,9 @@ type ARCSSD2400Demodulator struct {
 	delayI      [8]float64
 	delayQ      [8]float64
 	sampleCount int
-	cfoSum      float64
+	cfoSum      float64 // retained for compatibility with zero-value layout/debugging
+	cfoSinSum   float64
+	cfoCosSum   float64
 	cfoCount    int
 	cfoPhase    float64
 	cfoLocked   bool
@@ -103,12 +105,28 @@ func (d *ARCSSD2400Demodulator) Feed(samples []float32, sampleRate int) ([]bool,
 		phaseDiff := math.Atan2(demod, dot)
 		if !d.cfoLocked {
 			if d.sampleCount > 128 {
-				d.cfoSum += phaseDiff
+				// Use circular statistics instead of averaging discriminator phase
+				// directly. Receiver noise produces an incoherent phase cloud, while
+				// a valid GMSK carrier/preamble retains a stable circular mean. This
+				// prevents the AFC from locking to the first 312 ms of idle noise
+				// before a satellite transmission begins.
+				d.cfoSinSum += math.Sin(phaseDiff)
+				d.cfoCosSum += math.Cos(phaseDiff)
 				d.cfoCount++
 			}
 			if d.cfoCount >= 6000 {
-				d.cfoPhase = d.cfoSum / float64(d.cfoCount)
-				d.cfoLocked = true
+				coherence := math.Hypot(d.cfoSinSum, d.cfoCosSum) / float64(d.cfoCount)
+				if coherence >= 0.35 {
+					d.cfoPhase = math.Atan2(d.cfoSinSum, d.cfoCosSum)
+					d.cfoLocked = true
+				}
+				// Failed windows are discarded, then the detector continues
+				// searching. A later signal can therefore acquire without restarting
+				// the audio stream or resetting the framing parser.
+				d.cfoSinSum = 0
+				d.cfoCosSum = 0
+				d.cfoSum = 0
+				d.cfoCount = 0
 			}
 		} else {
 			// Very slow tracking follows Doppler drift over long satellite

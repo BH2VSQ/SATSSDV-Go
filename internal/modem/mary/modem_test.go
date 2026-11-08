@@ -53,7 +53,7 @@ func TestMAModulationRoundTripAllConstellations(t *testing.T) {
 
 func TestMAModulationFrequencyOffsetAcquisition(t *testing.T) {
 	payload := []byte("SATSSDV-QPSK-8PSK-16QAM-frequency-offset-regression")
-	for _, offset := range []int{80, -80} {
+	for _, offset := range []int{-300, -200, -100, 100, 200, 300} {
 		for _, bps := range []int{2, 3, 4} {
 			t.Run(fmt.Sprintf("1600baud_bps%d_offset%+d", bps, offset), func(t *testing.T) {
 				txCfg := Config{SampleRate: 48000, SymbolRate: 1600, BitsPerSymbol: bps, CarrierHz: 1600 + offset}
