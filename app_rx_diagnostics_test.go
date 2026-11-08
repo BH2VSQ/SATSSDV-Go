@@ -47,3 +47,40 @@ func TestSafeFeedRXDecoderPreservesPacketsAlongsideFeedError(t *testing.T) {
 		t.Fatalf("valid packets were discarded with a feed warning: %+v", packets)
 	}
 }
+
+type fixedMARYSNRDiagnostics struct{ diagnostics transport.DecoderDiagnostics }
+
+func (d fixedMARYSNRDiagnostics) Diagnostics() transport.DecoderDiagnostics { return d.diagnostics }
+
+type fixedAutoMARYSNRDiagnostics struct {
+	diagnostics transport.AutoDecoderDiagnostics
+}
+
+func (d fixedAutoMARYSNRDiagnostics) Diagnostics() transport.AutoDecoderDiagnostics {
+	return d.diagnostics
+}
+
+func TestRXDecoderMARYSNRRequiresLiveSynchronizedEstimate(t *testing.T) {
+	valid := transport.DecoderDiagnostics{MARYLocked: true, MARYSNRValid: true, MARYSNRDB: 17.25}
+	if got, ok := rxDecoderMARYSNR(fixedMARYSNRDiagnostics{diagnostics: valid}); !ok || got != 17.25 {
+		t.Fatalf("valid synchronized M-ary SNR was not forwarded: got %.2f valid=%v", got, ok)
+	}
+	for _, invalid := range []transport.DecoderDiagnostics{
+		{MARYLocked: false, MARYSNRValid: true, MARYSNRDB: 17.25},
+		{MARYLocked: true, MARYSNRValid: false, MARYSNRDB: 17.25},
+	} {
+		if got, ok := rxDecoderMARYSNR(fixedMARYSNRDiagnostics{diagnostics: invalid}); ok || got != 0 {
+			t.Fatalf("invalid/unsynchronized M-ary estimate leaked to UI: got %.2f valid=%v", got, ok)
+		}
+	}
+}
+
+func TestRXDecoderMARYSNRReadsAutoCandidates(t *testing.T) {
+	auto := transport.AutoDecoderDiagnostics{MARYCandidates: []transport.DecoderDiagnostics{
+		{Profile: "ssdv-qpsk-1600", MARYLocked: false, MARYSNRValid: true, MARYSNRDB: 99},
+		{Profile: "ssdv-8psk-1600", MARYLocked: true, MARYSNRValid: true, MARYSNRDB: 14.5},
+	}}
+	if got, ok := rxDecoderMARYSNR(fixedAutoMARYSNRDiagnostics{diagnostics: auto}); !ok || got != 14.5 {
+		t.Fatalf("Auto RX did not forward a live M-ary estimate: got %.2f valid=%v", got, ok)
+	}
+}

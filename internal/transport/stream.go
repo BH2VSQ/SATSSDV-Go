@@ -105,6 +105,10 @@ type DecoderDiagnostics struct {
 	MARYSilenceSamples  int     `json:"marySilenceSamples"`
 	MARYPacketizedMode  bool    `json:"maryPacketizedMode"`
 	MARYReacquireCount  uint64  `json:"maryReacquireCount"`
+	MARYEVMRMS          float64 `json:"maryEvmRms"`
+	MARYSNRDB           float64 `json:"marySnrDb"`
+	MARYEVMSamples      uint64  `json:"maryEvmSamples"`
+	MARYSNRValid        bool    `json:"marySnrValid"`
 	FECMode             string  `json:"fecMode"`
 	FECBufferedBits     int     `json:"fecBufferedBits"`
 	FECExpectedBits     int     `json:"fecExpectedBits"`
@@ -139,6 +143,10 @@ func (d *StreamDecoder) Diagnostics() DecoderDiagnostics {
 		status.MARYSilenceSamples = modem.SilenceSamples
 		status.MARYPacketizedMode = modem.PacketizedMode
 		status.MARYReacquireCount = modem.ReacquireCount
+		status.MARYEVMRMS = modem.EVMRMS
+		status.MARYSNRDB = modem.SNRDB
+		status.MARYEVMSamples = modem.SNRSamples
+		status.MARYSNRValid = modem.SNRValid
 	}
 	switch d.maryFECMode {
 	case -1:
@@ -513,11 +521,23 @@ func (d *StreamDecoder) consumeMARYPacketizedSoft(llrs []float32) []ReceivedPack
 			if errors.Is(err, errSDF3GroupCRC) && len(raw) > 0 {
 				packets = append(packets, d.consumeCCSDSBits(softBytesToBits(raw))...)
 			}
-			continue
+		} else {
+			d.marySDF3PacketsOK++
+			d.marySDF3LastError = ""
+			packets = append(packets, d.consumeCCSDSBits(softBytesToBits(raw))...)
 		}
-		d.marySDF3PacketsOK++
-		d.marySDF3LastError = ""
-		packets = append(packets, d.consumeCCSDSBits(softBytesToBits(raw))...)
+
+		// SDF3 advertises the exact end of each independently protected group.
+		// Do not depend on an audio-level silence threshold to release the old
+		// carrier lock: a real receiver has continuous RF noise during the guard,
+		// and at low channel SNR that noise may be comparable to the old threshold.
+		// If this callback already contains a complete next group header, keep
+		// scanning it; otherwise force a clean symbol/carrier re-acquisition now.
+		if _, _, nextReady := findSDF3PacketHeader(d.maryPacketSoft); !nextReady {
+			d.maryPacketSoft = nil
+			d.mary.Rearm()
+			return packets
+		}
 	}
 }
 
@@ -588,6 +608,8 @@ func decodeSDF3PacketBody(header fec.PacketBurstHeader, body []float32) ([]byte,
 		codedSoft, err = fec.UnpunctureConvRate3of4Soft(codedSoft, inputBits)
 	case fec.PacketFECProfileRate23:
 		codedSoft, err = fec.UnpunctureConvRate2of3Soft(codedSoft, inputBits)
+	case fec.PacketFECProfileRate56:
+		codedSoft, err = fec.UnpunctureConvRate5of6Soft(codedSoft, inputBits)
 	}
 	if err != nil {
 		return nil, err

@@ -83,6 +83,8 @@ type App struct {
 	rxSNRSampleRate    int
 	rxModemLocked      atomic.Bool
 	rxPacketValidated  atomic.Bool
+	rxMarySNRDB        atomic.Uint64 // float64 bits from the synchronized M-ary EVM estimator.
+	rxMarySNRValid     atomic.Bool
 	txSpectrumMu       sync.Mutex
 	txSpectrumLastEmit time.Time
 	txProgressMu       sync.Mutex
@@ -596,6 +598,9 @@ func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSecond
 // GIF transport through the existing radio/audio path. It is intentionally
 // limited to SSDV profiles; PCSI has a different packet format.
 func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, profileID, quality, callsign string, ax25SSID, audioRate int, ax25To string, repeat bool, intervalSeconds int) error {
+	a.mu.Lock()
+	maryFECProfile := a.settings.MARYFECProfile
+	a.mu.Unlock()
 	gifData, err := base64.StdEncoding.DecodeString(rendered.GIFBase64)
 	if err != nil || len(gifData) == 0 || len(gifData) > 8*1024*1024 {
 		return errors.New("template GIF must be valid and no larger than 8 MiB")
@@ -714,7 +719,7 @@ func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, pro
 			// GIF/template layers for the duration of a potentially long TX burst.
 			frames = nil
 			gifData, base, overlay = nil, nil, nil
-			transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: audioRate}
+			transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: audioRate, MARYFECProfile: maryFECProfileValue(maryFECProfile)}
 			if parsedProfile.LinkLayer == "AX.25 UI / HDLC" {
 				transportConfig.Source = ax25.Address{Callsign: currentCallsign, SSID: uint8(ax25SSID)}
 				transportConfig.Destination = ax25.Address{Callsign: ax25To}
@@ -860,6 +865,13 @@ func (a *App) getContext() context.Context {
 	return a.ctx
 }
 
+func maryFECProfileValue(value string) int {
+	if strings.EqualFold(strings.TrimSpace(value), "robust") {
+		return transport.MARYFECRobust
+	}
+	return transport.MARYFECBalanced
+}
+
 func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 	if _, err := domain.ParseProfile(job.Profile); err != nil {
 		return err
@@ -892,13 +904,14 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 	}
 	a.mu.Lock()
 	callsign, rate, duplex := a.settings.Callsign, a.settings.AudioSampleRate, a.audioDuplex
+	maryFECProfile := a.settings.MARYFECProfile
 	a.txImageID++
 	imageID := a.txImageID
 	a.mu.Unlock()
 	if duplex == nil {
 		return audio.ErrRuntimeUnavailable
 	}
-	prepared, err := tximage.PrepareImagePacketsWithAX25(source, job.Profile, job.Quality, callsign, imageID, rate, uint8(job.AX25SSID), job.AX25To)
+	prepared, err := tximage.PrepareImagePacketsWithAX25FEC(source, job.Profile, job.Quality, callsign, imageID, rate, uint8(job.AX25SSID), job.AX25To, maryFECProfileValue(maryFECProfile))
 	if err != nil {
 		return err
 	}
@@ -1342,6 +1355,8 @@ func (a *App) resetRXAudioSNRTracker() {
 	a.rxSNRTracker.Reset()
 	a.rxModemLocked.Store(false)
 	a.rxPacketValidated.Store(false)
+	a.rxMarySNRDB.Store(0)
+	a.rxMarySNRValid.Store(false)
 	a.rxSNRProfile = ""
 	a.rxSNRSampleRate = 0
 	a.rxSNRMu.Unlock()
@@ -1383,10 +1398,31 @@ func (a *App) handleRXAudio(samples []float32) {
 	a.rxSpectrumMu.Unlock()
 	if shouldEmit {
 		var snr dsp.BandSNR
+		snrReason := ""
 		bins, err := dsp.Spectrum(window, rate)
 		if err == nil {
 			a.emit("rx:spectrum", bins)
-			snr = a.estimateTrackedRXAudioSNR(bins, profileID, rate)
+			if strings.Contains(profileID, "1600") || profileID == domain.AutoReceiveProfile {
+				// M-ary occupies nearly the complete useful audio channel, so a
+				// spectrum-only noise reference is not independent. Use EVM from
+				// the live synchronized symbol decisions instead, including Auto RX.
+				if a.rxMarySNRValid.Load() {
+					snr = dsp.BandSNR{SNRDB: math.Float64frombits(a.rxMarySNRDB.Load()), Valid: true}
+					snrReason = "mary-evm"
+				} else if profileID == domain.AutoReceiveProfile {
+					// Auto RX may be testing several unrelated demodulators in parallel.
+					// Do not publish a generic spectrum-only number before a candidate has
+					// synchronized: it is not comparable across AFSK, GMSK and M-ary.
+					snrReason = "auto-awaiting-sync"
+				} else {
+					snrReason = "mary-awaiting-sync"
+				}
+			} else {
+				snr = a.estimateTrackedRXAudioSNR(bins, profileID, rate)
+				if strings.Contains(profileID, "2400") {
+					snrReason = "wideband-estimator-unavailable"
+				}
+			}
 		}
 		var sum float64
 		peak := float32(0)
@@ -1399,10 +1435,6 @@ func (a *App) handleRXAudio(samples []float32) {
 		}
 		rms := math.Sqrt(sum / float64(len(window)))
 		db := 20 * math.Log10(math.Max(rms, 1e-12))
-		snrReason := ""
-		if profileID == domain.AutoReceiveProfile || strings.Contains(profileID, "1600") || strings.Contains(profileID, "2400") {
-			snrReason = "wideband-noise-reference-unavailable"
-		}
 		a.emit("rx:level", map[string]interface{}{
 			"rmsDbfs": db, "peak": float64(peak),
 			"snrDb": snr.SNRDB, "snrValid": snr.Valid, "snrReason": snrReason,
@@ -1590,6 +1622,29 @@ func (a *App) emitRXDiagnostics(decoder interface{}, profile string, rate int, q
 	a.emit("rx:diagnostics", payload)
 }
 
+func rxDecoderMARYSNR(decoder interface{}) (float64, bool) {
+	switch value := decoder.(type) {
+	case interface {
+		Diagnostics() transport.DecoderDiagnostics
+	}:
+		d := value.Diagnostics()
+		if !d.MARYLocked || !d.MARYSNRValid {
+			return 0, false
+		}
+		return d.MARYSNRDB, true
+	case interface {
+		Diagnostics() transport.AutoDecoderDiagnostics
+	}:
+		d := value.Diagnostics()
+		for _, candidate := range d.MARYCandidates {
+			if candidate.MARYLocked && candidate.MARYSNRValid {
+				return candidate.MARYSNRDB, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 	var decoder interface {
 		Feed([]float32) ([]transport.ReceivedPacket, error)
@@ -1614,6 +1669,7 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 				a.rxStats.decoderResets.Add(1)
 				a.rxModemLocked.Store(false)
 				a.rxPacketValidated.Store(false)
+				a.rxMarySNRValid.Store(false)
 			}
 			a.mu.Lock()
 			profileID, rate := a.settings.RXProfile, a.settings.AudioSampleRate
@@ -1621,6 +1677,7 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 			if profileID != activeProfile || rate != activeRate {
 				a.rxModemLocked.Store(false)
 				a.rxPacketValidated.Store(false)
+				a.rxMarySNRValid.Store(false)
 				activeProfile, activeRate = profileID, rate
 				var err error
 				if profileID == domain.AutoReceiveProfile {
@@ -1644,9 +1701,13 @@ func (a *App) runRXDecodeWorker(ctx context.Context, queue <-chan []float32) {
 			if err == nil {
 				a.rxModemLocked.Store(rxDecoderHasModemLock(decoder))
 				a.rxPacketValidated.Store(rxDecoderHasFreshValidPacket(decoder))
+				snrDB, snrValid := rxDecoderMARYSNR(decoder)
+				a.rxMarySNRDB.Store(math.Float64bits(snrDB))
+				a.rxMarySNRValid.Store(snrValid)
 			} else {
 				a.rxModemLocked.Store(false)
 				a.rxPacketValidated.Store(false)
+				a.rxMarySNRValid.Store(false)
 			}
 			if err != nil {
 				a.rxStats.decoderErrors.Add(1)

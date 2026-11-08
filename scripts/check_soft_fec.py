@@ -26,7 +26,7 @@ checks = {
     "recovered packets are marked": "packet.FECRecovered = true" in FILES["rx"],
     "tests cover all constellations and both audio rates": "SSDVQPSK1600" in FILES["tests"] and "SSDV8PSK1600" in FILES["tests"] and "SSDV16QAM1600" in FILES["tests"] and "44100, 48000" in FILES["tests"],
     "tests cover AWGN and packet erasures": "RoundTripWithAWGN" in FILES["tests"] and "PacketErasureRecoveryThroughCCSDSFrameParser" in FILES["tests"],
-    "docs state old receiver compatibility limit": "An older receiver does not understand the SDF2 envelope" in FILES["docs"],
+    "docs state punctured SDF3 backward-compatibility limit": "predating the punctured SDF3 profiles" in FILES["docs"] and "balanced on-air coding profiles" in FILES["docs"],
     "docs avoid claiming simulated SNR is a real RF threshold": "do not define real-radio SNR thresholds" in FILES["docs"],
 }
 failed = [name for name, ok in checks.items() if not ok]

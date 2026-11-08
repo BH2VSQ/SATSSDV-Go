@@ -2223,15 +2223,25 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         const auto p=payloadValue.toObject();m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
         if (m_rxSnrLabel) {
             if (p.value(QStringLiteral("snrValid")).toBool()) {
-                m_rxSnrLabel->setText(uiText(QStringLiteral("SNR %1 dB")).arg(p.value(QStringLiteral("snrDb")).toDouble(), 0, 'f', 1));
-                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 audio SNR estimate · two separated tone groups + decoder sync + CRC-valid packet in last 1.2 s · wideband M-ary/GMSK and Auto intentionally show -- because this audio spectrum has no independent noise-only reference · not RF-calibrated · noise %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+                const QString method = p.value(QStringLiteral("snrReason")).toString();
+                if (method == QStringLiteral("mary-evm")) {
+                    m_rxSnrLabel->setText(QStringLiteral("EVM-SNR %1 dB").arg(p.value(QStringLiteral("snrDb")).toDouble(), 0, 'f', 1));
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("M-ary 后解调 EVM-SNR 估算值 · 从已同步星座符号测量 · 参考带宽为符号判决孔径，不可直接与全带宽 PCM SNR、RF SNR 或 Eb/N0 比较")));
+                } else {
+                    m_rxSnrLabel->setText(uiText(QStringLiteral("SNR %1 dB")).arg(p.value(QStringLiteral("snrDb")).toDouble(), 0, 'f', 1));
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 音频 SNR 估算 · 双音频谱特征 + 解调同步 + 最近 1.2 秒内 CRC 校验通过的数据包 · 未经射频校准 · 噪声底 %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+                }
             } else {
                 m_rxSnrLabel->setText(uiText(QStringLiteral("SNR -- dB")));
                 const QString reason = p.value(QStringLiteral("snrReason")).toString();
-                if (reason == QStringLiteral("wideband-noise-reference-unavailable")) {
-                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("SNR unavailable: this wideband modem occupies the audio analysis band, so the audio spectrum has no independent noise-only reference. A numeric value would be misleading. This is not RF SNR or Eb/N0.")));
+                if (reason == QStringLiteral("mary-awaiting-sync")) {
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("M-ary EVM-SNR 等待载波/定时同步及至少 48 个有效符号")));
+                } else if (reason == QStringLiteral("auto-awaiting-sync")) {
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Auto RX 正在等待已同步的解调候选；M-ary 候选锁定后会显示后解调 EVM-SNR")));
+                } else if (reason == QStringLiteral("wideband-estimator-unavailable")) {
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("当前模式暂不提供可靠的解调域 SNR 估算，因此不显示频谱推算值。")));
                 } else {
-                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 audio SNR is waiting for an idle-noise baseline, two-tone spectrum evidence, modem synchronization and a fresh CRC-valid packet")));
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 音频 SNR 正在等待空闲噪声基线、双音频谱特征、解调同步和有效 CRC 数据包")));
                 }
             }
         }
@@ -2665,6 +2675,9 @@ void MainWindow::openSettings() {
     auto *sample = makeCombo(&dialog, {QStringLiteral("19200"), QStringLiteral("44100"), QStringLiteral("48000"), QStringLiteral("96000")});
     const int rateIndex = sample->findText(QString::number(settings.value(QStringLiteral("audioSampleRate")).toInt(48000)));
     if (rateIndex >= 0) sample->setCurrentIndex(rateIndex);
+    auto *maryFEC = makeCombo(&dialog, {uiText(QStringLiteral("速度优先（均衡 FEC）")), uiText(QStringLiteral("弱信号（高冗余 FEC）"))});
+    maryFEC->setCurrentIndex(settings.value(QStringLiteral("maryFecProfile")).toString() == QStringLiteral("robust") ? 1 : 0);
+    maryFEC->setToolTip(uiText(QStringLiteral("均衡：QPSK 5/6、8PSK 3/4、16QAM 2/3，并按调制方式添加包级纠删冗余；高冗余：全部采用 1/2 卷积码和 8+2 包级恢复。高冗余会增加发射时间。")));
 
     auto *rxDevice = new QComboBox(&dialog);
     auto *txDevice = new QComboBox(&dialog);
@@ -2728,6 +2741,7 @@ void MainWindow::openSettings() {
     form->addRow(uiText(QStringLiteral("本站网格")), locator);
     form->addRow(uiText(QStringLiteral("界面语言")), language);
     form->addRow(uiText(QStringLiteral("音频采样率")), sample);
+    form->addRow(uiText(QStringLiteral("M-ary FEC 策略")), maryFEC);
     form->addRow(uiText(QStringLiteral("RX 音频输入")), rxDevice);
     form->addRow(uiText(QStringLiteral("TX 音频输出")), txDevice);
     form->addRow(uiText(QStringLiteral("PTT 控制方式")), pttMode);
@@ -2854,6 +2868,7 @@ void MainWindow::openSettings() {
         updated.insert(QStringLiteral("locator"), locator->text().trimmed());
         updated.insert(QStringLiteral("language"), language->currentIndex() == 1 ? QStringLiteral("en") : language->currentIndex() == 2 ? QStringLiteral("ja-JP") : QStringLiteral("zh-CN"));
         updated.insert(QStringLiteral("audioSampleRate"), sample->currentText().toInt());
+        updated.insert(QStringLiteral("maryFecProfile"), maryFEC->currentIndex() == 1 ? QStringLiteral("robust") : QStringLiteral("balanced"));
         updated.insert(QStringLiteral("rxInputDevice"), rxDevice->currentData().toString());
         updated.insert(QStringLiteral("txOutputDevice"), txDevice->currentData().toString());
         QJsonObject updatedPTT = updated.value(QStringLiteral("ptt")).toObject();

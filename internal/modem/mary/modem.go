@@ -39,6 +39,9 @@ type StreamDemodulator struct {
 	burstGeneration uint64
 	reacquireCount  uint64
 	packetizedMode  bool
+	evmSignalPower  float64
+	evmErrorPower   float64
+	evmSymbols      uint64
 	cosLUT          []float64
 	sinLUT          []float64
 }
@@ -81,6 +84,9 @@ func (d *StreamDemodulator) Reset() {
 	d.amplitudeScale = 1
 	d.silenceSamples = 0
 	d.signalRMS = 0
+	d.evmSignalPower = 0
+	d.evmErrorPower = 0
+	d.evmSymbols = 0
 	d.burstGeneration++
 }
 
@@ -157,10 +163,12 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 	blockRMS := audioBlockRMS(samples)
 	silenceRatio := 0.10
 	if d.packetizedMode {
-		// SDF3 group boundaries contain a deliberate quiet guard. Use a wider
-		// threshold so ordinary RF/audio noise does not hide the guard and keep
-		// the modem locked across the next training word.
-		silenceRatio = 0.20
+		// SDF3 group boundaries contain a deliberate quiet guard. Captured audio
+		// still contains receiver noise; at 10-12 dB SNR it can be 0.25-0.32 of
+		// the active signal RMS. A 0.20 threshold therefore never releases lock
+		// at the next group preamble. Use a threshold above expected channel noise
+		// but below the active M-ary waveform's block RMS.
+		silenceRatio = 0.36
 	}
 	silenceThreshold := math.Max(1e-5, d.signalRMS*silenceRatio)
 	if d.signalRMS > 0 && blockRMS < silenceThreshold {
@@ -306,6 +314,9 @@ func (d *StreamDemodulator) releaseAcquisition() {
 	d.amplitudeScale = 1
 	d.sampleCount = 0
 	d.silenceSamples = 0
+	d.evmSignalPower = 0
+	d.evmErrorPower = 0
+	d.evmSymbols = 0
 	// A released burst no longer defines the receive level. Clearing the
 	// envelope lets the next SDF3 unit reacquire even when its downlink level
 	// is much lower than the preceding unit.
@@ -384,13 +395,11 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 			rotation *= stepRotation
 		}
 	} else {
-		// Refine the coarse symbol-to-symbol CFO estimate directly against all
-		// known training samples. The real-audio quadrature mixer leaves a
-		// conjugate image; symbol-mean differential estimation is slightly biased
-		// by that image, particularly for negative offsets. A narrow maximum-
-		// likelihood search over the known BPSK word removes the bias before the
-		// receiver starts slicing 8PSK/16QAM payload symbols.
-		stepPhase = d.refineTrainingStep(start, stepPhase)
+		// Use the coarse differential estimate while comparing candidate symbol
+		// boundaries. The maximum-likelihood CFO refinement is performed only
+		// once, after the best boundary has been selected; doing the 25-point
+		// frequency search for every sample candidate multiplied acquisition CPU
+		// cost and could cause the live audio queue to fall behind.
 		rotation := complex(1.0, 0.0)
 		sampleRotation := cmplx.Rect(1, -stepPhase/float64(d.sps))
 		for k := 0; k < trainingSymbols; k++ {
@@ -405,6 +414,30 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 	}
 	score := cmplx.Abs(correlation) / (magnitude + 1e-15)
 	return trainingCandidate{phase: cmplx.Phase(correlation), phaseStep: stepPhase, amplitude: energy / trainingSymbols, score: score}, true
+}
+
+// refineTrainingCandidate performs the expensive carrier refinement once at
+// the selected symbol boundary and recomputes the coherent phase estimate.
+func (d *StreamDemodulator) refineTrainingCandidate(start int, candidate trainingCandidate) trainingCandidate {
+	stepPhase := d.refineTrainingStep(start, candidate.phaseStep)
+	rotation := complex(1.0, 0.0)
+	sampleRotation := cmplx.Rect(1, -stepPhase/float64(d.sps))
+	var correlation complex128
+	magnitude := 0.0
+	for symbol := 0; symbol < trainingSymbols; symbol++ {
+		sign := complex(float64(trainingSequence[symbol]), 0)
+		base := start + symbol*d.sps
+		for sampleIndex := 0; sampleIndex < d.sps; sampleIndex++ {
+			sample := complex128(d.baseband[base+sampleIndex])
+			correlation += sample * sign * rotation
+			magnitude += cmplx.Abs(sample)
+			rotation *= sampleRotation
+		}
+	}
+	candidate.phase = cmplx.Phase(correlation)
+	candidate.phaseStep = stepPhase
+	candidate.score = cmplx.Abs(correlation) / (magnitude + 1e-15)
+	return candidate
 }
 
 // refineTrainingStep performs a fine frequency search around the CFO estimate
@@ -491,6 +524,13 @@ func (d *StreamDemodulator) tryAcquire() {
 		if bestStart < 0 || best.score < 0.70 {
 			continue
 		}
+		// Refine carrier offset once per actual acquisition, not once per timing
+		// candidate. This retains the fine CFO accuracy without an O(samples ×
+		// frequency-search) burst of CPU work in the real-time decoder.
+		best = d.refineTrainingCandidate(bestStart, best)
+		if best.score < 0.70 {
+			continue
+		}
 		d.applyTrainingLock(bestStart, best)
 		d.locked = true
 		return
@@ -510,6 +550,9 @@ func (d *StreamDemodulator) applyTrainingLock(start int, candidate trainingCandi
 	d.stepRotation = cmplx.Rect(1, -d.phaseStep)
 	d.cursor = start + trainingSymbols*d.sps
 	d.symbolIndex = 0
+	d.evmSignalPower = 0
+	d.evmErrorPower = 0
+	d.evmSymbols = 0
 	d.reacquireCount++
 }
 
@@ -527,21 +570,39 @@ func (d *StreamDemodulator) decodeSymbolCount(count int) []float32 {
 	out := make([]float32, 0, count*d.cfg.BitsPerSymbol)
 	for n := 0; n < count; n++ {
 		base := d.cursor + n*d.sps
-		// Correct residual carrier rotation at sample rate before integrating
-		// the symbol. Rotating only the completed symbol mean leaves a residual
-		// phase ramp inside each symbol; with audio-IF Doppler that ramp also
-		// prevents the real-mixer image from cancelling over the symbol window.
+		// Apply the residual carrier correction per sample, then integrate the
+		// central half-symbol aperture. Avoiding symbol transitions reduces ISI
+		// and makes both soft decisions and EVM/SNR less sensitive to fades.
 		stepPhase := cmplx.Phase(d.stepRotation) // negative estimated CFO, rad/symbol
 		center := float64(d.sps-1) * 0.5
+		first := d.sps / 4
+		last := d.sps - d.sps/4
 		var corrected complex128
-		for sampleIndex := 0; sampleIndex < d.sps; sampleIndex++ {
+		for sampleIndex := first; sampleIndex < last; sampleIndex++ {
 			relative := (float64(sampleIndex) - center) / float64(d.sps)
 			localRotation := cmplx.Rect(1, stepPhase*relative)
 			corrected += complex128(d.baseband[base+sampleIndex]) * d.phaseRotation * localRotation
 		}
-		z := corrected / complex(float64(d.sps), 0)
+		z := corrected / complex(float64(last-first), 0)
 		z *= complex(d.amplitudeScale, 0)
 		decision := nearestConstellationPoint(z, d.cfg.BitsPerSymbol)
+		// Measure the post-synchronization error vector against the nearest ideal
+		// constellation point. Unlike an audio-spectrum noise-floor guess, this
+		// estimate is made inside the actual receive matched aperture and tracks
+		// residual noise, phase error and amplitude distortion. It is an EVM-based
+		// audio SNR estimate, not RF-calibrated SNR or Eb/N0.
+		errorVector := z - decision
+		errorPower := real(errorVector)*real(errorVector) + imag(errorVector)*imag(errorVector)
+		referencePower := real(decision)*real(decision) + imag(decision)*imag(decision)
+		const evmAlpha = 0.04
+		if d.evmSymbols == 0 {
+			d.evmErrorPower = errorPower
+			d.evmSignalPower = referencePower
+		} else {
+			d.evmErrorPower += evmAlpha * (errorPower - d.evmErrorPower)
+			d.evmSignalPower += evmAlpha * (referencePower - d.evmSignalPower)
+		}
+		d.evmSymbols++
 		phaseError := cmplx.Phase(z * cmplx.Conj(decision))
 		d.phaseRotation *= cmplx.Rect(1, -0.12*phaseError)
 		d.stepRotation *= cmplx.Rect(1, -0.0015*phaseError)
@@ -822,7 +883,13 @@ type StreamDiagnostics struct {
 	SignalRMS       float64
 	SilenceSamples  int
 	BurstGeneration uint64
+	EVMRMS          float64
+	SNRDB           float64
+	SNRSamples      uint64
+	SNRValid        bool
 }
+
+func finiteEVM(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
 
 func (d *StreamDemodulator) Diagnostics() StreamDiagnostics {
 	if d == nil {
@@ -830,7 +897,21 @@ func (d *StreamDemodulator) Diagnostics() StreamDiagnostics {
 	}
 	status := StreamDiagnostics{
 		ReacquireCount: d.reacquireCount, PacketizedMode: d.packetizedMode, Locked: d.locked, BufferedSamples: len(d.baseband), SignalRMS: d.signalRMS,
-		SilenceSamples: d.silenceSamples, BurstGeneration: d.burstGeneration,
+		SilenceSamples: d.silenceSamples, BurstGeneration: d.burstGeneration, SNRSamples: d.evmSymbols,
+	}
+	if d.locked && d.evmSymbols >= 48 && d.evmSignalPower > 1e-8 {
+		evm2 := d.evmErrorPower / d.evmSignalPower
+		if evm2 < 1e-6 {
+			evm2 = 1e-6 // cap display at 60 dB for the numerical noise floor.
+		}
+		if finiteEVM(evm2) && evm2 > 0 {
+			status.EVMRMS = math.Sqrt(evm2)
+			status.SNRDB = 10 * math.Log10(1/evm2)
+			if status.SNRDB > 60 {
+				status.SNRDB = 60
+			}
+			status.SNRValid = finiteEVM(status.SNRDB)
+		}
 	}
 	return status
 }

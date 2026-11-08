@@ -62,6 +62,12 @@ func PrepareImagePackets(src image.Image, profileID, quality, callsign string, i
 // transport encoder without materializing the full-duration audio waveform.
 // Call Encoder.StreamPackets to feed a bounded PCM consumer during TX.
 func PrepareImagePacketsWithAX25(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string) (Prepared, error) {
+	return PrepareImagePacketsWithAX25FEC(src, profileID, quality, callsign, imageID, outputSampleRate, sourceSSID, destination, transport.MARYFECBalanced)
+}
+
+// PrepareImagePacketsWithAX25FEC prepares a stream using an explicit M-ary
+// FEC policy. Non-M-ary profiles ignore the policy.
+func PrepareImagePacketsWithAX25FEC(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string, fecProfile int) (Prepared, error) {
 	var result Prepared
 	profile, err := domain.ParseProfile(profileID)
 	if err != nil {
@@ -102,7 +108,7 @@ func PrepareImagePacketsWithAX25(src image.Image, profileID, quality, callsign s
 	if err != nil {
 		return result, err
 	}
-	transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: outputSampleRate}
+	transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: outputSampleRate, MARYFECProfile: fecProfile}
 	if profile.LinkLayer == "AX.25 UI / HDLC" {
 		if destination == "" {
 			destination = "CQ"

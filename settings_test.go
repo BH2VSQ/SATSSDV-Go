@@ -108,3 +108,15 @@ func TestNormalizeSettingsKeepsAutoReceiveMode(t *testing.T) {
 		t.Fatalf("RX profile=%q, want auto", s.RXProfile)
 	}
 }
+
+func TestNormalizeSettingsMARYFECProfile(t *testing.T) {
+	if got := normalizeSettings(Settings{}).MARYFECProfile; got != "balanced" {
+		t.Fatalf("missing M-ary FEC setting should default to balanced, got %q", got)
+	}
+	if got := normalizeSettings(Settings{MARYFECProfile: "robust"}).MARYFECProfile; got != "robust" {
+		t.Fatalf("robust M-ary FEC policy was not retained: %q", got)
+	}
+	if got := normalizeSettings(Settings{MARYFECProfile: "unknown"}).MARYFECProfile; got != "balanced" {
+		t.Fatalf("invalid M-ary FEC policy should fall back to balanced, got %q", got)
+	}
+}

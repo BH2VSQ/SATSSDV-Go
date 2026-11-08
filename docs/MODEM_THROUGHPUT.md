@@ -7,13 +7,15 @@ settings:
 
 | Modulation | Inner FEC | Packet erasure parity |
 |---|---:|---:|
-| QPSK 1600 | K=7 rate 3/4 | 0 shards per 8 source packets |
-| 8PSK 1600 | K=7 rate 2/3 | 1 shard per 8 source packets |
-| 16QAM 1600 | K=7 rate 1/2 | 2 shards per 8 source packets |
+| QPSK 1600 | K=7 rate 5/6 | 0 shards per 8 source packets |
+| 8PSK 1600 | K=7 rate 3/4 | 1 shard per 8 source packets |
+| 16QAM 1600 | K=7 rate 2/3 | 1 shard per 8 source packets |
 
 The outer per-packet SSDV RS8 FEC remains enabled for every profile. The
 `MARYFECRobust` option uses rate 1/2 and both parity shards for all three
-modulations.
+modulations. The Qt settings dialog exposes Balanced and Robust policies; the
+Balanced policy is the default for throughput, while Robust is intended for
+weak/fading links and costs additional airtime.
 
 ## Eight-packet airtime check
 
@@ -27,9 +29,9 @@ specific parity and group timing.
 | Mode | Estimated airtime | Useful SSDV bytes/s | Relative to CCSDS 2400 |
 |---|---:|---:|---:|
 | SSDV CCSDS 2400 | 7.933 s | 258 B/s | baseline |
-| QPSK 1600 balanced | 7.235 s | 283 B/s | 8.8% faster |
-| 8PSK 1600 balanced | 6.017 s | 340 B/s | 24.2% faster |
-| 16QAM 1600 balanced | 6.688 s | 306 B/s | 15.7% faster |
+| QPSK 1600 balanced | 6.595 s | 311 B/s | 16.9% faster |
+| 8PSK 1600 balanced | 5.377 s | 381 B/s | 32.2% faster |
+| 16QAM 1600 balanced | 4.527 s | 452 B/s | 42.9% faster |
 
 These are encoded waveform airtimes derived from sample counts, not measured
 radio PTT/rig delays or image-render completion time. `TestSoftFECMARYStreamRoundTripAllConstellations`
@@ -39,9 +41,11 @@ count at both 44.1 kHz and 48 kHz output rates.
 ## Reliability validation
 
 The balanced profile is not assumed to be as robust as the rate-1/2 + 8+2
-configuration. The current regression suite verifies 18 dB AWGN and the
-following combinations for all three balanced modes: constant ±200 Hz offset,
-linear ±150 Hz offset drift, low PCM gain, and strong-to-weak packet changes.
+configuration. The current regression suite verifies 18 dB AWGN, plus a
+6 dB multi-group/noisy-guard regression for all three balanced modes with
+480/997/1920/4096-sample callbacks. The separate modem regression suite also
+covers constant ±200 Hz offset, linear ±150 Hz offset drift, low PCM gain,
+and strong-to-weak packet changes.
 Those synthetic tests do not define a guaranteed RF sensitivity or the exact
 maximum satellite Doppler that a real station can tolerate. Use
 `MARYFECRobust` when the link margin is poor and extra airtime is acceptable.

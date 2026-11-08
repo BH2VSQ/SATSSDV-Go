@@ -2,6 +2,8 @@ package mary
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -160,5 +162,77 @@ func TestStreamModulatorCanRepeatTrainingWithoutResetting(t *testing.T) {
 		if len(first) != 96*30 || len(training) < 96*30 || len(payload) == 0 || len(next) == 0 || len(tail) < 0 {
 			t.Fatalf("unexpected repeated training dimensions for %d bits/symbol: first=%d payload=%d training=%d next=%d tail=%d", bitsPerSymbol, len(first), len(payload), len(training), len(next), len(tail))
 		}
+	}
+}
+
+func TestMARYDemodulatorReportsEVMBasedSNR(t *testing.T) {
+	const sampleRate = 48000
+	const symbolRate = 1600
+	const targetAudioSNRDB = 12.0
+	for _, bitsPerSymbol := range []int{2, 3, 4} {
+		bitsPerSymbol := bitsPerSymbol
+		t.Run(fmt.Sprintf("bps-%d", bitsPerSymbol), func(t *testing.T) {
+			payload := make([]byte, 2048)
+			rng := rand.New(rand.NewSource(int64(0x534e5200 + bitsPerSymbol)))
+			for i := range payload {
+				payload[i] = byte(rng.Intn(256))
+			}
+			cfg := Config{SampleRate: sampleRate, SymbolRate: symbolRate, BitsPerSymbol: bitsPerSymbol, CarrierHz: 1600}
+			wave, err := ModulateBytes(payload, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const trainingSamples = trainingSymbols * (sampleRate / symbolRate)
+			active := wave[trainingSamples:]
+			var signalPower float64
+			for _, sample := range active {
+				signalPower += float64(sample * sample)
+			}
+			signalRMS := math.Sqrt(signalPower / float64(len(active)))
+			noiseRMS := signalRMS / math.Pow(10, targetAudioSNRDB/20)
+			input := make([]float32, 12013, 12013+len(wave))
+			for _, sample := range wave {
+				input = append(input, sample+float32(rng.NormFloat64()*noiseRMS))
+			}
+			demod, err := NewStreamDemodulator(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for offset := 0; offset < len(input); offset += 960 {
+				demod.FeedSoft(input[offset:min(len(input), offset+960)])
+			}
+			diag := demod.Diagnostics()
+			if !diag.Locked || !diag.SNRValid || diag.SNRSamples < 48 {
+				t.Fatalf("EVM SNR was not published after synchronized payload symbols: %+v", diag)
+			}
+			if math.IsNaN(diag.SNRDB) || math.IsInf(diag.SNRDB, 0) || diag.EVMRMS <= 0 {
+				t.Fatalf("invalid EVM/SNR diagnostics: %+v", diag)
+			}
+			// EVM is measured after symbol integration, so its effective noise
+			// bandwidth is narrower than the full 48 kHz PCM input. It should be
+			// higher than the injected full-band audio SNR but remain finite.
+			if diag.SNRDB < targetAudioSNRDB || diag.SNRDB > targetAudioSNRDB+25 {
+				t.Fatalf("implausible post-demod EVM SNR %.1f dB for %.1f dB injected audio SNR: %+v", diag.SNRDB, targetAudioSNRDB, diag)
+			}
+		})
+	}
+}
+
+func TestMARYDemodulatorDoesNotPublishEVMOnIdleNoise(t *testing.T) {
+	cfg := Config{SampleRate: 48000, SymbolRate: 1600, BitsPerSymbol: 2, CarrierHz: 1600}
+	demod, err := NewStreamDemodulator(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(0x49444c45))
+	noise := make([]float32, 48000)
+	for i := range noise {
+		noise[i] = float32(rng.NormFloat64() * 0.01)
+	}
+	for offset := 0; offset < len(noise); offset += 960 {
+		demod.FeedSoft(noise[offset:min(len(noise), offset+960)])
+	}
+	if diag := demod.Diagnostics(); diag.SNRValid || diag.Locked {
+		t.Fatalf("idle noise produced a modem lock or SNR: %+v", diag)
 	}
 }

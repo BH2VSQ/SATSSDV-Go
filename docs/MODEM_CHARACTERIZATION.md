@@ -4,7 +4,7 @@ The opt-in `TestModeNoiseAndOffsetCharacterization` test exercises all eight
 transport modes using `Encoder.StreamPackets()` and the production streaming
 receiver. In particular, QPSK/8PSK/16QAM are measured using the current SDF3
 grouped training and descriptor, modulation-specific K=7 FEC profile
-(rate 3/4 QPSK, rate 2/3 8PSK, rate 1/2 16QAM), interleaver and
+(rate 5/6 QPSK, rate 3/4 8PSK, rate 2/3 16QAM), interleaver and
 soft-decision Viterbi receive path. The legacy `EncodePackets()`
 M-ary waveform is not used for this report.
 
@@ -19,8 +19,13 @@ certified packet-error-rate curve. A threshold is reported only when at least
 The constant audio-IF CFO sweep uses +/-600 Hz in 100 Hz steps for FSK modes and
 +/-300 Hz in 100 Hz steps for M-ary modes. Additional production-path tests
 exercise M-ary SDF3 with 18 dB AWGN and +/-200 Hz constant CFO, +/-150 Hz linear
-CFO ramps, and PCM gain levels down to 0.001. The report is written after each
-mode completes, so partial results remain available if a long run is interrupted.
+CFO ramps, and PCM gain levels down to 0.001. A separate 6 dB regression sends
+two consecutive SDF3 groups with continuous channel noise in the 200 ms guard;
+all 16 source packets must be recovered for all three modulations at callback
+sizes 480, 997, 1920 and 4096 samples. The receiver re-arms at the exact group
+body boundary rather than requiring the RF noise floor to resemble digital
+silence. The report is written after each mode completes, so partial results
+remain available if a long run is interrupted.
 
 These are synthetic audio-baseband tests. They are not calibrated RF SNR, Eb/N0,
 receiver sensitivity or an over-the-air performance guarantee. They do not
@@ -29,7 +34,7 @@ multipath, time-varying multipath or hardware AGC/compression. Validate with
 recorded receiver WAV/IQ captures and actual satellite passes before publishing
 operational sensitivity or Doppler limits.
 
-The live audio SNR display is currently enabled only for AFSK 1200, where two separated tone groups leave a usable noise reference. QPSK/8PSK/16QAM, GMSK 2400 and Auto RX intentionally show `SNR --` until a training/pilot-based or calibrated noise estimator is implemented. See [RX SNR estimation](RX_SNR_ESTIMATION.md) for scope and limitations.
+The live RX quality display uses an in-channel audio SNR estimate for AFSK 1200 and a synchronized constellation EVM-SNR estimate for QPSK/8PSK/16QAM, including M-ary candidates under Auto RX. GMSK 2400 still shows `SNR --` until a validated demodulator-domain estimator is implemented. EVM-SNR is not calibrated RF SNR/Eb/N0 and is not directly comparable with full-band PCM SNR. See [RX SNR estimation](RX_SNR_ESTIMATION.md) for the measurement definition and limitations.
 
 Manual run from the repository root (PowerShell):
 

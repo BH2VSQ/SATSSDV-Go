@@ -494,3 +494,56 @@ func TestConvRate2of3RoundTripSoftViterbi(t *testing.T) {
 		t.Fatal("rate-2/3 soft Viterbi decode differs from source")
 	}
 }
+
+func TestConvRate5of6RoundTripSoftViterbi(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x56))
+	payload := make([]byte, 2049)
+	if _, err := rng.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	coded, err := EncodeConvRate5of6(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputBits := int64(len(payload)*8 + ConvMemory)
+	puncturedBits := ConvRate5of6CodedBitCount(inputBits)
+	if int64(len(coded))*8 != ((puncturedBits+7)/8)*8 {
+		t.Fatalf("encoded size %d bytes inconsistent with %d punctured bits", len(coded), puncturedBits)
+	}
+	llrs := make([]float32, puncturedBits)
+	for i := int64(0); i < puncturedBits; i++ {
+		if coded[i/8]&(1<<uint(7-i%8)) != 0 {
+			llrs[i] = -10
+		} else {
+			llrs[i] = 10
+		}
+	}
+	mother, err := UnpunctureConvRate5of6Soft(llrs, inputBits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := NewViterbiDecoder()
+	decoded, err := decoder.Feed(mother)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := decoder.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded = append(decoded, tail...)
+	if len(decoded) < len(payload)*8+ConvMemory {
+		t.Fatalf("Viterbi decoded %d bits, expected at least %d", len(decoded), len(payload)*8+ConvMemory)
+	}
+	got := make([]byte, len(payload))
+	for i := range payload {
+		for bit := 0; bit < 8; bit++ {
+			if decoded[i*8+bit] {
+				got[i] |= 1 << uint(7-bit)
+			}
+		}
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("rate-5/6 soft Viterbi decode differs from source")
+	}
+}

@@ -16,8 +16,9 @@ specified in `SGV2_PROTOCOL.md`.
 - The receiver probes for SDF3 first, then supports the earlier SDF2 burst
   format, and finally falls back to the original hard-decision CCSDS-MARY
   path. Previously recorded SGV1/uncoded M-ary bursts remain receivable.
-- A receiver predating SDF3 rate profiles 3/4 does not understand the new
-  balanced on-air coding profiles and must not be expected to decode them. The legacy `EncodePackets` API remains
+- A receiver predating the punctured SDF3 profiles (5/6, 3/4 and 2/3) does not
+  understand the balanced on-air coding profiles and must not be expected to
+  decode them. The legacy `EncodePackets` API remains
   available for code that explicitly needs the old uncoded format, but the
   current Qt transmit path uses `StreamPackets` and does not expose a GUI
   compatibility toggle. Interoperation with an old receiver therefore requires
@@ -46,13 +47,16 @@ software simulations and do not define real-radio SNR thresholds.
 
 ## SDF3 group descriptor
 
-The logical descriptor is 18 bytes. Byte 5 now identifies the convolutional-code profile: 2 = K=7 rate 1/2, 3 = punctured K=7 rate 3/4, and 4 = punctured K=7 rate 2/3. The receiver accepts all three profiles, including earlier SDF3 rate-1/2 groups.
+The logical descriptor is 18 bytes. Byte 5 identifies the convolutional-code
+profile: 2 = K=7 rate 1/2, 3 = punctured K=7 rate 3/4, 4 = punctured K=7 rate
+2/3, and 5 = punctured K=7 rate 5/6. The receiver accepts all four profiles,
+including earlier SDF3 rate-1/2 groups.
 
 | Offset | Size | Meaning |
 |---|---:|---|
 | 0 | 4 | ASCII `SDF3` |
 | 4 | 1 | Descriptor version, currently 1 |
-| 5 | 1 | Inner-code profile: 2 = rate 1/2, 3 = rate 3/4, 4 = rate 2/3; K=7 generators 171/133 octal |
+| 5 | 1 | Inner-code profile: 2 = rate 1/2, 3 = rate 3/4, 4 = rate 2/3, 5 = rate 5/6; K=7 generators 171/133 octal |
 | 6 | 2 | Interleaver block size, 64 bytes |
 | 8 | 4 | Number of raw bytes after the descriptor |
 | 12 | 4 | CRC32/IEEE of the complete raw byte stream |
@@ -63,26 +67,35 @@ triplet in the LLR domain, then verifies CRC16 before trusting the length or
 code profile. The descriptor follows the existing 96-symbol M-ary training
 word and precedes the encoded data stream.
 
+At the exact end of the advertised interleaved body, the receiver releases the
+current carrier/timing lock and re-arms for the next group's 96-symbol training
+word. It does not rely only on detecting digital silence: a real radio capture
+continues to contain channel noise during the 200 ms transmit guard, and that
+noise can prevent an audio-RMS silence detector from reaching its threshold.
+This boundary-based re-acquisition is covered with noisy guards and multiple
+callback sizes.
+
 ## Inner code and interleaver
 
 The grouped CCSDS byte stream (ASM/data units) is protected by a terminated
 K=7 convolutional mother code using generator polynomials 171 and 133 octal,
-with six zero termination bits and MSB-first bit order. The encoder supports
-three on-air profiles:
+with six zero termination bits and MSB-first bit order. The encoder supports four on-air profiles:
 
 - Profile 2: rate 1/2, no puncturing.
 - Profile 3: rate 3/4, keep (A,B), then A, then B in a repeating three-input
-  pattern. Punctured bits are restored as zero-reliability LLRs.
+  pattern.
 - Profile 4: rate 2/3, keep (A,B), then A in a repeating two-input pattern.
-  Punctured bits are also restored as zero-reliability LLRs.
+- Profile 5: rate 5/6, keep (A,B), then A, A, B, B in a repeating five-input
+  pattern. Punctured observations in all three punctured profiles are restored
+  as zero-reliability LLRs.
 
 The default **balanced** profile is selected by modulation:
 
 | Modulation | Inner code | Packet parity after each 8 SSDV packets |
 |---|---:|---:|
-| QPSK | rate 3/4 | 0 shards (SSDV RS8 remains enabled) |
-| 8PSK | rate 2/3 | 1 shard (recovers one whole lost packet) |
-| 16QAM | rate 1/2 | 2 shards (recovers up to two whole lost packets) |
+| QPSK | rate 5/6 | 0 shards (SSDV RS8 remains enabled) |
+| 8PSK | rate 3/4 | 1 shard (recovers one whole lost packet) |
+| 16QAM | rate 2/3 | 1 shard (recovers one whole lost packet) |
 
 Applications that need the previous maximum-redundancy behavior can select
 `transport.MARYFECRobust` in `transport.Config`; this uses rate 1/2 plus both
@@ -125,11 +138,15 @@ caches expire after two minutes and incomplete parity groups after 30 seconds.
   44.1 kHz and 48 kHz audio rates;
 - deterministic AWGN software loopback at 18 dB for all three balanced
   modulation-specific profiles;
+- 6 dB AWGN across two SDF3 groups with noisy inter-group guards for QPSK,
+  8PSK and 16QAM, tested with 480, 997, 1920 and 4096-sample callbacks;
+- live M-ary EVM-SNR publication after synchronization, including Auto RX
+  candidate forwarding and idle-noise rejection;
 - fixed ±200 Hz carrier offset and ±150 Hz linear drift tests at 18 dB for
   balanced QPSK, 8PSK and 16QAM;
 - actual encoder sample-count checks against the airtime estimator;
 - old uncoded M-ary waveform reception through the legacy fallback;
-- SDF3 header repetition and CRC validation for rate 1/2, rate 2/3 and rate 3/4;
+- SDF3 header repetition and CRC validation for rate 1/2, rate 2/3, rate 3/4 and rate 5/6;
 - one- and two-packet erasure recovery, including restoration accepted by the
   normal SSDV RS8 parser;
 - re-acquisition of a second M-ary burst after an inter-burst low-energy gap;

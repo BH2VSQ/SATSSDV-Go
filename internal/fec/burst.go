@@ -314,6 +314,7 @@ const (
 	PacketFECProfileRate12 uint8 = 2 // K=7, rate 1/2, generators 171/133.
 	PacketFECProfileRate34 uint8 = 3 // K=7, punctured rate 3/4, generators 171/133.
 	PacketFECProfileRate23 uint8 = 4 // K=7, punctured rate 2/3, generators 171/133.
+	PacketFECProfileRate56 uint8 = 5 // K=7, punctured rate 5/6, generators 171/133.
 )
 
 type PacketBurstHeader struct {
@@ -343,7 +344,7 @@ func (h PacketBurstHeader) MarshalBinary() ([]byte, error) {
 	if codeProfile == 0 {
 		codeProfile = PacketFECProfileRate12 // Preserve the original SDF3 profile for zero-value callers.
 	}
-	if codeProfile != PacketFECProfileRate12 && codeProfile != PacketFECProfileRate34 && codeProfile != PacketFECProfileRate23 {
+	if codeProfile != PacketFECProfileRate12 && codeProfile != PacketFECProfileRate34 && codeProfile != PacketFECProfileRate23 && codeProfile != PacketFECProfileRate56 {
 		return nil, errors.New("unsupported SDF3 group FEC profile")
 	}
 	out[5] = codeProfile
@@ -358,7 +359,7 @@ func ParsePacketBurstHeader(data []byte) (PacketBurstHeader, error) {
 	if len(data) < BurstHeaderSize || string(data[:4]) != string(packetBurstMagic[:]) {
 		return PacketBurstHeader{}, errors.New("SDF3 group marker not found")
 	}
-	if data[4] != BurstVersion || (data[5] != PacketFECProfileRate12 && data[5] != PacketFECProfileRate34 && data[5] != PacketFECProfileRate23) || binary.BigEndian.Uint16(data[6:8]) != InterleaveBlockBytes {
+	if data[4] != BurstVersion || (data[5] != PacketFECProfileRate12 && data[5] != PacketFECProfileRate34 && data[5] != PacketFECProfileRate23 && data[5] != PacketFECProfileRate56) || binary.BigEndian.Uint16(data[6:8]) != InterleaveBlockBytes {
 		return PacketBurstHeader{}, errors.New("unsupported SDF3 group FEC profile")
 	}
 	if got, want := binary.BigEndian.Uint16(data[16:18]), burstHeaderCRC16(data[:16]); got != want {
@@ -378,6 +379,8 @@ func (h PacketBurstHeader) CodedBits() int64 {
 		return ConvRate3of4CodedBitCount(inputBits)
 	case PacketFECProfileRate23:
 		return ConvRate2of3CodedBitCount(inputBits)
+	case PacketFECProfileRate56:
+		return ConvRate5of6CodedBitCount(inputBits)
 	default:
 		return 2 * inputBits
 	}

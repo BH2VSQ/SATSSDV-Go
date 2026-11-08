@@ -109,6 +109,7 @@ func TestModeNoiseAndOffsetCharacterization(t *testing.T) {
 				fec.PacketFECProfileRate12: "1/2",
 				fec.PacketFECProfileRate23: "2/3",
 				fec.PacketFECProfileRate34: "3/4",
+				fec.PacketFECProfileRate56: "5/6",
 			}[codeProfile]
 			lines = append(lines, fmt.Sprintf("- TX format: SDF3 grouped (max %d CCSDS units/group; this fixture carries one unit); K=7 rate-%s soft-decision Viterbi; %d packet-erasure parity shards per 8 source SSDV packets.", encoder.cfg.MARYBurstGroupSize, codeRate, parityShards))
 		}

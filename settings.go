@@ -14,6 +14,7 @@ type Settings struct {
 	RXProfile                 string            `json:"rxProfile"`
 	TXProfile                 string            `json:"txProfile"`
 	Quality                   string            `json:"quality"`
+	MARYFECProfile            string            `json:"maryFecProfile"` // balanced (default) or robust.
 	Callsign                  string            `json:"callsign"`
 	AX25SSID                  int               `json:"ax25Ssid"`
 	Locator                   string            `json:"locator"`
@@ -123,6 +124,9 @@ func normalizeSettings(s Settings) Settings {
 	if s.Quality == "low" || s.Quality == "medium" || s.Quality == "high" {
 		d.Quality = s.Quality
 	}
+	if s.MARYFECProfile == "balanced" || s.MARYFECProfile == "robust" {
+		d.MARYFECProfile = s.MARYFECProfile
+	}
 	if s.Callsign != "" {
 		d.Callsign = s.Callsign
 	}
@@ -155,5 +159,5 @@ func normalizeSettings(s Settings) Settings {
 }
 
 func DefaultSettings() Settings {
-	return Settings{Language: string(i18n.Chinese), RXProfile: string(domain.SSDVAX25), TXProfile: string(domain.SSDVAX25), Quality: "medium", Callsign: "N0CALL", Locator: "JJ00", AudioSampleRate: 48000, Waterfall: DefaultWaterfallSettings(), PTT: ptt.Config{Mode: ptt.ModeVOX, ActiveHigh: true}, PTTLeadMS: 300, PTTTailMS: 250}
+	return Settings{Language: string(i18n.Chinese), RXProfile: string(domain.SSDVAX25), TXProfile: string(domain.SSDVAX25), Quality: "medium", MARYFECProfile: "balanced", Callsign: "N0CALL", Locator: "JJ00", AudioSampleRate: 48000, Waterfall: DefaultWaterfallSettings(), PTT: ptt.Config{Mode: ptt.ModeVOX, ActiveHigh: true}, PTTLeadMS: 300, PTTTailMS: 250}
 }

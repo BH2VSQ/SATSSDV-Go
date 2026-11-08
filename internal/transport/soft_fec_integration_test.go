@@ -80,7 +80,7 @@ func TestSoftFECMARYStreamRoundTripAllConstellations(t *testing.T) {
 					wantWireCount := map[domain.TransportMode]int{
 						domain.SSDVQPSK1600:  8,
 						domain.SSDV8PSK1600:  9,
-						domain.SSDV16QAM1600: 10,
+						domain.SSDV16QAM1600: 9,
 					}[profile]
 					if wireCount != wantWireCount {
 						t.Fatalf("physical packet count=%d, want %d for balanced FEC", wireCount, wantWireCount)
@@ -657,4 +657,184 @@ func TestSoftFECMARYDecoderReacquiresAfterSilence(t *testing.T) {
 	if seenFirst != 8 || seenSecond != 8 {
 		t.Fatalf("burst packets first=%d second=%d", seenFirst, seenSecond)
 	}
+}
+
+// TestSDF3MARYReacquiresAcrossNoisyGroupGuards verifies that channel noise in
+// the 200 ms inter-group guard does not keep the previous carrier lock alive.
+// The group boundary is re-armed from the exact SDF3 body length, independent
+// of the relative RF/audio noise level in the inserted guard interval.
+func TestSDF3MARYReacquiresAcrossNoisyGroupGuards(t *testing.T) {
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	chunkSizes := []int{480, 997, 1920, 4096}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			packets := makeSoftFECTestPackets(t, 16)
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000}) // zero value is the balanced throughput profile.
+			if err != nil {
+				t.Fatal(err)
+			}
+			var waveform []float32
+			if _, err := encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+				waveform = append(waveform, block...)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var activePower float64
+			activeSamples := 0
+			for _, sample := range waveform {
+				if sample != 0 {
+					activePower += float64(sample * sample)
+					activeSamples++
+				}
+			}
+			if activeSamples == 0 {
+				t.Fatal("encoder produced no active samples")
+			}
+			activeRMS := math.Sqrt(activePower / float64(activeSamples))
+			const snrDB = 6.0
+			noiseRMS := activeRMS / math.Pow(10, snrDB/20)
+			rng := rand.New(rand.NewSource(0x5344463300 + int64(len(profile))))
+			input := make([]float32, 2048, 2048+len(waveform)+9600)
+			for _, sample := range waveform {
+				input = append(input, sample+float32(rng.NormFloat64()*noiseRMS))
+			}
+			for i := 0; i < 9600; i++ {
+				input = append(input, float32(rng.NormFloat64()*noiseRMS))
+			}
+			for _, chunkSize := range chunkSizes {
+				t.Run(fmt.Sprintf("chunk-%d", chunkSize), func(t *testing.T) {
+					decoder, err := NewStreamDecoder(profile, 48000)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var received []ReceivedPacket
+					for offset := 0; offset < len(input); offset += chunkSize {
+						batch, feedErr := decoder.Feed(input[offset:min(len(input), offset+chunkSize)])
+						if feedErr != nil {
+							t.Fatal(feedErr)
+						}
+						received = append(received, batch...)
+					}
+					if len(received) != len(packets) {
+						t.Fatalf("at %.0f dB SNR recovered %d/%d packets across noisy group guards; diag=%+v SDF3=%d/%d last=%q", snrDB, len(received), len(packets), decoder.Diagnostics(), decoder.marySDF3PacketsOK, decoder.marySDF3PacketsBad, decoder.marySDF3LastError)
+					}
+					if decoder.marySDF3PacketsOK < 2 {
+						t.Fatalf("expected two independently decoded SDF3 groups, got %d: %+v", decoder.marySDF3PacketsOK, decoder.Diagnostics())
+					}
+					if decoder.Diagnostics().MARYReacquireCount < 2 {
+						t.Fatalf("receiver did not reacquire the second group's training word: %+v", decoder.Diagnostics())
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestSDF3MARYStreamPublishesEVMSNRDuringReceive(t *testing.T) {
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			packets := makeSoftFECTestPackets(t, 8)
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var waveform []float32
+			if _, err := encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+				waveform = append(waveform, block...)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var power float64
+			active := 0
+			for _, sample := range waveform {
+				if sample != 0 {
+					power += float64(sample * sample)
+					active++
+				}
+			}
+			if active == 0 {
+				t.Fatal("encoder produced no active samples")
+			}
+			const injectedSNRDB = 12.0
+			noiseRMS := math.Sqrt(power/float64(active)) / math.Pow(10, injectedSNRDB/20)
+			rng := rand.New(rand.NewSource(0x45564d00 + int64(len(profile))))
+			input := make([]float32, 2413, 2413+len(waveform)+4800)
+			for _, sample := range waveform {
+				input = append(input, sample+float32(rng.NormFloat64()*noiseRMS))
+			}
+			for i := 0; i < 4800; i++ {
+				input = append(input, float32(rng.NormFloat64()*noiseRMS))
+			}
+			decoder, err := NewStreamDecoder(profile, 48000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed := false
+			var measured float64
+			for offset := 0; offset < len(input); offset += 960 {
+				if _, err := decoder.Feed(input[offset:min(len(input), offset+960)]); err != nil {
+					t.Fatal(err)
+				}
+				diagnostics := decoder.Diagnostics()
+				if diagnostics.MARYLocked && diagnostics.MARYSNRValid {
+					observed = true
+					measured = diagnostics.MARYSNRDB
+					if math.IsNaN(measured) || math.IsInf(measured, 0) || measured < 0 || measured > 60 {
+						t.Fatalf("invalid live EVM SNR %.2f dB: %+v", measured, diagnostics)
+					}
+				}
+			}
+			if !observed {
+				t.Fatalf("SDF3 RX never published a synchronized EVM SNR: %+v", decoder.Diagnostics())
+			}
+			t.Logf("injected full-band audio SNR %.1f dB; observed post-demod EVM SNR %.1f dB", injectedSNRDB, measured)
+		})
+	}
+}
+
+func TestMARYFECZeroValueDefaultsToBalancedProfile(t *testing.T) {
+	for _, profile := range []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600} {
+		encoder, err := NewEncoder(Config{Profile: profile})
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, parity := encoder.maryFECSettings(encoderProfileForTest(t, profile))
+		wantCode, wantParity := fec.PacketFECProfileRate23, 1
+		switch profile {
+		case domain.SSDVQPSK1600:
+			wantCode, wantParity = fec.PacketFECProfileRate56, 0
+		case domain.SSDV8PSK1600:
+			wantCode, wantParity = fec.PacketFECProfileRate34, 1
+		}
+		if code != wantCode || parity != wantParity {
+			t.Fatalf("zero-value %s FEC=%d parity=%d, want balanced profile %d + %d shards", profile, code, parity, wantCode, wantParity)
+		}
+	}
+}
+
+func TestMARYFECExplicitRobustPolicy(t *testing.T) {
+	for _, profile := range []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600} {
+		encoder, err := NewEncoder(Config{Profile: profile, MARYFECProfile: MARYFECRobust})
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, parity := encoder.maryFECSettings(encoderProfileForTest(t, profile))
+		if code != fec.PacketFECProfileRate12 || parity != 2 {
+			t.Fatalf("explicit robust %s FEC=%d parity=%d, want rate-1/2 + 2 shards", profile, code, parity)
+		}
+	}
+}
+
+func encoderProfileForTest(t *testing.T, profile domain.TransportMode) domain.Profile {
+	t.Helper()
+	parsed, err := domain.ParseProfile(string(profile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }

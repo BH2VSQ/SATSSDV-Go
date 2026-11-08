@@ -28,7 +28,7 @@ checks = {
     "Qt surfaces recovered decoder errors": 'name==QStringLiteral("rx:decoder-error")' in qt,
     "single-shard RS recovery branches before two-shard residuals": "if len(missing) == 1" in fec and fec.index("if len(missing) == 1") < fec.index("residual1 := append([]byte(nil), parity1...)"),
     "P0-only parity recovery regression exists": "TestPacketParityCanRecoverOneLossFromFirstParityShard" in fec_test,
-    "packetized modem guard is explicit": "SetPacketizedMode" in modem and "silenceRatio = 0.20" in modem,
+    "SDF3 re-arms at exact group boundary despite noisy audio guards": "SetPacketizedMode" in modem and "silenceRatio = 0.36" in modem and "d.mary.Rearm()" in transport and "TestSDF3MARYReacquiresAcrossNoisyGroupGuards" in (ROOT / "internal/transport/soft_fec_integration_test.go").read_text(encoding="utf-8"),
 }
 failed = [name for name, ok in checks.items() if not ok]
 for name, ok in checks.items():

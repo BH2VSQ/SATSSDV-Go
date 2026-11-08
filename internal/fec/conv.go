@@ -97,6 +97,95 @@ func ConvRate2of3CodedBitCount(inputBits int64) int64 {
 	return coded
 }
 
+// ConvRate5of6CodedBitCount returns the transmitted bit count for a
+// puncturing period of five input bits. The pattern keeps (A,B),(A,-),
+// (A,-),(-,B),(-,B): six coded bits for five source bits.
+func ConvRate5of6CodedBitCount(inputBits int64) int64 {
+	if inputBits <= 0 {
+		return 0
+	}
+	groups, rem := inputBits/5, inputBits%5
+	coded := groups * 6
+	if rem > 0 {
+		coded += rem + 1
+	}
+	return coded
+}
+
+// EncodeConvRate5of6 encodes with the K=7 mother code and applies the
+// (A,B),(A,-),(A,-),(-,B),(-,B) puncturing pattern.
+func EncodeConvRate5of6(data []byte) ([]byte, error) {
+	enc := NewConvStreamEncoder()
+	body, err := enc.WriteBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	tail, err := enc.Close()
+	if err != nil {
+		return nil, err
+	}
+	mother := append(body, tail...)
+	inputBits := int64(len(data)*8 + ConvMemory)
+	wantMotherBits := inputBits * 2
+	if int64(len(mother))*8 < wantMotherBits {
+		return nil, errors.New("convolutional mother code is shorter than expected")
+	}
+	codedBits := ConvRate5of6CodedBitCount(inputBits)
+	out := make([]byte, (codedBits+7)/8)
+	outPos := int64(0)
+	readMother := func(pos int64) bool { return mother[pos/8]&(1<<uint(7-pos%8)) != 0 }
+	for step := int64(0); step < inputBits; step++ {
+		a, b := readMother(2*step), readMother(2*step+1)
+		switch step % 5 {
+		case 0:
+			putPackedBit(out, int(outPos), a)
+			outPos++
+			putPackedBit(out, int(outPos), b)
+			outPos++
+		case 1, 2:
+			putPackedBit(out, int(outPos), a)
+			outPos++
+		case 3, 4:
+			putPackedBit(out, int(outPos), b)
+			outPos++
+		}
+	}
+	if outPos != codedBits {
+		return nil, errors.New("rate-5/6 puncturing produced an unexpected bit count")
+	}
+	return out, nil
+}
+
+// UnpunctureConvRate5of6Soft restores erased generator observations as zero
+// LLRs before soft-decision Viterbi decoding.
+func UnpunctureConvRate5of6Soft(punctured []float32, inputBits int64) ([]float32, error) {
+	if inputBits <= 0 || inputBits > int64(^uint(0)>>1)/2 {
+		return nil, errors.New("invalid rate-5/6 input bit count")
+	}
+	if int64(len(punctured)) != ConvRate5of6CodedBitCount(inputBits) {
+		return nil, errors.New("rate-5/6 soft input has an unexpected punctured bit count")
+	}
+	out := make([]float32, int(inputBits*2))
+	read := 0
+	for step := int64(0); step < inputBits; step++ {
+		switch step % 5 {
+		case 0:
+			out[2*step] = punctured[read]
+			out[2*step+1] = punctured[read+1]
+			read += 2
+		case 1, 2:
+			out[2*step] = punctured[read]
+			out[2*step+1] = 0
+			read++
+		case 3, 4:
+			out[2*step] = 0
+			out[2*step+1] = punctured[read]
+			read++
+		}
+	}
+	return out, nil
+}
+
 // EncodeConvRate2of3 applies the K=7 rate-2/3 puncturing pattern
 // (keep both outputs for even input steps, keep only generator A for odd
 // input steps). The same soft-decision Viterbi decoder can be used after

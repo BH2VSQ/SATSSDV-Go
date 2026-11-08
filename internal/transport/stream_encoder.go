@@ -192,6 +192,11 @@ func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packet
 			if err != nil {
 				return 0, err
 			}
+		case fec.PacketFECProfileRate56:
+			coded, err = fec.EncodeConvRate5of6(rawGroup)
+			if err != nil {
+				return 0, err
+			}
 		default:
 			conv := fec.NewConvStreamEncoder()
 			coded, err = conv.WriteBytes(rawGroup)

@@ -23,10 +23,12 @@ const (
 )
 
 const (
-	// MARYFECBalanced uses punctured K=7 rate-3/4 soft-decision FEC and
-	// modulation-specific packet erasure parity to favour throughput.
+	// MARYFECBalanced is the zero-value/default profile. It keeps soft-decision
+	// FEC while selecting modulation-specific code rates/parity for useful
+	// image throughput. Operators can select MARYFECRobust for poor links.
 	MARYFECBalanced = iota
-	// MARYFECRobust retains K=7 rate-1/2 FEC and two packet parity shards.
+	// MARYFECRobust uses K=7 rate-1/2 soft-decision FEC plus both packet-
+	// erasure parity shards for every constellation.
 	MARYFECRobust
 )
 
@@ -85,11 +87,11 @@ func (e *Encoder) maryFECSettings(profile domain.Profile) (uint8, int) {
 	}
 	switch profile.BitsPerSymbol {
 	case 2:
-		return fec.PacketFECProfileRate34, 0 // QPSK: 3/4 inner code; SSDV RS8 remains enabled.
+		return fec.PacketFECProfileRate56, 0 // QPSK: 5/6 code with outer SSDV RS8; tune for higher useful rate.
 	case 3:
-		return fec.PacketFECProfileRate23, 1 // 8PSK: 2/3 inner code plus one erasure shard.
+		return fec.PacketFECProfileRate34, 1 // 8PSK: 3/4 inner code plus one group erasure shard.
 	default:
-		return fec.PacketFECProfileRate12, 2 // 16QAM: retain strongest inner and packet FEC.
+		return fec.PacketFECProfileRate23, 1 // 16QAM: 2/3 inner code plus one shard; stronger option remains available.
 	}
 }
 

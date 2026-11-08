@@ -1,7 +1,7 @@
 
 # SATSSDV-Go modem noise and frequency-offset characterization
 
-Generated: 2026-11-08T09:04:49Z
+Generated: 2026-11-08T09:59:05Z
 
 Synthetic audio-PCM/baseband test only; this is not calibrated RF SNR, Eb/N0, receiver sensitivity or an over-the-air result.
 
@@ -228,7 +228,7 @@ Contiguous interval: **-600 / +600 Hz**; symmetric verified interval: **±600 Hz
 
 - Modulation: `qpsk`; codec: `SSDV`; link layer: `CCSDS-MARY`.
 - Audio rate: 48000 Hz; bit rate: 3200 bit/s; symbol rate: 1600 baud; bits/symbol: 2.
-- TX format: SDF3 grouped (max 10 CCSDS units/group; this fixture carries one unit); K=7 rate-3/4 soft-decision Viterbi; 0 packet-erasure parity shards per 8 source SSDV packets.
+- TX format: SDF3 grouped (max 10 CCSDS units/group; this fixture carries one unit); K=7 rate-5/6 soft-decision Viterbi; 0 packet-erasure parity shards per 8 source SSDV packets.
 - M-ary carrier: 1600 Hz; acquisition word: 96 symbols.
 
 ### AWGN SNR sweep
@@ -264,7 +264,7 @@ Contiguous interval: **-300 / +300 Hz**; symmetric verified interval: **±300 Hz
 
 - Modulation: `8psk`; codec: `SSDV`; link layer: `CCSDS-MARY`.
 - Audio rate: 48000 Hz; bit rate: 4800 bit/s; symbol rate: 1600 baud; bits/symbol: 3.
-- TX format: SDF3 grouped (max 10 CCSDS units/group; this fixture carries one unit); K=7 rate-2/3 soft-decision Viterbi; 1 packet-erasure parity shards per 8 source SSDV packets.
+- TX format: SDF3 grouped (max 10 CCSDS units/group; this fixture carries one unit); K=7 rate-3/4 soft-decision Viterbi; 1 packet-erasure parity shards per 8 source SSDV packets.
 - M-ary carrier: 1600 Hz; acquisition word: 96 symbols.
 
 ### AWGN SNR sweep
@@ -300,7 +300,7 @@ Contiguous interval: **-300 / +300 Hz**; symmetric verified interval: **±300 Hz
 
 - Modulation: `16qam`; codec: `SSDV`; link layer: `CCSDS-MARY`.
 - Audio rate: 48000 Hz; bit rate: 6400 bit/s; symbol rate: 1600 baud; bits/symbol: 4.
-- TX format: SDF3 grouped (max 10 CCSDS units/group; this fixture carries one unit); K=7 rate-1/2 soft-decision Viterbi; 2 packet-erasure parity shards per 8 source SSDV packets.
+- TX format: SDF3 grouped (max 10 CCSDS units/group; this fixture carries one unit); K=7 rate-2/3 soft-decision Viterbi; 1 packet-erasure parity shards per 8 source SSDV packets.
 - M-ary carrier: 1600 Hz; acquisition word: 96 symbols.
 
 ### AWGN SNR sweep
