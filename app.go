@@ -499,9 +499,10 @@ func (a *App) Start1500HzTestTone() error {
 				a.txCancel, a.txDone = nil, nil
 			}
 			a.mu.Unlock()
-			a.txGate.Unlock()
+			a.emitTXResetTelemetry()
 			a.emit("tx:tone-state", map[string]any{"active": false})
 			a.emit("tx:state", map[string]any{"active": false})
+			a.txGate.Unlock()
 		}()
 		const duration = 60.0
 		samples := make([]float32, int(float64(rate)*duration))
@@ -828,8 +829,9 @@ func (a *App) startTransmissionWithSender(job txqueue.Job, repeat bool, interval
 			a.mu.Lock()
 			a.txCancel, a.txDone = nil, nil
 			a.mu.Unlock()
-			a.txGate.Unlock()
+			a.emitTXResetTelemetry()
 			a.emit("tx:state", map[string]any{"active": false})
+			a.txGate.Unlock()
 		}()
 		if ctx.Err() == nil {
 			a.emit("tx:state", map[string]any{"active": true})
@@ -1075,6 +1077,18 @@ func buildTXMetrics(startedAt, now time.Time, estimated time.Duration, totalFram
 	}
 }
 
+func emptyTXMetrics() map[string]any {
+    return map[string]any{
+        "estimatedSeconds": 0, "elapsedSeconds": 0, "remainingSeconds": 0,
+        "totalDataFrames": 0, "sentDataFrames": 0, "progress": 0.0,
+    }
+}
+
+func (a *App) emitTXResetTelemetry() {
+    a.emit("tx:progress", 0.0)
+    a.emit("tx:metrics", emptyTXMetrics())
+}
+
 func (a *App) emitTXMetrics(startedAt time.Time, estimated time.Duration, totalFrames int, progress float64) {
 	if startedAt.IsZero() {
 		return
@@ -1093,7 +1107,7 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 	if shouldEmitProgress {
 		a.emit("tx:progress", progress)
 	}
-	if len(samples) < 1024 {
+	if len(samples) < 4096 {
 		return
 	}
 	// Audio playback callbacks can arrive much faster than the display row
@@ -1108,14 +1122,15 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 	a.txSpectrumLastEmit = now
 	a.txSpectrumMu.Unlock()
 	end := int(progress * float64(len(samples)-1))
-	start := end - 1024
+	const spectrumWindow = 4096
+	start := end - spectrumWindow
 	if start < 0 {
 		start = 0
 	}
-	if start+1024 > len(samples) {
-		start = len(samples) - 1024
+	if start+spectrumWindow > len(samples) {
+		start = len(samples) - spectrumWindow
 	}
-	bins, err := dsp.Spectrum(samples[start:start+1024], sampleRate)
+	bins, err := dsp.Spectrum(samples[start:start+spectrumWindow], sampleRate)
 	if err == nil {
 		a.emit("tx:spectrum", bins)
 	}
@@ -1125,7 +1140,8 @@ func (a *App) emitTXProgress(samples []float32, sampleRate int, progress float64
 // old batch path it never indexes into a full-duration waveform. FFT work and UI
 // events remain limited to 15 Hz to match waterfall row cadence.
 func (a *App) emitTXStreamSpectrum(samples []float32, sampleRate int) {
-	if len(samples) < 1024 {
+	const spectrumWindow = 4096
+	if len(samples) < spectrumWindow {
 		return
 	}
 	now := time.Now()
@@ -1136,7 +1152,7 @@ func (a *App) emitTXStreamSpectrum(samples []float32, sampleRate int) {
 	}
 	a.txSpectrumLastEmit = now
 	a.txSpectrumMu.Unlock()
-	window := samples[len(samples)-1024:]
+	window := samples[len(samples)-spectrumWindow:]
 	bins, err := dsp.Spectrum(window, sampleRate)
 	if err == nil {
 		a.emit("tx:spectrum", bins)
@@ -1210,6 +1226,22 @@ func (a *App) TransmitPCM(samples []float32, waveformSampleRate int) error {
 	})
 }
 
+func estimateRXAudioSNR(bins []dsp.SpectrumBin, profileID string, sampleRate int) dsp.BandSNR {
+    nyquist := float64(sampleRate) / 2
+    signalLow, signalHigh, noiseLow := 650.0, 3100.0, 4000.0
+    switch {
+    case profileID == domain.AutoReceiveProfile:
+        signalLow, signalHigh, noiseLow = 350, 3800, 4400
+    case strings.Contains(profileID, "1600"):
+        signalLow, signalHigh, noiseLow = 150, 3800, 4500
+    case strings.Contains(profileID, "2400"):
+        signalLow, signalHigh, noiseLow = 650, 3600, 4300
+    }
+    noiseHigh := math.Min(9000, nyquist-50)
+    signalHigh = math.Min(signalHigh, noiseLow-100)
+    return dsp.EstimateBandSNR(bins, signalLow, signalHigh, noiseLow, noiseHigh)
+}
+
 func (a *App) handleRXAudio(samples []float32) {
 	a.rxStats.audioBlocks.Add(1)
 	if samples == nil {
@@ -1227,24 +1259,28 @@ func (a *App) handleRXAudio(samples []float32) {
 	a.rxStats.audioSamples.Add(uint64(len(samples)))
 	a.mu.Lock()
 	rate := a.settings.AudioSampleRate
+	profileID := a.settings.RXProfile
 	a.mu.Unlock()
 	now := time.Now()
 	a.rxSpectrumMu.Lock()
 	a.rxSpectrumWindow = append(a.rxSpectrumWindow, samples...)
-	if len(a.rxSpectrumWindow) > 4096 {
-		a.rxSpectrumWindow = append([]float32(nil), a.rxSpectrumWindow[len(a.rxSpectrumWindow)-4096:]...)
+	const spectrumWindow = 4096
+	if len(a.rxSpectrumWindow) > spectrumWindow {
+		a.rxSpectrumWindow = append([]float32(nil), a.rxSpectrumWindow[len(a.rxSpectrumWindow)-spectrumWindow:]...)
 	}
-	shouldEmit := len(a.rxSpectrumWindow) >= 1024 && now.Sub(a.rxSpectrumLastEmit) >= time.Second/15
+	shouldEmit := len(a.rxSpectrumWindow) >= spectrumWindow && now.Sub(a.rxSpectrumLastEmit) >= time.Second/15
 	var window []float32
 	if shouldEmit {
-		window = append([]float32(nil), a.rxSpectrumWindow[len(a.rxSpectrumWindow)-1024:]...)
+		window = append([]float32(nil), a.rxSpectrumWindow[len(a.rxSpectrumWindow)-spectrumWindow:]...)
 		a.rxSpectrumLastEmit = now
 	}
 	a.rxSpectrumMu.Unlock()
 	if shouldEmit {
+		var snr dsp.BandSNR
 		bins, err := dsp.Spectrum(window, rate)
 		if err == nil {
 			a.emit("rx:spectrum", bins)
+			snr = estimateRXAudioSNR(bins, profileID, rate)
 		}
 		var sum float64
 		peak := float32(0)
@@ -1257,7 +1293,11 @@ func (a *App) handleRXAudio(samples []float32) {
 		}
 		rms := math.Sqrt(sum / float64(len(window)))
 		db := 20 * math.Log10(math.Max(rms, 1e-12))
-		a.emit("rx:level", map[string]float64{"rmsDbfs": db, "peak": float64(peak)})
+		a.emit("rx:level", map[string]interface{}{
+			"rmsDbfs": db, "peak": float64(peak),
+			"snrDb": snr.SNRDB, "snrValid": snr.Valid,
+			"noiseFloorDbfs": snr.NoiseFloorDBFS, "signalBandDbfs": snr.SignalBandDBFS,
+		})
 	}
 	// Always forward every capture block to the ordered decoder queue. Only
 	// display telemetry is throttled; demodulation input is never rate-limited.

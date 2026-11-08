@@ -231,7 +231,7 @@ private:
 class SpectrumWaterfallWidget final : public QWidget {
 public:
     explicit SpectrumWaterfallWidget(QWidget *parent = nullptr)
-        : QWidget(parent), m_waterfall(640, 220, QImage::Format_RGB32) {
+        : QWidget(parent), m_waterfall(1280, 220, QImage::Format_RGB32) {
         m_waterfall.fill(m_backgroundColor);
         m_decayTimer.setTimerType(Qt::PreciseTimer);
         m_decayTimer.setInterval(1000 / m_rowsPerSecond);
@@ -277,7 +277,7 @@ public:
         m_highColor = color(QStringLiteral("highColor"), QColor(QStringLiteral("#39c6b0")));
         m_peakColor = color(QStringLiteral("peakColor"), QColor(QStringLiteral("#f7d45b")));
         const int historyRows = qBound(30, m_rowsPerSecond * m_historySeconds, 2400);
-        m_waterfall = QImage(640, historyRows, QImage::Format_RGB32);
+        m_waterfall = QImage(1280, historyRows, QImage::Format_RGB32);
         m_waterfall.fill(m_backgroundColor);
         m_lastUpdateMs = 0;
         m_decayTimer.setInterval(qMax(25, 1000 / qMax(1, m_rowsPerSecond)));
@@ -309,8 +309,8 @@ public:
         if (values.size() < 2) return;
         m_dataMinFrequencyHz = firstHz;
         m_dataMaxFrequencyHz = lastHz;
-        if (m_waterfall.width() != 640 || m_waterfall.height() != qBound(30, m_rowsPerSecond * m_historySeconds, 2400)) {
-            m_waterfall = QImage(640, qBound(30, m_rowsPerSecond * m_historySeconds, 2400), QImage::Format_RGB32);
+        if (m_waterfall.width() != 1280 || m_waterfall.height() != qBound(30, m_rowsPerSecond * m_historySeconds, 2400)) {
+            m_waterfall = QImage(1280, qBound(30, m_rowsPerSecond * m_historySeconds, 2400), QImage::Format_RGB32);
             m_waterfall.fill(m_backgroundColor);
         }
         for (int y = 0; y < m_waterfall.height() - 1; ++y) {
@@ -325,8 +325,12 @@ public:
         const double sourceSpan = qMax(1.0, m_dataMaxFrequencyHz - m_dataMinFrequencyHz);
         for (int x = 0; x < m_waterfall.width(); ++x) {
             const double hz = minHz + (maxHz - minHz) * (double(x) / qMax(1, m_waterfall.width() - 1));
-            const int index = qBound(0, qRound((hz - m_dataMinFrequencyHz) / sourceSpan * (int(values.size()) - 1)), int(values.size()) - 1);
-            const double level = qBound(0.0, (values[index] - m_minDbfs) / qMax(1.0, double(m_maxDbfs - m_minDbfs)), 1.0);
+            const double sourcePosition = qBound(0.0, (hz - m_dataMinFrequencyHz) / sourceSpan * double(values.size() - 1), double(values.size() - 1));
+            const int index0 = qBound(0, int(std::floor(sourcePosition)), int(values.size()) - 1);
+            const int index1 = qMin(index0 + 1, int(values.size()) - 1);
+            const double fraction = sourcePosition - index0;
+            const double magnitude = values[index0] + (values[index1] - values[index0]) * fraction;
+            const double level = qBound(0.0, (magnitude - m_minDbfs) / qMax(1.0, double(m_maxDbfs - m_minDbfs)), 1.0);
             row[x] = colorFor(level).rgb();
         }
         update();
@@ -335,6 +339,7 @@ public:
 protected:
     void paintEvent(QPaintEvent *) override {
         QPainter painter(this);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
         painter.fillRect(rect(), m_backgroundColor);
 
         const double minHz = m_visibleMaxFrequencyHz > m_visibleMinFrequencyHz
@@ -682,6 +687,10 @@ void MainWindow::buildUi() {
     auto *rxSpectrumTitle = new QHBoxLayout();
     rxSpectrumTitle->addWidget(new QLabel(uiText(QStringLiteral("RX 瀑布图")), rxPane));
     rxSpectrumTitle->addStretch();
+    m_rxSnrLabel = new QLabel(uiText(QStringLiteral("SNR -- dB")), rxPane);
+    m_rxSnrLabel->setObjectName(QStringLiteral("rxSnrLabel"));
+    m_rxSnrLabel->setStyleSheet(QStringLiteral("font-size:8pt; color:#315c70; font-weight:700; padding:1px 4px;"));
+    rxSpectrumTitle->addWidget(m_rxSnrLabel);
     rxLayout->addLayout(rxSpectrumTitle);
     m_rxSpectrumStatus = new QLabel(uiText(QStringLiteral("等待 RX 音频")), rxPane);
     m_rxSpectrumStatus->setStyleSheet(QStringLiteral("font-size:8pt; color:#77858f;"));
@@ -2212,6 +2221,15 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         appendLog(uiText(QStringLiteral("RX decoder recovered from error: %1")).arg(error));
     } else if(name==QStringLiteral("rx:level")){
         const auto p=payloadValue.toObject();m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
+        if (m_rxSnrLabel) {
+            if (p.value(QStringLiteral("snrValid")).toBool()) {
+                m_rxSnrLabel->setText(uiText(QStringLiteral("SNR %1 dB")).arg(p.value(QStringLiteral("snrDb")).toDouble(), 0, 'f', 1));
+                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Audio-band estimate · noise floor %1 dBFS")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+            } else {
+                m_rxSnrLabel->setText(uiText(QStringLiteral("SNR -- dB")));
+                m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Waiting for a measurable signal")));
+            }
+        }
     } else if(name==QStringLiteral("rx:spectrum")||name==QStringLiteral("tx:spectrum")){
         const auto bins=payloadValue.toArray(); if(!bins.isEmpty()){
             SpectrumWaterfallWidget *target = name.startsWith(QStringLiteral("rx")) ? m_rxSpectrum : m_txSpectrum;
@@ -2237,7 +2255,12 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         if (!m_txActive) m_txCountdownActive = false;
         updateRepeatControls();
         updateTXToggle();
-        if(!m_txActive){m_txProgress->setValue(0);refreshAlbum();}
+        if(!m_txActive){
+            m_txProgress->setValue(0);
+            m_txMetrics->setText(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
+                .arg(QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("0"), QStringLiteral("0")));
+            refreshAlbum();
+        }
     } else if(name==QStringLiteral("tx:tone-state")){
         m_txToneActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
         updateTXToggle();
@@ -2273,6 +2296,7 @@ void MainWindow::startRX() {
     if (m_rxPreview) m_rxPreview->clearSourceImage();
     if (m_rxMeta) m_rxMeta->setText(QStringLiteral("CALL  ---   IMAGE ID  --   PACKETS  0 / 0   MODE  ---"));
     if (m_rxDiagnostics) m_rxDiagnostics->setText(uiText(QStringLiteral("RX 解码诊断 · 等待音频")));
+    if (m_rxSnrLabel) m_rxSnrLabel->setText(uiText(QStringLiteral("SNR -- dB")));
     m_settings.insert(QStringLiteral("rxProfile"), m_rxProfile->currentData().toString());
     QString saveError;
     m_backend->callSync(QStringLiteral("SaveSettings"), QJsonArray{m_settings}, &saveError, 15000);
@@ -2284,7 +2308,7 @@ void MainWindow::startRX() {
 }
 void MainWindow::stopRX() {
     m_backend->call(QStringLiteral("StopRX"), {}, [this](bool ok, const QJsonValue &, const QString &error) {
-        if (ok) { m_rxActive = false; m_rxStatus->setText(uiText(QStringLiteral("RX 已停止"))); updateRXToggle(); appendLog(uiText(QStringLiteral("接收已停止"))); }
+        if (ok) { m_rxActive = false; m_rxStatus->setText(uiText(QStringLiteral("RX 已停止"))); if (m_rxSnrLabel) m_rxSnrLabel->setText(uiText(QStringLiteral("SNR -- dB"))); updateRXToggle(); appendLog(uiText(QStringLiteral("接收已停止"))); }
         else showError(error);
     });
 }

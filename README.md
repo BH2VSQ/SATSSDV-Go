@@ -73,6 +73,8 @@ The Qt build is separately validated through CMake on Qt-enabled CI runners. The
 
 ## Notes on compatibility and limitations
 
+- The dedicated `modem-characterization` CI job sweeps AWGN SNR and constant audio-IF frequency offset for all eight transport profiles, then publishes a Markdown report artifact. These are synthetic audio-baseband results, not calibrated RF sensitivity or Eb/N0 values. The RX workbench SNR indicator is also an audio-band estimate.
+
 - Existing SSDV, PCSI-MMT, AX.25 and CCSDS packet/modulation paths remain independent of the experimental BCSI codec.
 - QPSK/8PSK/16QAM 1600 are project-specific and require the matching decoder. Their on-air performance still needs validation against recorded sound-card/electrical loopback and real RF captures.
 - The Qt client provides a native RX/TX workbench, profile selectors, QSO fields, an interactive 4:3 template canvas (component selection, drag-to-move, text/image resizing, layer ordering, optional 5% snap grid, add/delete image and text layers), text properties, gallery and album operations, template-pack import/export, audio/PTT configuration, and native spectrum/waterfall drawing. The language preference is stored but full QTranslator localization is pending. Image crop/fit controls, full localization catalogs, advanced album filters and waterfall palette/range editing remain parity work tracked in `docs/PORT_QT6_WIDGETS.md`.

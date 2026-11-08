@@ -132,6 +132,7 @@ private:
     QPushButton *m_albumNav = nullptr;
     QComboBox *m_languageSelect = nullptr;
     QLabel *m_rxSpectrumStatus = nullptr;
+    QLabel *m_rxSnrLabel = nullptr;
     QLabel *m_txSpectrumStatus = nullptr;
     SpectrumWaterfallWidget *m_rxSpectrum = nullptr;
     SpectrumWaterfallWidget *m_txSpectrum = nullptr;

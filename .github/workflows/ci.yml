@@ -55,6 +55,25 @@ jobs:
       - name: Race-check filtered QPSK, 8PSK and 16QAM air paths
         run: go test -race ./internal/transport -run '^TestMAModulationTXFilteredRXAirpath$|^TestMAModulationTXFilteredRXWithAudioNoise$'
 
+  modem-characterization:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Run all-profile AWGN and audio-IF sweep
+        env:
+          SATSSDV_CHARACTERIZATION: "1"
+          MODEM_REPORT_PATH: modem-characterization-report.md
+        run: go test -count=1 -v ./internal/transport -run '^TestModeNoiseAndOffsetCharacterization$'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-modem-characterization
+          path: modem-characterization-report.md
+          if-no-files-found: error
+
   qt-linux:
     runs-on: ubuntu-24.04
     steps:
