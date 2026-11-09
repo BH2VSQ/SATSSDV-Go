@@ -10,6 +10,7 @@
 #include <QFont>
 #include <QApplication>
 #include <QDateTime>
+#include <memory>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -182,12 +183,12 @@ private:
         if (m_movie) {
             m_movie->stop();
             setMovie(nullptr);
-            delete m_movie;
+            m_movie->deleteLater();
             m_movie = nullptr;
         }
         if (m_movieBuffer) {
             m_movieBuffer->close();
-            delete m_movieBuffer;
+            m_movieBuffer->deleteLater();
             m_movieBuffer = nullptr;
         }
         m_movieOriginalSize = QSize();
@@ -1929,6 +1930,7 @@ void MainWindow::refreshAlbum() {
         statusBar()->showMessage(uiText(QStringLiteral("读取相册失败：%1")).arg(error), 6000);
         return;
     }
+
     m_album = result.toArray();
     QList<QJsonObject> orderedAlbum;
     orderedAlbum.reserve(m_album.size());
@@ -1938,8 +1940,8 @@ void MainWindow::refreshAlbum() {
     });
 
     while (QLayoutItem *item = m_albumCardsLayout->takeAt(0)) {
+        const std::unique_ptr<QLayoutItem> ownedItem(item);
         if (QWidget *widget = item->widget()) widget->deleteLater();
-        delete item;
     }
 
     const int filter = m_albumFilter ? m_albumFilter->currentIndex() : 0;
@@ -1947,143 +1949,16 @@ void MainWindow::refreshAlbum() {
     const int columns = qBound(1, availableWidth / 210, 7);
     int visibleRow = 0;
     int visibleColumn = 0;
-
     for (const QJsonObject &record : orderedAlbum) {
         const QString type = record.value(QStringLiteral("type")).toString().toUpper();
-        if (filter == 1 && type != QStringLiteral("RX")) continue;
-        if (filter == 2 && type != QStringLiteral("TX")) continue;
-        const QString id = record.value(QStringLiteral("id")).toString();
-        if (id.isEmpty()) continue;
-
-        auto *card = new QFrame(m_albumCardsHost);
-        card->setMinimumWidth(198);
-        card->setMaximumWidth(260);
-        card->setStyleSheet(QStringLiteral("QFrame { background:#f8f9fa; border:1px solid #c4cbd0; }"));
-        auto *cardLayout = new QVBoxLayout(card);
-        cardLayout->setContentsMargins(6, 6, 6, 6);
-        cardLayout->setSpacing(4);
-
-        auto *thumb = new QPushButton(card);
-        thumb->setMinimumHeight(112);
-        thumb->setMaximumHeight(135);
-        thumb->setCursor(Qt::PointingHandCursor);
-        thumb->setStyleSheet(QStringLiteral("QPushButton { background:#ffffff; border:1px solid #d0d6da; padding:1px; }"));
-        thumb->setText(uiText(QStringLiteral("正在读取图像…")));
-        cardLayout->addWidget(thumb);
-        QPointer<QPushButton> safeThumb(thumb);
-        m_backend->call(QStringLiteral("GetAlbumImageData"), QJsonArray{id}, [this, safeThumb](bool ok, const QJsonValue &value, const QString &) {
-            if (!safeThumb || !ok) return;
-            const QString dataUrl = value.toString();
-            const QImage thumbnail = imageFromDataUrl(dataUrl);
-            if (thumbnail.isNull()) {
-                safeThumb->setText(uiText(QStringLiteral("图像预览不可用")));
-                return;
-            }
-            safeThumb->setProperty("imageDataUrl", dataUrl);
-            safeThumb->setText(QString());
-            safeThumb->setIcon(QIcon(QPixmap::fromImage(thumbnail).scaled(220, 128, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
-            safeThumb->setIconSize(QSize(220, 128));
-        });
-        connect(thumb, &QPushButton::clicked, this, [this, id, thumb]() {
-            auto showPreview = [this](const QString &dataUrl) {
-                const QImage previewImage = imageFromDataUrl(dataUrl);
-                if (previewImage.isNull()) { statusBar()->showMessage(uiText(QStringLiteral("无法解码相册图像")), 6000); return; }
-                QDialog preview(this);
-                const bool animatedGIF = dataUrl.startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive);
-                preview.setWindowTitle(animatedGIF ? uiText(QStringLiteral("GIF 动图预览")) : uiText(QStringLiteral("图像预览")));
-                auto *layout = new QVBoxLayout(&preview);
-                auto *label = new QLabel(&preview);
-                label->setAlignment(Qt::AlignCenter);
-                layout->addWidget(label);
-
-                if (animatedGIF) {
-                    auto *buffer = new QBuffer(&preview);
-                    buffer->setData(imageDataUrlBytes(dataUrl));
-                    if (buffer->open(QIODevice::ReadOnly)) {
-                        auto *movie = new QMovie(buffer, QByteArrayLiteral("gif"), &preview);
-                        movie->setScaledSize(previewImage.size().scaled(QSize(1200, 850), Qt::KeepAspectRatio));
-                        if (movie->jumpToFrame(0) && movie->isValid()) {
-                            label->setMovie(movie);
-                            movie->start();
-                        } else {
-                            label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-                        }
-                    } else {
-                        label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-                    }
-                } else {
-                    label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-                }
-                preview.resize(qMin(1260, previewImage.width() + 40), qMin(920, previewImage.height() + 80));
-                preview.exec();
-            };
-            const QString cached = thumb->property("imageDataUrl").toString();
-            if (!cached.isEmpty()) { showPreview(cached); return; }
-            m_backend->call(QStringLiteral("GetAlbumImageData"), QJsonArray{id}, [this, showPreview](bool ok, const QJsonValue &value, const QString &error) {
-                if (!ok) { statusBar()->showMessage(error, 6000); return; }
-                showPreview(value.toString());
-            });
-        });
-
-        auto *badge = new QLabel(type == QStringLiteral("RX") ? QStringLiteral("RX · RECEIVED") : QStringLiteral("TX · SENT"), card);
-        badge->setStyleSheet(type == QStringLiteral("RX")
-            ? QStringLiteral("background:#dcecf3; border:1px solid #a7c6d5; color:#315c70; padding:2px 5px; font-size:8pt; font-weight:700;")
-            : QStringLiteral("background:#f7eddb; border:1px solid #ddc99f; color:#8a6732; padding:2px 5px; font-size:8pt; font-weight:700;"));
-        badge->setMaximumWidth(110);
-        cardLayout->addWidget(badge, 0, Qt::AlignLeft);
-
-        const QString profile = record.value(QStringLiteral("profile")).toString();
-        auto *name = new QLabel(profile, card);
-        name->setStyleSheet(QStringLiteral("font-size:9pt; font-weight:700; color:#344b58;"));
-        name->setWordWrap(true);
-        cardLayout->addWidget(name);
-
-        QDateTime created = QDateTime::fromString(record.value(QStringLiteral("createdAt")).toString(), Qt::ISODateWithMs);
-        if (!created.isValid()) created = QDateTime::fromString(record.value(QStringLiteral("createdAt")).toString(), Qt::ISODate);
-        const QString timeText = created.isValid() ? created.toLocalTime().toString(QStringLiteral("yyyy/MM/dd HH:mm:ss")) : record.value(QStringLiteral("createdAt")).toString();
-        const QString callsign = valueOr(record, QStringLiteral("callsign"), QStringLiteral("---"));
-        const QString packets = QStringLiteral("%1/%2").arg(record.value(QStringLiteral("packetsReceived")).toInt()).arg(record.value(QStringLiteral("packetsExpected")).toInt());
-        const QString quality = valueOr(record, QStringLiteral("quality"), QStringLiteral("-"));
-        const QString dimensions = QStringLiteral("%1×%2").arg(record.value(QStringLiteral("imageWidth")).toInt()).arg(record.value(QStringLiteral("imageHeight")).toInt());
-        auto *metadata = new QLabel(QStringLiteral("%1\n%2 · ID %3 · %4 · %5 · %6")
-            .arg(timeText, callsign)
-            .arg(record.value(QStringLiteral("imageId")).toInt())
-            .arg(dimensions, packets, record.value(QStringLiteral("status")).toString()), card);
-        metadata->setWordWrap(true);
-        metadata->setStyleSheet(QStringLiteral("font-size:8pt; color:#74808a;"));
-        cardLayout->addWidget(metadata);
-        if (quality != QStringLiteral("-")) {
-            auto *qualityLabel = new QLabel(uiText(QStringLiteral("质量：%1")).arg(quality), card);
-            qualityLabel->setStyleSheet(QStringLiteral("font-size:8pt; color:#89939b;"));
-            cardLayout->addWidget(qualityLabel);
+        if ((filter == 1 && type != QStringLiteral("RX")) ||
+            (filter == 2 && type != QStringLiteral("TX"))) continue;
+        if (record.value(QStringLiteral("id")).toString().isEmpty()) continue;
+        m_albumCardsLayout->addWidget(createAlbumCard(record), visibleRow, visibleColumn);
+        if (++visibleColumn >= columns) {
+            visibleColumn = 0;
+            ++visibleRow;
         }
-
-        auto *actions = new QHBoxLayout();
-        auto *exportButton = new QPushButton(uiText(QStringLiteral("导出文件")), card);
-        auto *deleteButton = new QPushButton(uiText(QStringLiteral("删除记录")), card);
-        deleteButton->setProperty("role", "danger");
-        actions->addWidget(exportButton);
-        actions->addStretch();
-        actions->addWidget(deleteButton);
-        cardLayout->addLayout(actions);
-        connect(exportButton, &QPushButton::clicked, this, [this, id]() {
-            const QString dir = QFileDialog::getExistingDirectory(this, uiText(QStringLiteral("导出图像")), QStandardPaths::writableLocation(QStandardPaths::PicturesLocation));
-            if (dir.isEmpty()) return;
-            m_backend->call(QStringLiteral("ExportAlbumRecordToDirectory"), QJsonArray{id, dir}, [this](bool ok, const QJsonValue &, const QString &error) {
-                if (ok) statusBar()->showMessage(uiText(QStringLiteral("相册图像已导出")), 4000);
-                else showError(error);
-            });
-        });
-        connect(deleteButton, &QPushButton::clicked, this, [this, id]() {
-            if (QMessageBox::question(this, uiText(QStringLiteral("删除图像记录")), uiText(QStringLiteral("确定删除所选相册记录吗？"))) != QMessageBox::Yes) return;
-            m_backend->call(QStringLiteral("DeleteAlbumRecord"), QJsonArray{id}, [this](bool ok, const QJsonValue &, const QString &error) {
-                if (ok) refreshAlbum(); else showError(error);
-            });
-        });
-
-        m_albumCardsLayout->addWidget(card, visibleRow, visibleColumn);
-        ++visibleColumn;
-        if (visibleColumn >= columns) { visibleColumn = 0; ++visibleRow; }
     }
 
     if (visibleRow == 0 && visibleColumn == 0) {
@@ -2096,6 +1971,167 @@ void MainWindow::refreshAlbum() {
     m_albumCardsLayout->setColumnStretch(columns, 1);
 }
 
+QWidget *MainWindow::createAlbumCard(const QJsonObject &record) {
+    const QString id = record.value(QStringLiteral("id")).toString();
+    const QString type = record.value(QStringLiteral("type")).toString().toUpper();
+    auto *card = new QFrame(m_albumCardsHost);
+    card->setMinimumWidth(198);
+    card->setMaximumWidth(260);
+    card->setStyleSheet(QStringLiteral("QFrame { background:#f8f9fa; border:1px solid #c4cbd0; }"));
+    auto *cardLayout = new QVBoxLayout(card);
+    cardLayout->setContentsMargins(6, 6, 6, 6);
+    cardLayout->setSpacing(4);
+
+    auto *thumb = new QPushButton(card);
+    thumb->setMinimumHeight(112);
+    thumb->setMaximumHeight(135);
+    thumb->setCursor(Qt::PointingHandCursor);
+    thumb->setStyleSheet(QStringLiteral("QPushButton { background:#ffffff; border:1px solid #d0d6da; padding:1px; }"));
+    thumb->setText(uiText(QStringLiteral("正在读取图像…")));
+    cardLayout->addWidget(thumb);
+    loadAlbumThumbnail(id, thumb);
+    connect(thumb, &QPushButton::clicked, this, [this, id, thumb] {
+        openAlbumRecordPreview(id, thumb);
+    });
+
+    auto *badge = new QLabel(type == QStringLiteral("RX") ? QStringLiteral("RX · RECEIVED") : QStringLiteral("TX · SENT"), card);
+    badge->setStyleSheet(type == QStringLiteral("RX")
+        ? QStringLiteral("background:#dcecf3; border:1px solid #a7c6d5; color:#315c70; padding:2px 5px; font-size:8pt; font-weight:700;")
+        : QStringLiteral("background:#f7eddb; border:1px solid #ddc99f; color:#8a6732; padding:2px 5px; font-size:8pt; font-weight:700;"));
+    badge->setMaximumWidth(110);
+    cardLayout->addWidget(badge, 0, Qt::AlignLeft);
+
+    auto *name = new QLabel(record.value(QStringLiteral("profile")).toString(), card);
+    name->setStyleSheet(QStringLiteral("font-size:9pt; font-weight:700; color:#344b58;"));
+    name->setWordWrap(true);
+    cardLayout->addWidget(name);
+    addAlbumCardMetadata(card, cardLayout, record);
+    addAlbumCardActions(card, cardLayout, id);
+    return card;
+}
+
+void MainWindow::loadAlbumThumbnail(const QString &id, QPushButton *thumb) {
+    QPointer<QPushButton> safeThumb(thumb);
+    m_backend->call(QStringLiteral("GetAlbumImageData"), QJsonArray{id}, [this, safeThumb](bool ok, const QJsonValue &value, const QString &) {
+        if (!safeThumb || !ok) return;
+        const QString dataUrl = value.toString();
+        const QImage thumbnail = imageFromDataUrl(dataUrl);
+        if (thumbnail.isNull()) {
+            safeThumb->setText(uiText(QStringLiteral("图像预览不可用")));
+            return;
+        }
+        safeThumb->setProperty("imageDataUrl", dataUrl);
+        safeThumb->setText(QString());
+        safeThumb->setIcon(QIcon(QPixmap::fromImage(thumbnail).scaled(220, 128, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+        safeThumb->setIconSize(QSize(220, 128));
+    });
+}
+
+void MainWindow::showAlbumPreview(const QString &dataUrl) {
+    const QImage previewImage = imageFromDataUrl(dataUrl);
+    if (previewImage.isNull()) {
+        statusBar()->showMessage(uiText(QStringLiteral("无法解码相册图像")), 6000);
+        return;
+    }
+    QDialog preview(this);
+    const bool animatedGIF = dataUrl.startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive);
+    preview.setWindowTitle(animatedGIF ? uiText(QStringLiteral("GIF 动图预览")) : uiText(QStringLiteral("图像预览")));
+    auto *layout = new QVBoxLayout(&preview);
+    auto *label = new QLabel(&preview);
+    label->setAlignment(Qt::AlignCenter);
+    layout->addWidget(label);
+
+    if (animatedGIF) {
+        auto *buffer = new QBuffer(&preview);
+        buffer->setData(imageDataUrlBytes(dataUrl));
+        if (buffer->open(QIODevice::ReadOnly)) {
+            auto *movie = new QMovie(buffer, QByteArrayLiteral("gif"), &preview);
+            movie->setScaledSize(previewImage.size().scaled(QSize(1200, 850), Qt::KeepAspectRatio));
+            if (movie->jumpToFrame(0) && movie->isValid()) {
+                label->setMovie(movie);
+                movie->start();
+            } else {
+                label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            }
+        } else {
+            label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        }
+    } else {
+        label->setPixmap(QPixmap::fromImage(previewImage).scaled(1200, 850, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }
+    preview.resize(qMin(1260, previewImage.width() + 40), qMin(920, previewImage.height() + 80));
+    preview.exec();
+}
+
+void MainWindow::openAlbumRecordPreview(const QString &id, QPushButton *thumb) {
+    const QString cached = thumb ? thumb->property("imageDataUrl").toString() : QString();
+    if (!cached.isEmpty()) {
+        showAlbumPreview(cached);
+        return;
+    }
+    m_backend->call(QStringLiteral("GetAlbumImageData"), QJsonArray{id}, [this](bool ok, const QJsonValue &value, const QString &error) {
+        if (!ok) {
+            statusBar()->showMessage(error, 6000);
+            return;
+        }
+        showAlbumPreview(value.toString());
+    });
+}
+
+void MainWindow::addAlbumCardMetadata(QWidget *card, QVBoxLayout *layout, const QJsonObject &record) {
+    QDateTime created = QDateTime::fromString(record.value(QStringLiteral("createdAt")).toString(), Qt::ISODateWithMs);
+    if (!created.isValid()) created = QDateTime::fromString(record.value(QStringLiteral("createdAt")).toString(), Qt::ISODate);
+    const QString timeText = created.isValid()
+        ? created.toLocalTime().toString(QStringLiteral("yyyy/MM/dd HH:mm:ss"))
+        : record.value(QStringLiteral("createdAt")).toString();
+    const QString callsign = valueOr(record, QStringLiteral("callsign"), QStringLiteral("---"));
+    const QString packets = QStringLiteral("%1/%2").arg(record.value(QStringLiteral("packetsReceived")).toInt())
+        .arg(record.value(QStringLiteral("packetsExpected")).toInt());
+    const QString quality = valueOr(record, QStringLiteral("quality"), QStringLiteral("-"));
+    const QString dimensions = QStringLiteral("%1×%2").arg(record.value(QStringLiteral("imageWidth")).toInt())
+        .arg(record.value(QStringLiteral("imageHeight")).toInt());
+    auto *metadata = new QLabel(QStringLiteral("%1\n%2 · ID %3 · %4 · %5 · %6")
+        .arg(timeText, callsign).arg(record.value(QStringLiteral("imageId")).toInt())
+        .arg(dimensions, packets, record.value(QStringLiteral("status")).toString()), card);
+    metadata->setWordWrap(true);
+    metadata->setStyleSheet(QStringLiteral("font-size:8pt; color:#74808a;"));
+    layout->addWidget(metadata);
+    if (quality != QStringLiteral("-")) {
+        auto *qualityLabel = new QLabel(uiText(QStringLiteral("质量：%1")).arg(quality), card);
+        qualityLabel->setStyleSheet(QStringLiteral("font-size:8pt; color:#89939b;"));
+        layout->addWidget(qualityLabel);
+    }
+}
+
+void MainWindow::addAlbumCardActions(QWidget *card, QVBoxLayout *layout, const QString &id) {
+    auto *actions = new QHBoxLayout();
+    auto *exportButton = new QPushButton(uiText(QStringLiteral("导出文件")), card);
+    auto *deleteButton = new QPushButton(uiText(QStringLiteral("删除记录")), card);
+    deleteButton->setProperty("role", "danger");
+    actions->addWidget(exportButton);
+    actions->addStretch();
+    actions->addWidget(deleteButton);
+    layout->addLayout(actions);
+    connect(exportButton, &QPushButton::clicked, this, [this, id] {
+        const QString dir = QFileDialog::getExistingDirectory(this, uiText(QStringLiteral("导出图像")),
+            QStandardPaths::writableLocation(QStandardPaths::PicturesLocation));
+        if (dir.isEmpty()) return;
+        m_backend->call(QStringLiteral("ExportAlbumRecordToDirectory"), QJsonArray{id, dir},
+            [this](bool ok, const QJsonValue &, const QString &error) {
+                if (ok) statusBar()->showMessage(uiText(QStringLiteral("相册图像已导出")), 4000);
+                else showError(error);
+            });
+    });
+    connect(deleteButton, &QPushButton::clicked, this, [this, id] {
+        if (QMessageBox::question(this, uiText(QStringLiteral("删除图像记录")),
+            uiText(QStringLiteral("确定删除所选相册记录吗？"))) != QMessageBox::Yes) return;
+        m_backend->call(QStringLiteral("DeleteAlbumRecord"), QJsonArray{id},
+            [this](bool ok, const QJsonValue &, const QString &error) {
+                if (ok) refreshAlbum(); else showError(error);
+            });
+    });
+}
+
 void MainWindow::pollEvents() {
     if(!m_backend->isRunning())return;
     m_backend->pollEvents(m_eventSequence,[this](const QJsonArray &events,quint64 next,bool reset,const QString &error){
@@ -2105,9 +2141,38 @@ void MainWindow::pollEvents() {
 }
 
 void MainWindow::handleEvent(const QJsonObject &event) {
-    const QString name=event.value(QStringLiteral("name")).toString(); const QJsonValue payloadValue=event.value(QStringLiteral("payload"));
-    if(name==QStringLiteral("rx:image")){
-        const auto payload=payloadValue.toObject();
+    const QString name = event.value(QStringLiteral("name")).toString();
+    const QJsonValue payload = event.value(QStringLiteral("payload"));
+    if (name == QStringLiteral("rx:image")) {
+        handleRXImageEvent(payload.toObject());
+    } else if (name == QStringLiteral("rx:diagnostics")) {
+        handleRXDiagnosticsEvent(payload.toObject());
+    } else if (name == QStringLiteral("rx:decoder-error")) {
+        const auto details = payload.toObject();
+        const QString error = details.value(QStringLiteral("error")).toString();
+        statusBar()->showMessage(uiText(QStringLiteral("RX 解码器发生异常，已重置并继续监听：%1")).arg(error), 10000);
+        appendLog(uiText(QStringLiteral("RX decoder recovered from error: %1")).arg(error));
+    } else if (name == QStringLiteral("rx:level")) {
+        handleRXLevelEvent(payload.toObject());
+    } else if (name == QStringLiteral("rx:spectrum") || name == QStringLiteral("tx:spectrum")) {
+        handleSpectrumEvent(name, payload.toArray());
+    } else if (name == QStringLiteral("tx:progress")) {
+        m_txProgress->setValue(static_cast<int>(payload.toDouble() * 1000.0));
+    } else if (name == QStringLiteral("tx:metrics")) {
+        handleTXMetricsEvent(payload.toObject());
+    } else if (name == QStringLiteral("tx:state")) {
+        handleTXStateEvent(payload.toObject());
+    } else if (name == QStringLiteral("tx:tone-state")) {
+        m_txToneActive = payload.toObject().value(QStringLiteral("active")).toBool();
+        updateTXToggle();
+    } else if (name == QStringLiteral("tx:status")) {
+        handleTXStatusEvent(payload.toObject());
+    } else if (name.endsWith(QStringLiteral(":error")) || name == QStringLiteral("ptt:error") || name == QStringLiteral("audio:error")) {
+        showError(payload.isString() ? payload.toString() : QJsonDocument(payload.toObject()).toJson(QJsonDocument::Compact));
+    }
+}
+
+void MainWindow::handleRXImageEvent(const QJsonObject &payload) {
         const bool hasPreview = payload.value(QStringLiteral("hasPreview")).toBool();
         const bool gifStart = payload.value(QStringLiteral("gifStart")).toBool();
         const bool gifEnd = payload.value(QStringLiteral("gifEnd")).toBool();
@@ -2185,8 +2250,9 @@ void MainWindow::handleEvent(const QJsonObject &event) {
             statusBar()->showMessage(uiText(QStringLiteral("GIF 部分接收内容已自动保存到相册")), 3500);
         }
         if (gifMode ? gifSaved || gifEnd : complete) refreshAlbum();
-    } else if(name==QStringLiteral("rx:diagnostics")){
-        const auto p=payloadValue.toObject();
+}
+
+void MainWindow::handleRXDiagnosticsEvent(const QJsonObject &p) {
         const auto manager=p.value(QStringLiteral("manager")).toObject();
         const auto decoder=p.value(QStringLiteral("decoder")).toObject();
         QString modemState=QStringLiteral("N/A");
@@ -2255,13 +2321,10 @@ void MainWindow::handleEvent(const QJsonObject &event) {
             .arg(manager.value(QStringLiteral("processedPackets")).toInteger())
             .arg(buffered).arg(reacquires).arg(gifDetails).arg(fecError).arg(p.value(QStringLiteral("lastError")).toString());
         m_rxDiagnostics->setToolTip(tip);
-    } else if(name==QStringLiteral("rx:decoder-error")){
-        const auto p=payloadValue.toObject();
-        const QString error=p.value(QStringLiteral("error")).toString();
-        statusBar()->showMessage(uiText(QStringLiteral("RX 解码器发生异常，已重置并继续监听：%1")).arg(error),10000);
-        appendLog(uiText(QStringLiteral("RX decoder recovered from error: %1")).arg(error));
-    } else if(name==QStringLiteral("rx:level")){
-        const auto p=payloadValue.toObject();m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
+}
+
+void MainWindow::handleRXLevelEvent(const QJsonObject &p) {
+m_rxStatus->setToolTip(QStringLiteral("RMS %1 dBFS · Peak %2").arg(p.value(QStringLiteral("rmsDbfs")).toDouble(),0,'f',1).arg(p.value(QStringLiteral("peak")).toDouble(),0,'f',3));
         if (m_rxSnrLabel) {
             if (p.value(QStringLiteral("snrValid")).toBool()) {
                 const QString method = p.value(QStringLiteral("snrReason")).toString();
@@ -2294,65 +2357,68 @@ void MainWindow::handleEvent(const QJsonObject &event) {
                 }
             }
         }
-    } else if(name==QStringLiteral("rx:spectrum")||name==QStringLiteral("tx:spectrum")){
-        const auto bins=payloadValue.toArray(); if(!bins.isEmpty()){
-            SpectrumWaterfallWidget *target = name.startsWith(QStringLiteral("rx")) ? m_rxSpectrum : m_txSpectrum;
-            QLabel *status = name.startsWith(QStringLiteral("rx")) ? m_rxSpectrumStatus : m_txSpectrumStatus;
-            target->pushBins(bins);
-            double peak=-120.0;int peakHz=0;for(const auto &b:bins){const auto o=b.toObject();const double db=o.value(QStringLiteral("magnitudeDbfs")).toDouble(-120);if(db>peak){peak=db;peakHz=o.value(QStringLiteral("frequencyHz")).toInt();}}
-            status->setText(uiText(QStringLiteral("%1 bins · 峰值 %2 dBFS @ %3 Hz")).arg(bins.size()).arg(peak,0,'f',1).arg(peakHz));
+}
+
+void MainWindow::handleSpectrumEvent(const QString &name, const QJsonArray &bins) {
+    if (bins.isEmpty()) return;
+    SpectrumWaterfallWidget *target = name.startsWith(QStringLiteral("rx")) ? m_rxSpectrum : m_txSpectrum;
+    QLabel *status = name.startsWith(QStringLiteral("rx")) ? m_rxSpectrumStatus : m_txSpectrumStatus;
+    target->pushBins(bins);
+    double peak = -120.0;
+    int peakHz = 0;
+    for (const auto &bin : bins) {
+        const auto item = bin.toObject();
+        const double db = item.value(QStringLiteral("magnitudeDbfs")).toDouble(-120);
+        if (db > peak) {
+            peak = db;
+            peakHz = item.value(QStringLiteral("frequencyHz")).toInt();
         }
-    } else if(name==QStringLiteral("tx:progress")){
-        m_txProgress->setValue(static_cast<int>(payloadValue.toDouble()*1000.0));
-    } else if(name==QStringLiteral("tx:metrics")){
-        const auto p = payloadValue.toObject();
-        const QString estimated = formatTXDuration(p.value(QStringLiteral("estimatedSeconds")).toInteger());
-        const QString elapsed = formatTXDuration(p.value(QStringLiteral("elapsedSeconds")).toInteger());
-        const QString remaining = formatTXDuration(p.value(QStringLiteral("remainingSeconds")).toInteger());
-        const qint64 sent = qMax<qint64>(0, p.value(QStringLiteral("sentDataFrames")).toInteger());
-        const qint64 total = qMax<qint64>(0, p.value(QStringLiteral("totalDataFrames")).toInteger());
-        m_txMetrics->setText(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
-            .arg(estimated, elapsed, remaining).arg(sent).arg(total));
-    } else if(name==QStringLiteral("tx:state")){
-        m_txActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
-        if (m_txSpectrum) m_txSpectrum->setStreaming(m_txActive);
-        if (!m_txActive) m_txCountdownActive = false;
-        updateRepeatControls();
-        updateTXToggle();
-        if(!m_txActive){
-            m_txProgress->setValue(0);
-            m_txMetrics->setText(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
-                .arg(QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("0"), QStringLiteral("0")));
-            refreshAlbum();
-        }
-    } else if(name==QStringLiteral("tx:tone-state")){
-        m_txToneActive = payloadValue.toObject().value(QStringLiteral("active")).toBool();
-        updateTXToggle();
-    } else if(name==QStringLiteral("tx:status")){
-        const auto p=payloadValue.toObject();
-        const QString phase=p.value(QStringLiteral("phase")).toString();
-        if (phase == QStringLiteral("countdown") && m_repeat && m_repeat->isChecked()) {
-            m_txCountdownActive = true;
-            updateRepeatControls();
-            const int remaining = qMax(0, p.value(QStringLiteral("remainingSeconds")).toInt());
-            m_repeatInterval->setValue(remaining);
-            statusBar()->showMessage(uiText(QStringLiteral("循环发射倒计时：%1 秒")).arg(remaining));
-        } else if (phase == QStringLiteral("sending") || phase == QStringLiteral("completed")) {
-            // Keep the display at zero during transmission. When a burst
-            // finishes, TX waterfall enters idle-scroll mode and clears old
-            // rows during the inter-cycle countdown.
-            m_txCountdownActive = false;
-            if (m_txSpectrum) m_txSpectrum->setStreaming(phase == QStringLiteral("sending"));
-            updateRepeatControls();
-        } else if (phase == QStringLiteral("cancelled")) {
-            m_txCountdownActive = false;
-            m_repeatInterval->setValue(m_repeatIntervalSeconds);
-            updateRepeatControls();
-        }
-        appendLog(QStringLiteral("TX: ")+QJsonDocument(p).toJson(QJsonDocument::Compact));
-    } else if(name.endsWith(QStringLiteral(":error"))||name==QStringLiteral("ptt:error")||name==QStringLiteral("audio:error")){
-        showError(payloadValue.isString()?payloadValue.toString():QJsonDocument(payloadValue.toObject()).toJson(QJsonDocument::Compact));
     }
+    status->setText(uiText(QStringLiteral("%1 bins · 峰值 %2 dBFS @ %3 Hz")).arg(bins.size()).arg(peak, 0, 'f', 1).arg(peakHz));
+}
+
+void MainWindow::handleTXMetricsEvent(const QJsonObject &p) {
+    const QString estimated = formatTXDuration(p.value(QStringLiteral("estimatedSeconds")).toInteger());
+    const QString elapsed = formatTXDuration(p.value(QStringLiteral("elapsedSeconds")).toInteger());
+    const QString remaining = formatTXDuration(p.value(QStringLiteral("remainingSeconds")).toInteger());
+    const qint64 sent = qMax<qint64>(0, p.value(QStringLiteral("sentDataFrames")).toInteger());
+    const qint64 total = qMax<qint64>(0, p.value(QStringLiteral("totalDataFrames")).toInteger());
+    m_txMetrics->setText(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
+        .arg(estimated, elapsed, remaining).arg(sent).arg(total));
+}
+
+void MainWindow::handleTXStateEvent(const QJsonObject &p) {
+    m_txActive = p.value(QStringLiteral("active")).toBool();
+    if (m_txSpectrum) m_txSpectrum->setStreaming(m_txActive);
+    if (!m_txActive) m_txCountdownActive = false;
+    updateRepeatControls();
+    updateTXToggle();
+    if (!m_txActive) {
+        m_txProgress->setValue(0);
+        m_txMetrics->setText(uiText(QStringLiteral("预计 %1 · 已发射 %2 · 剩余 %3 · 数据帧 %4 / %5"))
+            .arg(QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("00:00:00"), QStringLiteral("0"), QStringLiteral("0")));
+        refreshAlbum();
+    }
+}
+
+void MainWindow::handleTXStatusEvent(const QJsonObject &p) {
+    const QString phase = p.value(QStringLiteral("phase")).toString();
+    if (phase == QStringLiteral("countdown") && m_repeat && m_repeat->isChecked()) {
+        m_txCountdownActive = true;
+        updateRepeatControls();
+        const int remaining = qMax(0, p.value(QStringLiteral("remainingSeconds")).toInt());
+        m_repeatInterval->setValue(remaining);
+        statusBar()->showMessage(uiText(QStringLiteral("循环发射倒计时：%1 秒")).arg(remaining));
+    } else if (phase == QStringLiteral("sending") || phase == QStringLiteral("completed")) {
+        m_txCountdownActive = false;
+        if (m_txSpectrum) m_txSpectrum->setStreaming(phase == QStringLiteral("sending"));
+        updateRepeatControls();
+    } else if (phase == QStringLiteral("cancelled")) {
+        m_txCountdownActive = false;
+        m_repeatInterval->setValue(m_repeatIntervalSeconds);
+        updateRepeatControls();
+    }
+    appendLog(QStringLiteral("TX: ") + QJsonDocument(p).toJson(QJsonDocument::Compact));
 }
 
 void MainWindow::startRX() {

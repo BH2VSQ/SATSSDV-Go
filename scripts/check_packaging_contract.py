@@ -34,18 +34,26 @@ if not README.is_file():
     errors.append("Windows portable package README is missing")
 if "aislop@0.20.0" not in WORKFLOW or "aislop ci" not in WORKFLOW:
     errors.append("CI workflow must run the pinned Aislop 0.20.0 quality gate")
-if "SATSSDV-Go-aislop-code-analysis" not in WORKFLOW or "generate_aislop_report.py" not in WORKFLOW:
-    errors.append("CI workflow must preserve the raw Aislop JSON and generate a Markdown report")
+if "SATSSDV-Go-report-input-aislop" not in WORKFLOW or "generate_aislop_report.py" not in WORKFLOW:
+    errors.append("CI workflow must preserve raw Aislop JSON and generate its Markdown report")
 if "qex-itu-channel-regression" not in WORKFLOW or "TestSatelliteChannelSensitivityCharacterization" not in WORKFLOW:
     errors.append("CI workflow must run the QEX/ITU production-path channel sweep")
-if "SATSSDV-Go-QEX-ITU-Channel-Report" not in WORKFLOW or "generate_qex_report.py" not in WORKFLOW:
-    errors.append("CI workflow must publish the QEX/ITU Markdown, CSV, JSON and PNG report")
+if "SATSSDV-Go-report-input-qex" not in WORKFLOW or "generate_qex_report.py" not in WORKFLOW:
+    errors.append("CI workflow must preserve the all-profile QEX/ITU Markdown, CSV, JSON and PNG report inputs")
+if "SATSSDV-Go-Complete-CI-Reports" not in WORKFLOW or "package_ci_reports.py" not in WORKFLOW:
+    errors.append("CI workflow must publish one unified ZIP containing Aislop, QEX/ITU and race reports")
 if "race-regression:" in WORKFLOW:
     errors.append("The standalone race-regression job must be replaced by the QEX/ITU regression job")
-if "SATSSDV-Go-race-log" not in WORKFLOW or "go test -race ./internal/rx" not in WORKFLOW:
-    errors.append("QEX/ITU regression must retain and publish the race detector evidence")
-if "  go-test:" in WORKFLOW:
-    errors.append("Go tests must be merged into each platform's native build job")
+if "SATSSDV-Go-report-input-qex" not in WORKFLOW or "go test -race ./internal/rx" not in WORKFLOW:
+    errors.append("QEX/ITU regression must retain race detector evidence in its unified report input")
+if "matrix.profile" in WORKFLOW or "SATSSDV_CHANNEL_PROFILE" in WORKFLOW:
+    errors.append("QEX/ITU profile tests must run in one job, not a per-profile matrix")
+if "SATSSDV_CHANNEL_CSV: ${{ github.workspace }}/reports/channel/channel-all-profiles.csv" not in WORKFLOW:
+    errors.append("QEX/ITU tests must aggregate every profile into one measurement CSV")
+if "go test -count=1 -timeout 100m -v ./internal/transport" not in WORKFLOW:
+    errors.append("the unified all-profile QEX/ITU sweep must use its explicit 100-minute test timeout")
+if "timeout-minutes: 120" not in WORKFLOW:
+    errors.append("the unified QEX/ITU job must allow enough time for the single all-profile sweep and race tests")
 for platform_job in ("qt-linux", "qt-windows", "qt-macos"):
     marker = f"  {platform_job}:\n"
     if marker not in WORKFLOW:

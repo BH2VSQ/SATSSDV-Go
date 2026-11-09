@@ -107,6 +107,8 @@ const Translation kTranslations[] = {
     {"GIF 已解码，但相册保存失败：%1", "GIF decoded, but saving to the album failed: %1", "GIF はデコードされましたが、アルバムへの保存に失敗しました: %1"},
     {"GIF 动图接收完成并已保存到相册（%1 帧）", "Animated GIF received and saved to the album (%1 frames)", "アニメーション GIF を受信し、アルバムに保存しました（%1 フレーム）"},
     {"GIF 接收中断，已保存可解码的部分动画（%1 帧）", "GIF reception stopped; decodable partial animation saved (%1 frames)", "GIF 受信が中断されました。デコード可能な部分アニメーションを保存しました（%1 フレーム）"},
+    {"加载接收 GIF 动图失败：", "Failed to load received GIF animation: ", "受信した GIF アニメーションの読み込みに失敗しました: "},
+    {"GIF 接收结束事件已到达，但后端尚未提供有效动画数据", "GIF reception completed, but the backend has not provided valid animation data", "GIF 受信完了イベントを受信しましたが、バックエンドから有効なアニメーションデータがまだ提供されていません"},
     {"GIF 部分接收内容已自动保存到相册", "Partial GIF reception was automatically saved to the album", "GIF の部分受信データをアルバムに自動保存しました"},
     {"帧不完整，继续重同步", "Frame incomplete; resynchronizing", "フレームが不完全です。再同期しています"},
     {"等待关键帧，增量帧仍继续接收", "Waiting for a keyframe; delta frames are still being received", "キーフレーム待機中。差分フレームの受信は継続しています"},

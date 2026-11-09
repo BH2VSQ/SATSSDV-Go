@@ -70,8 +70,8 @@ var satelliteChannelModes = []domain.TransportMode{
 }
 
 // TestSatelliteChannelSensitivityCharacterization uses the production stream
-// encoder and receiver. Set SATSSDV_CHANNEL_PROFILE to distribute the sweep
-// across CI matrix jobs; SATSSDV_CHANNEL_TRIALS controls deterministic trials.
+// encoder and receiver. An empty SATSSDV_CHANNEL_PROFILE runs all eight profiles
+// in one invocation; SATSSDV_CHANNEL_TRIALS controls deterministic trials.
 func TestSatelliteChannelSensitivityCharacterization(t *testing.T) {
 	if os.Getenv("SATSSDV_CHANNEL_TESTS") != "1" {
 		t.Skip("set SATSSDV_CHANNEL_TESTS=1 to run the QEX/ITU channel sweep")
@@ -113,6 +113,21 @@ func readChannelTrialCount(t *testing.T) int {
 		trials = parsed
 	}
 	return trials
+}
+
+func TestSelectedChannelModesDefaultsToAllProfiles(t *testing.T) {
+	modes, err := selectedChannelModes("")
+	if err != nil {
+		t.Fatalf("select default channel profiles: %v", err)
+	}
+	if len(modes) != len(satelliteChannelModes) {
+		t.Fatalf("default channel sweep selected %d profiles, want %d", len(modes), len(satelliteChannelModes))
+	}
+	for index, want := range satelliteChannelModes {
+		if modes[index] != want {
+			t.Fatalf("default profile %d = %q, want %q", index, modes[index], want)
+		}
+	}
 }
 
 func selectedChannelModes(filter string) ([]domain.TransportMode, error) {

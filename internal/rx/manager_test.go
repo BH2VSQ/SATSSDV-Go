@@ -573,7 +573,7 @@ func TestSSDVPreviewAttemptIsMadeForEveryValidPacket(t *testing.T) {
 }
 
 func TestGIFPacketsAreRoutedIntoDedicatedGIFDecoder(t *testing.T) {
-	raw, err := ssdv.NewGIFFrameControlPacket("N0CALL", 2, 320, 240, 4, 10, 0, true, false, true, false, true)
+	raw, err := ssdv.NewGIFFrameControlPacket(ssdv.GIFFrameControlOptions{Callsign: "N0CALL", ImageID: 2, Width: 320, Height: 240, Quality: 4, DelayCS: 10, FrameStart: true, StreamStart: true, Keyframe: true})
 	if err != nil {
 		t.Fatal(err)
 	}

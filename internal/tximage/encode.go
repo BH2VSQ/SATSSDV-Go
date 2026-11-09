@@ -55,19 +55,37 @@ func EncodeImage(src image.Image, profileID, quality, callsign string, imageID u
 // EncodeImageWithAX25 allows the UI to set the local source SSID and the
 // destination callsign used by AX.25. The values are ignored by CCSDS modes.
 func PrepareImagePackets(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int) (Prepared, error) {
-	return PrepareImagePacketsWithAX25(src, profileID, quality, callsign, imageID, outputSampleRate, 0, "CQ")
+	return PrepareImagePacketsWithOptions(src, PrepareOptions{
+		ProfileID: profileID, Quality: quality, Callsign: callsign, ImageID: imageID,
+		OutputSampleRate: outputSampleRate, Destination: "CQ",
+		FECProfile: transport.MARYFECBalanced,
+	})
 }
 
-// PrepareImagePacketsWithAX25 prepares encoded image packets and a persistent
-// transport encoder without materializing the full-duration audio waveform.
-// Call Encoder.StreamPackets to feed a bounded PCM consumer during TX.
-func PrepareImagePacketsWithAX25(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string) (Prepared, error) {
-	return PrepareImagePacketsWithAX25FEC(src, profileID, quality, callsign, imageID, outputSampleRate, sourceSSID, destination, transport.MARYFECBalanced)
+// PrepareOptions contains all packetization and link-layer settings for one
+// prepared image transmission.
+type PrepareOptions struct {
+	ProfileID        string
+	Quality          string
+	Callsign         string
+	ImageID          uint8
+	OutputSampleRate int
+	SourceSSID       uint8
+	Destination      string
+	FECProfile       int
 }
 
-// PrepareImagePacketsWithAX25FEC prepares a stream using an explicit M-ary
-// FEC policy. Non-M-ary profiles ignore the policy.
-func PrepareImagePacketsWithAX25FEC(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string, fecProfile int) (Prepared, error) {
+// PrepareImagePacketsWithOptions prepares packets using an explicit FEC policy.
+// Non-M-ary profiles ignore the policy.
+func PrepareImagePacketsWithOptions(src image.Image, options PrepareOptions) (Prepared, error) {
+	profileID := options.ProfileID
+	quality := options.Quality
+	callsign := options.Callsign
+	imageID := options.ImageID
+	outputSampleRate := options.OutputSampleRate
+	sourceSSID := options.SourceSSID
+	destination := options.Destination
+	fecProfile := options.FECProfile
 	var result Prepared
 	profile, err := domain.ParseProfile(profileID)
 	if err != nil {
@@ -132,7 +150,11 @@ func PrepareImagePacketsWithAX25FEC(src image.Image, profileID, quality, callsig
 // StreamPackets instead.
 func EncodeImageWithAX25(src image.Image, profileID, quality, callsign string, imageID uint8, outputSampleRate int, sourceSSID uint8, destination string) (Result, error) {
 	var result Result
-	prepared, err := PrepareImagePacketsWithAX25(src, profileID, quality, callsign, imageID, outputSampleRate, sourceSSID, destination)
+	prepared, err := PrepareImagePacketsWithOptions(src, PrepareOptions{
+		ProfileID: profileID, Quality: quality, Callsign: callsign, ImageID: imageID,
+		OutputSampleRate: outputSampleRate, SourceSSID: sourceSSID, Destination: destination,
+		FECProfile: transport.MARYFECBalanced,
+	})
 	if err != nil {
 		return result, err
 	}

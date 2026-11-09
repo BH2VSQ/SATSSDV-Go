@@ -71,55 +71,92 @@ func EstimateBandSNRWithTonePairEvidence(bins []SpectrumBin, signalLowHz, signal
 // EstimateBandSNRWithEvidence allows the caller to select the signal-shape
 // evidence expected for the modulation: wide occupied spectrum (one cluster)
 // or separated tone groups (e.g. AFSK mark/space).
-func EstimateBandSNRWithEvidence(bins []SpectrumBin, signalLowHz, signalHighHz float64, noiseBands []FrequencyBand, minClusterBins, minClusters int, minSeparationHz, minOccupiedBandwidthHz float64) BandSNR {
-	result := BandSNR{}
-	if minClusterBins < 1 || minClusters < 1 || !finiteSNR(minSeparationHz) || minSeparationHz < 0 || !finiteSNR(minOccupiedBandwidthHz) || minOccupiedBandwidthHz < 0 {
-		return result
-	}
-	if len(bins) < 16 || !finiteSNR(signalLowHz) || !finiteSNR(signalHighHz) ||
-		signalLowHz < 0 || signalHighHz <= signalLowHz || len(noiseBands) == 0 {
-		return result
-	}
+type noisePSD struct {
+	centre float64
+	mean   float64
+}
 
+func EstimateBandSNRWithEvidence(bins []SpectrumBin, signalLowHz, signalHighHz float64, noiseBands []FrequencyBand, minClusterBins, minClusters int, minSeparationHz, minOccupiedBandwidthHz float64) BandSNR {
+	if !validSNRDetectionParameters(signalLowHz, signalHighHz, noiseBands, minClusterBins, minClusters, minSeparationHz, minOccupiedBandwidthHz) {
+		return BandSNR{}
+	}
+	valid := validSpectrumPowerBins(bins)
+	if len(valid) < 16 {
+		return BandSNR{}
+	}
+	sort.Slice(valid, func(i, j int) bool { return valid[i].frequency < valid[j].frequency })
+	signal := selectSignalBins(valid, signalLowHz, signalHighHz)
+	if len(signal) < 8 {
+		return BandSNR{}
+	}
+	noiseEstimates := estimateGuardNoise(valid, noiseBands, signalLowHz, signalHighHz)
+	if len(noiseEstimates) == 0 {
+		return BandSNR{}
+	}
+	sort.Slice(noiseEstimates, func(i, j int) bool { return noiseEstimates[i].centre < noiseEstimates[j].centre })
+	predictedNoise, excessPower, expectedNoise, observedSignal, ok := predictSignalBandPower(signal, noiseEstimates)
+	if !ok {
+		return BandSNR{}
+	}
+	longestRun, clusters := signalEvidenceClusters(signal, predictedNoise, medianBinSpacing(valid), minClusterBins)
+	separatedClusters := separatedEvidenceClusters(clusters, minSeparationHz)
+
+	result := BandSNR{
+		EvidenceClusters:      len(clusters),
+		EvidenceBins:          longestRun,
+		OccupiedBandwidth90Hz: occupiedBandwidth90(signal, excessPower),
+		NoiseFloorDBFS:        10 * math.Log10(math.Max(expectedNoise/float64(len(signal)), 1e-24)),
+		SignalBandDBFS:        10 * math.Log10(math.Max(observedSignal, 1e-24)),
+	}
+	if len(clusters) < minClusters || (minClusters > 1 && separatedClusters < minClusters-1) ||
+		result.OccupiedBandwidth90Hz < minOccupiedBandwidthHz || expectedNoise <= 0 || observedSignal <= expectedNoise {
+		return result
+	}
+	result.SNRDB = 10 * math.Log10((observedSignal-expectedNoise)/expectedNoise)
+	if !finiteSNR(result.SNRDB) || result.SNRDB < 3.0 {
+		return result
+	}
+	result.Valid = true
+	return result
+}
+
+func validSNRDetectionParameters(lowHz, highHz float64, noiseBands []FrequencyBand, minClusterBins, minClusters int, minSeparationHz, minOccupiedBandwidthHz float64) bool {
+	return minClusterBins >= 1 && minClusters >= 1 && finiteSNR(minSeparationHz) && minSeparationHz >= 0 &&
+		finiteSNR(minOccupiedBandwidthHz) && minOccupiedBandwidthHz >= 0 &&
+		finiteSNR(lowHz) && finiteSNR(highHz) && lowHz >= 0 && highHz > lowHz && len(noiseBands) > 0
+}
+
+func validSpectrumPowerBins(bins []SpectrumBin) []snrPowerBin {
 	valid := make([]snrPowerBin, 0, len(bins))
 	for _, bin := range bins {
 		if !finiteSNR(bin.FrequencyHz) || !finiteSNR(bin.MagnitudeDBFS) ||
 			bin.MagnitudeDBFS < -200 || bin.MagnitudeDBFS > 40 || bin.FrequencyHz < 0 {
 			continue
 		}
-		// Spectrum() reports amplitude in dBFS (20*log10(amplitude));
-		// converting with 10^(dB/10) yields the corresponding linear power.
 		power := math.Pow(10, bin.MagnitudeDBFS/10)
-		if !finiteSNR(power) || power <= 0 {
-			continue
+		if finiteSNR(power) && power > 0 {
+			valid = append(valid, snrPowerBin{frequency: bin.FrequencyHz, power: power})
 		}
-		valid = append(valid, snrPowerBin{frequency: bin.FrequencyHz, power: power})
 	}
-	if len(valid) < 16 {
-		return result
-	}
-	sort.Slice(valid, func(i, j int) bool { return valid[i].frequency < valid[j].frequency })
+	return valid
+}
 
+func selectSignalBins(valid []snrPowerBin, lowHz, highHz float64) []snrPowerBin {
 	signal := make([]snrPowerBin, 0, len(valid)/4)
 	for _, bin := range valid {
-		if bin.frequency >= signalLowHz && bin.frequency <= signalHighHz {
+		if bin.frequency >= lowHz && bin.frequency <= highHz {
 			signal = append(signal, bin)
 		}
 	}
-	if len(signal) < 8 {
-		return result
-	}
+	return signal
+}
 
-	type noiseEstimate struct {
-		centre float64
-		mean   float64
-	}
-	noiseEstimates := make([]noiseEstimate, 0, len(noiseBands))
+func estimateGuardNoise(valid []snrPowerBin, noiseBands []FrequencyBand, signalLowHz, signalHighHz float64) []noisePSD {
+	estimates := make([]noisePSD, 0, len(noiseBands))
 	for _, band := range noiseBands {
 		if !finiteSNR(band.LowHz) || !finiteSNR(band.HighHz) || band.LowHz < 0 || band.HighHz <= band.LowHz {
 			continue
 		}
-		// Guard bands must not overlap the modem passband.
 		if band.LowHz < signalHighHz && band.HighHz > signalLowHz {
 			continue
 		}
@@ -133,68 +170,62 @@ func EstimateBandSNRWithEvidence(bins []SpectrumBin, signalLowHz, signalHighHz f
 			continue
 		}
 		sort.Float64s(powers)
-		mid := len(powers) / 2
-		median := powers[mid]
+		median := powers[len(powers)/2]
 		if len(powers)%2 == 0 {
-			median = (powers[mid-1] + powers[mid]) / 2
+			middle := len(powers) / 2
+			median = (powers[middle-1] + powers[middle]) / 2
 		}
 		mean := median / math.Ln2
 		if finiteSNR(mean) && mean > 1e-24 {
-			noiseEstimates = append(noiseEstimates, noiseEstimate{centre: (band.LowHz + band.HighHz) / 2, mean: mean})
+			estimates = append(estimates, noisePSD{centre: (band.LowHz + band.HighHz) / 2, mean: mean})
 		}
 	}
-	if len(noiseEstimates) == 0 {
-		return result
-	}
-	sort.Slice(noiseEstimates, func(i, j int) bool { return noiseEstimates[i].centre < noiseEstimates[j].centre })
+	return estimates
+}
 
-	// With one guard, assume locally flat noise. With two or more guards,
-	// interpolate the log PSD between the nearest lower/upper guard estimates.
-	lower, upper := noiseEstimates[0], noiseEstimates[len(noiseEstimates)-1]
-	if len(noiseEstimates) == 1 {
+func predictSignalBandPower(signal []snrPowerBin, estimates []noisePSD) ([]float64, []float64, float64, float64, bool) {
+	lower, upper := estimates[0], estimates[len(estimates)-1]
+	if len(estimates) == 1 {
 		upper = lower
 	}
 	if lower.centre > upper.centre {
 		lower, upper = upper, lower
 	}
-
-	expectedNoise := 0.0
-	observedSignal := 0.0
-	longestRun, currentRun := 0, 0
-	clusters := make([]struct{ centre float64 }, 0, 8)
-	spacing := medianBinSpacing(valid)
 	predictedNoise := make([]float64, len(signal))
 	excessPower := make([]float64, len(signal))
+	expectedNoise, observedSignal := 0.0, 0.0
 	for i, bin := range signal {
 		predicted := lower.mean
-		if len(noiseEstimates) >= 2 && upper.centre > lower.centre {
+		if len(estimates) >= 2 && upper.centre > lower.centre {
 			t := (bin.frequency - lower.centre) / (upper.centre - lower.centre)
-			// Extrapolation is deliberately bounded: a guard band far from the
-			// occupied channel must not create an unbounded PSD correction.
 			t = math.Max(-0.5, math.Min(1.5, t))
 			predicted = math.Exp(math.Log(lower.mean) + t*(math.Log(upper.mean)-math.Log(lower.mean)))
 		}
 		if !finiteSNR(predicted) || predicted <= 0 {
-			return BandSNR{}
+			return nil, nil, 0, 0, false
 		}
 		predictedNoise[i] = predicted
 		excessPower[i] = math.Max(0, bin.power-predicted)
 		expectedNoise += predicted
 		observedSignal += bin.power
 	}
+	return predictedNoise, excessPower, expectedNoise, observedSignal, true
+}
 
-	// Build connected groups of bins that are at least 8 dB above the
-	// interpolated noise PSD. Windowed narrow tones have a short main lobe;
-	// they are rejected by the profile-specific minimum cluster width below.
-	currentRun = 0
+func signalEvidenceClusters(signal []snrPowerBin, predictedNoise []float64, spacing float64, minClusterBins int) (int, []float64) {
+	longestRun, currentRun := 0, 0
 	clusterStart, clusterEnd := 0.0, 0.0
+	clusters := make([]float64, 0, 8)
+	appendCluster := func() {
+		if currentRun >= minClusterBins {
+			clusters = append(clusters, (clusterStart+clusterEnd)/2)
+		}
+	}
 	for i, bin := range signal {
 		above := bin.power >= predictedNoise[i]*6.3095734448
 		if above {
 			if currentRun == 0 || (i > 0 && bin.frequency-signal[i-1].frequency > spacing*1.5) {
-				if currentRun >= minClusterBins {
-					clusters = append(clusters, struct{ centre float64 }{centre: (clusterStart + clusterEnd) / 2})
-				}
+				appendCluster()
 				currentRun = 0
 				clusterStart = bin.frequency
 			}
@@ -204,51 +235,25 @@ func EstimateBandSNRWithEvidence(bins []SpectrumBin, signalLowHz, signalHighHz f
 				longestRun = currentRun
 			}
 		} else if currentRun > 0 {
-			if currentRun >= minClusterBins {
-				clusters = append(clusters, struct{ centre float64 }{centre: (clusterStart + clusterEnd) / 2})
-			}
+			appendCluster()
 			currentRun = 0
 		}
 	}
-	if currentRun >= minClusterBins {
-		clusters = append(clusters, struct{ centre float64 }{centre: (clusterStart + clusterEnd) / 2})
-	}
+	appendCluster()
+	return longestRun, clusters
+}
 
-	separatedClusters := 0
-	for i := range clusters {
-		for j := i + 1; j < len(clusters); j++ {
-			if math.Abs(clusters[i].centre-clusters[j].centre) >= minSeparationHz {
-				separatedClusters++
+func separatedEvidenceClusters(centres []float64, minSeparationHz float64) int {
+	separated := 0
+	for i := range centres {
+		for j := i + 1; j < len(centres); j++ {
+			if math.Abs(centres[i]-centres[j]) >= minSeparationHz {
+				separated++
 				break
 			}
 		}
 	}
-	result.EvidenceClusters = len(clusters)
-	result.EvidenceBins = longestRun
-	result.OccupiedBandwidth90Hz = occupiedBandwidth90(signal, excessPower)
-	result.NoiseFloorDBFS = 10 * math.Log10(math.Max(expectedNoise/float64(len(signal)), 1e-24))
-	result.SignalBandDBFS = 10 * math.Log10(math.Max(observedSignal, 1e-24))
-
-	// A single spectral spike or unstructured noise is not enough to declare
-	// that a modem signal is present, even if the integrated ratio is large.
-	if len(clusters) < minClusters || (minClusters > 1 && separatedClusters < minClusters-1) ||
-		result.OccupiedBandwidth90Hz < minOccupiedBandwidthHz || expectedNoise <= 0 || observedSignal <= expectedNoise {
-		return result
-	}
-	signalOnly := observedSignal - expectedNoise
-	result.SNRDB = 10 * math.Log10(signalOnly/expectedNoise)
-	if !finiteSNR(result.SNRDB) {
-		return BandSNR{}
-	}
-	// Below roughly 3 dB, broad random noise fluctuations are too easily
-	// confused with a modem-shaped in-band feature in a single 85 ms FFT
-	// window. Keep the numeric estimate hidden until the signal is at least
-	// measurably above its interpolated local noise power.
-	if result.SNRDB < 3.0 {
-		return result
-	}
-	result.Valid = true
-	return result
+	return separated
 }
 
 func occupiedBandwidth90(signal []snrPowerBin, excess []float64) float64 {
@@ -374,125 +379,111 @@ func (t *BandSNRTracker) EstimateWithLock(bins []SpectrumBin, signalLowHz, signa
 // impulsive noise can occasionally produce a front-end lock. Conversely, a
 // valid but not-yet-decoded preamble must freeze the noise baseline.
 func (t *BandSNRTracker) EstimateWithEvidence(bins []SpectrumBin, signalLowHz, signalHighHz float64, signalHint, signalAcquired, packetValidated bool) BandSNR {
-	result := BandSNR{}
 	if t == nil || len(bins) < 16 || !finiteSNR(signalLowHz) || !finiteSNR(signalHighHz) ||
 		signalLowHz < 0 || signalHighHz <= signalLowHz {
-		return result
+		return BandSNR{}
 	}
+	frequencies, powers, bandPower, bandBins, valid := t.spectrumPowers(bins, signalLowHz, signalHighHz)
+	if !valid || bandBins < 8 {
+		return BandSNR{}
+	}
+	if bandPower < snrMinimumBaselinePower {
+		if !signalAcquired {
+			t.Reset()
+		}
+		return BandSNR{}
+	}
+	if !t.prepareNoiseProfile(frequencies, powers, signalHint, signalAcquired) {
+		return BandSNR{}
+	}
+	if t.frames < snrNoiseLearningFrames {
+		if signalHint {
+			return BandSNR{}
+		}
+		t.learnNoiseFrame(powers)
+		return BandSNR{}
+	}
+	if !signalHint {
+		t.updateIdleNoise(powers, frequencies, signalLowHz, signalHighHz)
+		return BandSNR{}
+	}
+	if !signalAcquired || !packetValidated {
+		return BandSNR{}
+	}
+	return t.calculateTrackedSNR(frequencies, powers, signalLowHz, signalHighHz)
+}
 
+func (t *BandSNRTracker) spectrumPowers(bins []SpectrumBin, lowHz, highHz float64) ([]float64, []float64, float64, int, bool) {
 	frequencies := make([]float64, len(bins))
 	powers := make([]float64, len(bins))
-	bandPower := 0.0
-	bandBins := 0
+	bandPower, bandBins := 0.0, 0
 	for i, bin := range bins {
 		if !finiteSNR(bin.FrequencyHz) || !finiteSNR(bin.MagnitudeDBFS) ||
 			bin.MagnitudeDBFS < -200 || bin.MagnitudeDBFS > 40 || bin.FrequencyHz < 0 {
 			t.Reset()
-			return result
+			return nil, nil, 0, 0, false
 		}
 		frequencies[i] = bin.FrequencyHz
 		powers[i] = math.Pow(10, bin.MagnitudeDBFS/10)
-		if !finiteSNR(powers[i]) || powers[i] <= 0 {
+		if !finiteSNR(powers[i]) || powers[i] <= 0 || (i > 0 && frequencies[i] <= frequencies[i-1]) {
 			t.Reset()
-			return result
+			return nil, nil, 0, 0, false
 		}
-		if i > 0 && frequencies[i] <= frequencies[i-1] {
-			t.Reset()
-			return result
-		}
-		if frequencies[i] >= signalLowHz && frequencies[i] <= signalHighHz {
+		if frequencies[i] >= lowHz && frequencies[i] <= highHz {
 			bandPower += powers[i]
 			bandBins++
 		}
 	}
-	if bandBins < 8 {
-		return result
-	}
-	if bandPower < snrMinimumBaselinePower {
-		// Do not turn a muted/zero-input interval into an unrealistically low
-		// noise reference. Keep the profile unready until real receiver noise is
-		// present, or discard a previously learned floor if the input disappeared.
-		if !signalAcquired {
-			t.Reset()
-		}
-		return result
-	}
+	return frequencies, powers, bandPower, bandBins, true
+}
 
+func (t *BandSNRTracker) prepareNoiseProfile(frequencies, powers []float64, signalHint, signalAcquired bool) bool {
 	if len(t.frequencies) != len(frequencies) || len(t.noisePower) != len(powers) {
-		t.frequencies = append(t.frequencies[:0], frequencies...)
-		t.noisePower = make([]float64, len(powers))
-		if !signalHint && !signalAcquired {
-			copy(t.noisePower, powers)
-			t.frames = 1
-		} else {
-			t.frames = 0
-		}
-		return result
+		t.resetNoiseProfile(frequencies, powers, signalHint, signalAcquired)
+		return false
 	}
 	for i := range frequencies {
 		if math.Abs(frequencies[i]-t.frequencies[i]) > 1e-6 {
-			t.frequencies = append(t.frequencies[:0], frequencies...)
-			t.noisePower = make([]float64, len(powers))
-			if !signalHint && !signalAcquired {
-				copy(t.noisePower, powers)
-				t.frames = 1
-			} else {
-				t.frames = 0
-			}
-			return result
+			t.resetNoiseProfile(frequencies, powers, signalHint, signalAcquired)
+			return false
 		}
 	}
+	return true
+}
 
-	if t.frames < snrNoiseLearningFrames {
-		if signalHint {
-			// Never teach a modem-like spectrum as idle noise, even before the
-			// decoder has acquired synchronization. A current window without the
-			// independent modem feature is eligible for noise learning even when
-			// an FSK/GMSK decoder retains a stale carrier-lock flag.
-			return result
-		}
-		t.frames++
-		for i, value := range powers {
-			t.noisePower[i] += (value - t.noisePower[i]) / float64(t.frames)
-		}
-		return result
+func (t *BandSNRTracker) resetNoiseProfile(frequencies, powers []float64, signalHint, signalAcquired bool) {
+	t.frequencies = append(t.frequencies[:0], frequencies...)
+	t.noisePower = make([]float64, len(powers))
+	if !signalHint && !signalAcquired {
+		copy(t.noisePower, powers)
+		t.frames = 1
+	} else {
+		t.frames = 0
 	}
+}
 
-	// Keep tracking actual idle-channel noise whenever the current spectrum
-	// no longer contains the modem feature. FSK/GMSK implementations can retain
-	// lock after PTT drops, so lock by itself must not freeze an old noise floor.
-	if !signalHint {
-		t.updateIdleNoise(powers, frequencies, signalLowHz, signalHighHz)
-		return result
+func (t *BandSNRTracker) learnNoiseFrame(powers []float64) {
+	t.frames++
+	for i, value := range powers {
+		t.noisePower[i] += (value - t.noisePower[i]) / float64(t.frames)
 	}
-	// A live numeric value requires the current-window spectral feature, modem
-	// synchronization and a recently CRC-validated packet. None alone is enough.
-	if !signalAcquired || !packetValidated {
-		// A previously valid packet is not evidence that the *current* FFT
-		// window still contains the wanted signal. Requiring both current
-		// spectral evidence and a recently CRC-validated packet suppresses a
-		// stale high SNR display after the receiver returns to idle noise.
-		return result
-	}
+}
 
-	signal := make([]snrPowerBin, 0, bandBins)
-	noise := make([]snrPowerBin, 0, bandBins)
+func (t *BandSNRTracker) calculateTrackedSNR(frequencies, powers []float64, lowHz, highHz float64) BandSNR {
+	signal := make([]snrPowerBin, 0, len(powers)/4)
+	noise := make([]snrPowerBin, 0, len(powers)/4)
 	for i, frequency := range frequencies {
-		if frequency >= signalLowHz && frequency <= signalHighHz {
+		if frequency >= lowHz && frequency <= highHz {
 			signal = append(signal, snrPowerBin{frequency: frequency, power: powers[i]})
 			noise = append(noise, snrPowerBin{frequency: frequency, power: t.noisePower[i]})
 		}
 	}
 	if len(signal) < 8 || len(noise) != len(signal) {
-		return result
+		return BandSNR{}
 	}
 
-	// The per-bin idle-noise profile is deliberately not scaled from spectral
-	// bins while a signal is active: M-ary sidebands can occupy the entire
-	// audio channel, so they are not an independent AGC reference.
 	const noiseGain = 1.0
-	expectedNoise := 0.0
-	observedPower := 0.0
+	expectedNoise, observedPower := 0.0, 0.0
 	excess := make([]float64, len(signal))
 	for i := range signal {
 		expected := noise[i].power * noiseGain
@@ -500,17 +491,16 @@ func (t *BandSNRTracker) EstimateWithEvidence(bins []SpectrumBin, signalLowHz, s
 		observedPower += signal[i].power
 		excess[i] = math.Max(0, signal[i].power-expected)
 	}
-	result.OccupiedBandwidth90Hz = occupiedBandwidth90(signal, excess)
-	result.NoiseFloorDBFS = 10 * math.Log10(math.Max(expectedNoise/float64(len(signal)), 1e-24))
-	result.SignalBandDBFS = 10 * math.Log10(math.Max(observedPower, 1e-24))
+	result := BandSNR{
+		OccupiedBandwidth90Hz: occupiedBandwidth90(signal, excess),
+		NoiseFloorDBFS:        10 * math.Log10(math.Max(expectedNoise/float64(len(signal)), 1e-24)),
+		SignalBandDBFS:        10 * math.Log10(math.Max(observedPower, 1e-24)),
+	}
 	if expectedNoise <= 0 || observedPower <= expectedNoise {
 		return result
 	}
 	result.SNRDB = 10 * math.Log10((observedPower-expectedNoise)/expectedNoise)
-	if !finiteSNR(result.SNRDB) {
-		return BandSNR{}
-	}
-	if result.SNRDB < snrDisplayMinDB {
+	if !finiteSNR(result.SNRDB) || result.SNRDB < snrDisplayMinDB {
 		return result
 	}
 	result.Valid = true

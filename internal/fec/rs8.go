@@ -1,12 +1,11 @@
-// Package fec implements the shortened RS(255,223) code used by the ARCSSD
-// image packet layer. The code uses GF(256) with primitive polynomial 0x187,
-// 32 roots beginning at alpha^(112*11), and primitive step 11.
-//
-// The implementation is a clean-room encoder/decoder based on the public
-// Reed-Solomon parameters documented by the upstream ARCSSD RS8 source.
+// Package fec provides Reed-Solomon, convolutional and packet-erasure coding
+// primitives used by the image transport layers.
 package fec
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 const (
 	RS8CodeSymbols   = 255
@@ -50,14 +49,14 @@ func gfMul(a, b byte) byte {
 	return alphaTo[mod255(int(indexOf[a])+int(indexOf[b]))]
 }
 
-func gfDiv(a, b byte) byte {
-	if a == 0 {
-		return 0
-	}
+func gfDiv(a, b byte) (byte, error) {
 	if b == 0 {
-		panic("fec: division by zero in GF(256)")
+		return 0, errors.New("RS8 finite-field division by zero")
 	}
-	return alphaTo[mod255(int(indexOf[a])-int(indexOf[b]))]
+	if a == 0 {
+		return 0, nil
+	}
+	return alphaTo[mod255(int(indexOf[a])-int(indexOf[b]))], nil
 }
 
 func gfPow(a byte, n int) byte {
@@ -146,7 +145,10 @@ func CorrectRS8(codeword []byte) (int, error) {
 		return 0, nil
 	}
 
-	locator, degree := berlekampMassey(syndromes)
+	locator, degree, err := berlekampMassey(syndromes)
+	if err != nil {
+		return 0, fmt.Errorf("RS8 error locator: %w", err)
+	}
 	if degree == 0 || degree > RS8ParitySymbols/2 {
 		return 0, errors.New("RS8 error count exceeds correction capability")
 	}
@@ -157,7 +159,10 @@ func CorrectRS8(codeword []byte) (int, error) {
 		// A symbol at position pos contributes X^(112+i) to syndrome i,
 		// where X = alpha^(11*(254-pos)). The locator roots are X^-1.
 		x := alphaTo[mod255(RS8Primitive*(RS8CodeSymbols-1-pos))]
-		z := gfDiv(1, x)
+		z, err := gfDiv(1, x)
+		if err != nil {
+			return 0, fmt.Errorf("invert RS8 locator root: %w", err)
+		}
 		var value byte
 		power := byte(1)
 		for i := 0; i <= degree; i++ {
@@ -188,7 +193,7 @@ func CorrectRS8(codeword []byte) (int, error) {
 	return len(positions), nil
 }
 
-func berlekampMassey(s []byte) ([]byte, int) {
+func berlekampMassey(s []byte) ([]byte, int, error) {
 	c := make([]byte, RS8ParitySymbols+1)
 	b := make([]byte, RS8ParitySymbols+1)
 	c[0], b[0] = 1, 1
@@ -205,7 +210,10 @@ func berlekampMassey(s []byte) ([]byte, int) {
 			continue
 		}
 		t := append([]byte(nil), c...)
-		coef := gfDiv(d, lastDiscrepancy)
+		coef, err := gfDiv(d, lastDiscrepancy)
+		if err != nil {
+			return nil, 0, err
+		}
 		for i := 0; i+shift < len(c); i++ {
 			if b[i] != 0 {
 				c[i+shift] ^= gfMul(coef, b[i])
@@ -220,7 +228,7 @@ func berlekampMassey(s []byte) ([]byte, int) {
 			shift++
 		}
 	}
-	return c, degree
+	return c, degree, nil
 }
 
 func solveErrorMagnitudes(s []byte, locations []byte) ([]byte, error) {
@@ -243,7 +251,10 @@ func solveErrorMagnitudes(s []byte, locations []byte) ([]byte, error) {
 			return nil, errors.New("RS8 error magnitude matrix is singular")
 		}
 		matrix[col], matrix[pivot] = matrix[pivot], matrix[col]
-		invPivot := gfDiv(1, matrix[col][col])
+		invPivot, err := gfDiv(1, matrix[col][col])
+		if err != nil {
+			return nil, fmt.Errorf("invert RS8 error-magnitude pivot: %w", err)
+		}
 		for j := col; j <= n; j++ {
 			matrix[col][j] = gfMul(matrix[col][j], invPivot)
 		}

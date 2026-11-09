@@ -45,7 +45,9 @@ func (p *dctPlan) transform(src, dst []float64, inverse bool) {
 			p.fftInput[i] = complex(v, 0)
 			p.fftInput[p.fftSize-1-i] = complex(v, 0)
 		}
-		fftInto(p.fftInput, 0, 1, p.fftSize, p.fftOutput, 0, p.scratch, p.roots, p.fftSize, false)
+		fftInto(p.fftInput, p.fftOutput, fftWorkspace{scratch: p.scratch, roots: p.roots}, fftRange{
+			stride: 1, size: p.fftSize, baseSize: p.fftSize,
+		})
 		for k := 0; k < p.n; k++ {
 			value := real(p.fftOutput[k]*p.rotation[k]) * 0.5
 			if k == 0 {
@@ -66,7 +68,9 @@ func (p *dctPlan) transform(src, dst []float64, inverse bool) {
 		p.fftInput[p.fftSize-k] = cmplx.Conj(v)
 	}
 	p.fftInput[p.n] = 0
-	fftInto(p.fftInput, 0, 1, p.fftSize, p.fftOutput, 0, p.scratch, p.roots, p.fftSize, true)
+	fftInto(p.fftInput, p.fftOutput, fftWorkspace{scratch: p.scratch, roots: p.roots}, fftRange{
+		stride: 1, size: p.fftSize, baseSize: p.fftSize, inverse: true,
+	})
 	for i := 0; i < p.n; i++ {
 		dst[i] = real(p.fftOutput[i]) / float64(p.fftSize)
 	}
@@ -128,48 +132,69 @@ func transform2D(src []float64, width, height int, inverse bool) ([]float64, err
 	return out, nil
 }
 
+// fftWorkspace groups reusable storage shared by all recursion levels.
+type fftWorkspace struct {
+	scratch []complex128
+	roots   []complex128
+}
+
+// fftRange describes one recursive slice of the mixed-radix transform.
+type fftRange struct {
+	inputOffset  int
+	stride       int
+	size         int
+	outputOffset int
+	baseSize     int
+	inverse      bool
+}
+
 // fftInto is a mixed-radix decimation-in-time transform. All output and
 // scratch storage is owned by dctPlan, so its recursion performs no allocation.
-func fftInto(input []complex128, inputOffset, stride, n int, output []complex128, outputOffset int, scratch, roots []complex128, baseN int, inverse bool) {
-	if n <= 1 {
-		output[outputOffset] = input[inputOffset]
+func fftInto(input, output []complex128, workspace fftWorkspace, transform fftRange) {
+	if transform.size <= 1 {
+		output[transform.outputOffset] = input[transform.inputOffset]
 		return
 	}
-	radix := smallestFactor(n)
-	if radix == n {
-		for k := 0; k < n; k++ {
+	radix := smallestFactor(transform.size)
+	if radix == transform.size {
+		for k := 0; k < transform.size; k++ {
 			var sum complex128
-			for j := 0; j < n; j++ {
-				rootIndex := (j * k * (baseN / n)) % baseN
-				root := roots[rootIndex]
-				if inverse {
+			for j := 0; j < transform.size; j++ {
+				rootIndex := (j * k * (transform.baseSize / transform.size)) % transform.baseSize
+				root := workspace.roots[rootIndex]
+				if transform.inverse {
 					root = cmplx.Conj(root)
 				}
-				sum += input[inputOffset+j*stride] * root
+				sum += input[transform.inputOffset+j*transform.stride] * root
 			}
-			output[outputOffset+k] = sum
+			output[transform.outputOffset+k] = sum
 		}
 		return
 	}
 
-	m := n / radix
+	childSize := transform.size / radix
 	for j := 0; j < radix; j++ {
-		fftInto(input, inputOffset+j*stride, stride*radix, m, output, outputOffset+j*m, scratch, roots, baseN, inverse)
+		child := transform
+		child.inputOffset += j * transform.stride
+		child.stride *= radix
+		child.size = childSize
+		child.outputOffset += j * childSize
+		fftInto(input, output, workspace, child)
 	}
-	for k := 0; k < n; k++ {
-		k0 := k % m
+	for k := 0; k < transform.size; k++ {
+		k0 := k % childSize
 		var sum complex128
 		for j := 0; j < radix; j++ {
-			rootIndex := (j * k * (baseN / n)) % baseN
-			root := roots[rootIndex]
-			if inverse {
+			rootIndex := (j * k * (transform.baseSize / transform.size)) % transform.baseSize
+			root := workspace.roots[rootIndex]
+			if transform.inverse {
 				root = cmplx.Conj(root)
 			}
-			sum += output[outputOffset+j*m+k0] * root
+			sum += output[transform.outputOffset+j*childSize+k0] * root
 		}
-		scratch[k] = sum
+		workspace.scratch[k] = sum
 	}
-	copy(output[outputOffset:outputOffset+n], scratch[:n])
+	copy(output[transform.outputOffset:transform.outputOffset+transform.size], workspace.scratch[:transform.size])
 }
 
 func smallestFactor(n int) int {

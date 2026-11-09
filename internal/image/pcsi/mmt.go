@@ -1,6 +1,4 @@
-// Package pcsi implements the PCSI MMT packetizer used by the supplied
-// PCSI.py / pcsitximage_mmt.py reference path. The reconstruction optimizer is
-// a separate RX component and remains under interoperability validation.
+// Package pcsi implements PCSI MMT image packetization and reconstruction.
 package pcsi
 
 import (

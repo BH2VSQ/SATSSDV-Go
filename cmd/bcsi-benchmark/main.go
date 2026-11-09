@@ -21,6 +21,12 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/imagequality"
 )
 
+type benchmarkConfig struct {
+	output     string
+	iterations int
+	workers    int
+}
+
 func main() {
 	output := flag.String("out", "docs/BCSI_BENCHMARK_REPORT.md", "Markdown report path")
 	iterations := flag.Int("iterations", 14, "BCSI reconstruction iterations (1..80)")
@@ -29,18 +35,45 @@ func main() {
 	if *iterations < 1 || *iterations > 80 || *workers < 1 || *workers > 16 {
 		fatal("iterations must be 1..80 and workers must be 1..16")
 	}
-	var report strings.Builder
-	fmt.Fprintln(&report, "# BCSI / JPEG / Haar codec benchmark")
-	fmt.Fprintln(&report)
-	fmt.Fprintf(&report, "- Date: %s\n- Go: %s\n- OS/Arch: %s/%s\n- CPUs visible: %d\n- Reconstruction: %d iterations, %d workers\n- Fixture: deterministic synthetic RGB image (smooth gradients + edges + texture)\n", time.Now().Format("2006-01-02 15:04:05 MST"), runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), *iterations, *workers)
-	fmt.Fprintln(&report)
-	fmt.Fprintln(&report, "All codec sizes include each codec's own headers/CRC/compressed payload. BCSI size is the sum of independent block packets; no existing CCSDS/AX.25 framing, link FEC, interleaving or modem waveform overhead is included. The JPEG target-size row uses Go's standard JPEG encoder with quality selected to approach the BCSI byte target; it is not a separate libjpeg-turbo optimized-Huffman implementation. JPEG and Haar candidates may be smaller/larger than the target when the tested quality/quantizer range cannot hit it exactly. Airtime is ideal payload-only time at 1200/2400 bit/s, not a modem/on-air measurement.")
-	fmt.Fprintln(&report)
-	fmt.Fprintln(&report, "## Same-target-size comparison")
-	fmt.Fprintln(&report)
-	fmt.Fprintln(&report, "| Image | Base luma / effective all-channel measurements | BCSI bytes | PSNR | SSIM | Encode ms | Decode ms | Encode alloc MB | Decode alloc MB | JPEG Q75 bytes / PSNR | Target-size JPEG Q / bytes / PSNR | Haar step / bytes / PSNR | Ideal payload time 1200 / 2400 bit/s |")
-	fmt.Fprintln(&report, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+	if err := runBenchmark(benchmarkConfig{output: *output, iterations: *iterations, workers: *workers}); err != nil {
+		fatal(err.Error())
+	}
+}
 
+func runBenchmark(config benchmarkConfig) error {
+	var report strings.Builder
+	appendBenchmarkHeader(&report, config)
+	if err := appendCodecComparisons(&report, config); err != nil {
+		return err
+	}
+	if err := appendPacketLossComparison(&report, config); err != nil {
+		return err
+	}
+	appendBenchmarkLimitations(&report)
+	if err := os.MkdirAll(filepath.Dir(config.output), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(config.output, []byte(report.String()), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s\n", config.output)
+	return nil
+}
+
+func appendBenchmarkHeader(report *strings.Builder, config benchmarkConfig) {
+	fmt.Fprintln(report, "# BCSI / JPEG / Haar codec benchmark")
+	fmt.Fprintln(report)
+	fmt.Fprintf(report, "- Date: %s\n- Go: %s\n- OS/Arch: %s/%s\n- CPUs visible: %d\n- Reconstruction: %d iterations, %d workers\n- Fixture: deterministic synthetic RGB image (smooth gradients + edges + texture)\n", time.Now().Format("2006-01-02 15:04:05 MST"), runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), config.iterations, config.workers)
+	fmt.Fprintln(report)
+	fmt.Fprintln(report, "All codec sizes include each codec's own headers/CRC/compressed payload. BCSI size is the sum of independent block packets; no existing CCSDS/AX.25 framing, link FEC, interleaving or modem waveform overhead is included. The JPEG target-size row uses Go's standard JPEG encoder with quality selected to approach the BCSI byte target; it is not a separate libjpeg-turbo optimized-Huffman implementation. JPEG and Haar candidates may be smaller/larger than the target when the tested quality/quantizer range cannot hit it exactly. Airtime is ideal payload-only time at 1200/2400 bit/s, not a modem/on-air measurement.")
+	fmt.Fprintln(report)
+	fmt.Fprintln(report, "## Same-target-size comparison")
+	fmt.Fprintln(report)
+	fmt.Fprintln(report, "| Image | Base luma / effective all-channel measurements | BCSI bytes | PSNR | SSIM | Encode ms | Decode ms | Encode alloc MB | Decode alloc MB | JPEG Q75 bytes / PSNR | Target-size JPEG Q / bytes / PSNR | Haar step / bytes / PSNR | Ideal payload time 1200 / 2400 bit/s |")
+	fmt.Fprintln(report, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+}
+
+func appendCodecComparisons(report *strings.Builder, config benchmarkConfig) error {
 	sizes := []image.Point{{320, 240}, {448, 336}, {640, 480}}
 	rates := []float64{0.25, 0.375, 0.50}
 	for _, size := range sizes {
@@ -53,7 +86,7 @@ func main() {
 			start := time.Now()
 			packets, err := bcsi.Encode(img, cfg)
 			if err != nil {
-				fatal(err.Error())
+				return err
 			}
 			encDuration := time.Since(start)
 			runtime.ReadMemStats(&memAfterEncode)
@@ -65,14 +98,14 @@ func main() {
 			decoder := bcsi.NewDecoder()
 			for _, packet := range packets {
 				if err := decoder.AddPacket(packet); err != nil {
-					fatal(err.Error())
+					return err
 				}
 			}
 			start = time.Now()
-			bcsiImage, stats, err := decoder.Reconstruct(context.Background(), *workers, *iterations)
+			bcsiImage, stats, err := decoder.Reconstruct(context.Background(), config.workers, config.iterations)
 			decDuration := time.Since(start)
 			if err != nil {
-				fatal(err.Error())
+				return err
 			}
 			runtime.ReadMemStats(&memAfterDecode)
 			decAllocMB := float64(memAfterDecode.TotalAlloc-memAfterEncode.TotalAlloc) / (1024 * 1024)
@@ -81,12 +114,12 @@ func main() {
 
 			jpeg75, jpeg75Image, _, err := encodeJPEG(img, 75)
 			if err != nil {
-				fatal(fmt.Sprintf("encode JPEG Q75: %v", err))
+				return fmt.Errorf("encode JPEG Q75: %w", err)
 			}
 			jpegOptQuality, jpegOptBytes := nearestJPEGSize(img, bcsiBytes)
 			_, jpegOptImage, _, err := encodeJPEG(img, jpegOptQuality)
 			if err != nil {
-				fatal(fmt.Sprintf("encode target-size JPEG Q%d: %v", jpegOptQuality, err))
+				return fmt.Errorf("encode target-size JPEG Q%d: %w", jpegOptQuality, err)
 			}
 
 			haarQ, haarBytes := nearestHaarSize(img, bcsiBytes)
@@ -94,67 +127,65 @@ func main() {
 			haarStream, err := bcsi.EncodeHaarBaseline(img, haarQ)
 			haarEnc := time.Since(haarStart)
 			if err != nil {
-				fatal(err.Error())
+				return err
 			}
 			haarStart = time.Now()
 			haarImage, err := bcsi.DecodeHaarBaseline(haarStream)
 			haarDec := time.Since(haarStart)
 			if err != nil {
-				fatal(err.Error())
+				return err
 			}
 			airtime1200 := float64(bcsiBytes*8) / 1200
 			airtime2400 := float64(bcsiBytes*8) / 2400
-			fmt.Fprintf(&report, "| %dx%d | %.1f%% / %.1f%% | %d | %.2f dB | %.4f | %.1f | %.1f | %.2f | %.2f | Q75: %d / %.2f dB | Q%d: %d / %.2f dB | step %d: %d / %.2f dB | %.1f s / %.1f s |\n",
+			fmt.Fprintf(report, "| %dx%d | %.1f%% / %.1f%% | %d | %.2f dB | %.4f | %.1f | %.1f | %.2f | %.2f | Q75: %d / %.2f dB | Q%d: %d / %.2f dB | step %d: %d / %.2f dB | %.1f s / %.1f s |\n",
 				size.X, size.Y, rate*100, stats.SamplingRate*100, bcsiBytes, bcsiPSNR, bcsiSSIM, float64(encDuration.Microseconds())/1000, float64(decDuration.Microseconds())/1000, encAllocMB, decAllocMB,
 				len(jpeg75), imagequality.PSNR(img, jpeg75Image), jpegOptQuality, jpegOptBytes, imagequality.PSNR(img, jpegOptImage), haarQ, haarBytes, imagequality.PSNR(img, haarImage), airtime1200, airtime2400)
-			fmt.Fprintf(&report, "<!-- Haar encode/decode %d/%d us; BCSI measurements %d; BCSI received blocks %d/%d -->\n", haarEnc.Microseconds(), haarDec.Microseconds(), stats.Measurements, stats.BlocksReconstructed, stats.BlocksExpected)
+			fmt.Fprintf(report, "<!-- Haar encode/decode %d/%d us; BCSI measurements %d; BCSI received blocks %d/%d -->\n", haarEnc.Microseconds(), haarDec.Microseconds(), stats.Measurements, stats.BlocksReconstructed, stats.BlocksExpected)
 		}
 	}
+	return nil
+}
 
-	fmt.Fprintln(&report)
-	fmt.Fprintln(&report, "## BCSI packet-loss behavior (320×240, 37.5% base luma rate)")
-	fmt.Fprintln(&report)
-	fmt.Fprintln(&report, "| Random block-packet loss | Blocks received | Blocks independently reconstructed | Blocks concealed | Output coverage | PSNR | SSIM |")
-	fmt.Fprintln(&report, "|---:|---:|---:|---:|---:|---:|---:|")
+func appendPacketLossComparison(report *strings.Builder, config benchmarkConfig) error {
+	fmt.Fprintln(report)
+	fmt.Fprintln(report, "## BCSI packet-loss behavior (320×240, 37.5% base luma rate)")
+	fmt.Fprintln(report)
+	fmt.Fprintln(report, "| Random block-packet loss | Blocks received | Blocks independently reconstructed | Blocks concealed | Output coverage | PSNR | SSIM |")
+	fmt.Fprintln(report, "|---:|---:|---:|---:|---:|---:|---:|")
 	lossImage := fixture(320, 240)
 	lossPackets, err := bcsi.Encode(lossImage, bcsi.Config{SamplingRate: 0.375, Adaptive: true, QuantStep: 2, Seed: 0x53415453})
 	if err != nil {
-		fatal(err.Error())
+		return err
 	}
 	for _, lossPercent := range []int{10, 25, 40} {
-		dec := bcsi.NewDecoder()
-		for i, packet := range lossPackets {
-			if (i*37+11)%100 < lossPercent {
+		decoder := bcsi.NewDecoder()
+		for index, packet := range lossPackets {
+			if (index*37+11)%100 < lossPercent {
 				continue
 			}
-			if err := dec.AddPacket(packet); err != nil {
-				fatal(err.Error())
+			if err := decoder.AddPacket(packet); err != nil {
+				return err
 			}
 		}
-		preview, stats, err := dec.Reconstruct(context.Background(), *workers, max(4, *iterations/2))
+		preview, stats, err := decoder.Reconstruct(context.Background(), config.workers, max(4, config.iterations/2))
 		if err != nil {
-			fatal(err.Error())
+			return err
 		}
-		fmt.Fprintf(&report, "| %d%% | %d/%d | %d | %d | %.1f%% | %.2f dB | %.4f |\n", lossPercent, stats.BlocksReceived, stats.BlocksExpected, stats.BlocksReconstructed, stats.BlocksConcealed, stats.Coverage*100, imagequality.PSNR(lossImage, preview), imagequality.SSIM(lossImage, preview))
+		fmt.Fprintf(report, "| %d%% | %d/%d | %d | %d | %.1f%% | %.2f dB | %.4f |\n", lossPercent, stats.BlocksReceived, stats.BlocksExpected, stats.BlocksReconstructed, stats.BlocksConcealed, stats.Coverage*100, imagequality.PSNR(lossImage, preview), imagequality.SSIM(lossImage, preview))
 	}
+	return nil
+}
 
-	fmt.Fprintln(&report)
-	fmt.Fprintln(&report, "## Interpretation and limitations")
-	fmt.Fprintln(&report)
-	fmt.Fprintln(&report, "- BCSI is a block-local experimental codec. Every block packet carries image geometry, block index, measurement counts, quantizer, deterministic matrix seed and CRC. A missing/corrupt block does not invalidate neighbouring blocks; the preview conceals missing blocks by nearest recovered block. Concealment improves canvas continuity but does not recover the original missing detail.")
-	fmt.Fprintln(&report, "- The test input is deterministic synthetic RGB content (gradients, geometric edges and texture), not a photographic corpus. Results must not be generalized to all satellite imagery; repeat with representative user images before selecting production defaults.")
-	fmt.Fprintln(&report, "- The Haar baseline is a deliberately simple block Haar + scalar quantization + DEFLATE reference, not JPEG 2000. The target-size JPEG/Haar values are the nearest candidate from the tested quality/step range; actual byte counts are shown because exact rate matching is not always possible.")
-	fmt.Fprintln(&report, "- Allocation columns show cumulative Go heap bytes allocated during the respective BCSI encode/decode phase. They are allocation volume, not peak resident set size (RSS) and do not include native audio/GUI allocations.")
-	fmt.Fprintln(&report, "- BCSI measurements and reconstruction use floating-point arithmetic. The current prototype prioritizes correctness and packet independence; it is not yet integrated into a radio profile/modem, so on-air compatibility and real RF packet loss are not claimed.")
-	fmt.Fprintln(&report, "- Reported encode/decode time is one local run and is workload/CPU dependent. Run this command on Windows, Linux and macOS release builds before making cross-platform performance claims.")
-
-	if err := os.MkdirAll(filepath.Dir(*output), 0o755); err != nil {
-		fatal(err.Error())
-	}
-	if err := os.WriteFile(*output, []byte(report.String()), 0o644); err != nil {
-		fatal(err.Error())
-	}
-	fmt.Printf("wrote %s\n", *output)
+func appendBenchmarkLimitations(report *strings.Builder) {
+	fmt.Fprintln(report)
+	fmt.Fprintln(report, "## Interpretation and limitations")
+	fmt.Fprintln(report)
+	fmt.Fprintln(report, "- BCSI is a block-local experimental codec. Every block packet carries image geometry, block index, measurement counts, quantizer, deterministic matrix seed and CRC. A missing/corrupt block does not invalidate neighbouring blocks; the preview conceals missing blocks by nearest recovered block. Concealment improves canvas continuity but does not recover the original missing detail.")
+	fmt.Fprintln(report, "- The test input is deterministic synthetic RGB content (gradients, geometric edges and texture), not a photographic corpus. Results must not be generalized to all satellite imagery; repeat with representative user images before selecting production defaults.")
+	fmt.Fprintln(report, "- The Haar baseline is a deliberately simple block Haar + scalar quantization + DEFLATE reference, not JPEG 2000. The target-size JPEG/Haar values are the nearest candidate from the tested quality/step range; actual byte counts are shown because exact rate matching is not always possible.")
+	fmt.Fprintln(report, "- Allocation columns show cumulative Go heap bytes allocated during the respective BCSI encode/decode phase. They are allocation volume, not peak resident set size (RSS) and do not include native audio/GUI allocations.")
+	fmt.Fprintln(report, "- BCSI measurements and reconstruction use floating-point arithmetic. The current prototype prioritizes correctness and packet independence; it is not yet integrated into a radio profile/modem, so on-air compatibility and real RF packet loss are not claimed.")
+	fmt.Fprintln(report, "- Reported encode/decode time is one local run and is workload/CPU dependent. Run this command on Windows, Linux and macOS release builds before making cross-platform performance claims.")
 }
 
 func encodeJPEG(img image.Image, quality int) ([]byte, image.Image, time.Duration, error) {

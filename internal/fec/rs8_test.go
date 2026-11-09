@@ -111,3 +111,12 @@ func TestRS8CorrectionDoesNotMutateUncorrectableInput(t *testing.T) {
 		t.Fatal("uncorrectable correction attempt modified the input")
 	}
 }
+
+func TestGFDivRejectsZeroDenominatorWithoutPanic(t *testing.T) {
+	if _, err := gfDiv(1, 0); err == nil {
+		t.Fatal("GF(256) division by zero must return an error")
+	}
+	if got, err := gfDiv(0, 7); err != nil || got != 0 {
+		t.Fatalf("0 divided by non-zero must be zero: got=%d err=%v", got, err)
+	}
+}

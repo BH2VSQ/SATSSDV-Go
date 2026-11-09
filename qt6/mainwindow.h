@@ -26,6 +26,7 @@ class SpectrumWaterfallWidget;
 class ImagePreviewLabel;
 class TemplateCanvas;
 class QHBoxLayout;
+class QVBoxLayout;
 class QGridLayout;
 class QTabWidget;
 
@@ -41,6 +42,12 @@ private:
     void refreshLatestRXPreview();
     void refreshLatestRXGIFPreview();
     void refreshAlbum();
+    QWidget *createAlbumCard(const QJsonObject &record);
+    void loadAlbumThumbnail(const QString &id, QPushButton *thumb);
+    void showAlbumPreview(const QString &dataUrl);
+    void openAlbumRecordPreview(const QString &id, QPushButton *thumb);
+    void addAlbumCardMetadata(QWidget *card, QVBoxLayout *layout, const QJsonObject &record);
+    void addAlbumCardActions(QWidget *card, QVBoxLayout *layout, const QString &id);
     void refreshGallery();
     void refreshTemplates();
     void refreshTemplateComponentList();
@@ -59,6 +66,13 @@ private:
     void applyLanguage(const QString &locale);
     void pollEvents();
     void handleEvent(const QJsonObject &event);
+    void handleRXImageEvent(const QJsonObject &payload);
+    void handleRXDiagnosticsEvent(const QJsonObject &payload);
+    void handleRXLevelEvent(const QJsonObject &payload);
+    void handleSpectrumEvent(const QString &name, const QJsonArray &bins);
+    void handleTXMetricsEvent(const QJsonObject &payload);
+    void handleTXStateEvent(const QJsonObject &payload);
+    void handleTXStatusEvent(const QJsonObject &payload);
     void startRX();
     void stopRX();
     void startTX();

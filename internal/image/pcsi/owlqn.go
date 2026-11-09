@@ -138,6 +138,16 @@ func reconstructChannel(width, height int, columnIndices []int, observations []u
 	return reconstructChannelContext(context.Background(), width, height, columnIndices, observations, initial, iterations)
 }
 
+type owlqnIterationState struct {
+	coefficients []float64
+	candidate    []float64
+	loss         float64
+	gradient     []float64
+	pseudo       []float64
+	value        float64
+	history      []owlqnHistoryPair
+}
+
 func reconstructChannelContext(ctx context.Context, width, height int, columnIndices []int, observations []uint8, initial []float64, iterations int) ([]float64, []float64, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -163,10 +173,36 @@ func reconstructChannelContext(ctx context.Context, width, height int, columnInd
 	if err != nil {
 		return nil, nil, err
 	}
+	state, err := newOWLQNIterationState(objective, width, height, observations, initial)
+	if err != nil {
+		return nil, nil, err
+	}
+	for iteration := 0; iteration < iterations; iteration++ {
+		continued, stepErr := runOWLQNIteration(ctx, objective, state)
+		if stepErr != nil {
+			return nil, nil, stepErr
+		}
+		if !continued {
+			break
+		}
+	}
+	spatial := make([]float64, width*height)
+	for column := 0; column < width; column++ {
+		for row := 0; row < height; row++ {
+			objective.coefficientMatrix[row*width+column] = state.coefficients[column*height+row]
+		}
+	}
+	if err := objective.plan.transform(objective.coefficientMatrix, spatial, true); err != nil {
+		return nil, nil, err
+	}
+	return spatial, state.coefficients, nil
+}
+
+func newOWLQNIterationState(objective *pcsiObjective, width, height int, observations []uint8, initial []float64) (*owlqnIterationState, error) {
 	n := width * height
-	x := make([]float64, n)
+	coefficients := make([]float64, n)
 	if len(initial) == n {
-		copy(x, initial)
+		copy(coefficients, initial)
 	} else {
 		// Seed the orthonormal DCT DC coefficient from the mean of the
 		// received measurements. Starting every progressive preview at an
@@ -179,118 +215,129 @@ func reconstructChannelContext(ctx context.Context, width, height int, columnInd
 			sum += float64(sample)
 		}
 		mean := sum / float64(len(observations))
-		x[0] = mean * math.Sqrt(float64(n))
+		coefficients[0] = mean * math.Sqrt(float64(n))
 	}
-	loss, gradient, err := objective.evaluate(x, true)
+	loss, gradient, err := objective.evaluate(coefficients, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	value := loss + pcsiOWLQNLambda*vectorL1Norm(x)
-	pseudo := owlqnPseudoGradient(x, gradient, pcsiOWLQNLambda)
-	history := make([]owlqnHistoryPair, 0, owlqnHistory)
+	return &owlqnIterationState{
+		coefficients: coefficients,
+		candidate:    make([]float64, len(coefficients)),
+		loss:         loss,
+		gradient:     gradient,
+		pseudo:       owlqnPseudoGradient(coefficients, gradient, pcsiOWLQNLambda),
+		value:        loss + pcsiOWLQNLambda*vectorL1Norm(coefficients),
+		history:      make([]owlqnHistoryPair, 0, owlqnHistory),
+	}, nil
+}
 
-	for iteration := 0; iteration < iterations; iteration++ {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+func runOWLQNIteration(ctx context.Context, objective *pcsiObjective, state *owlqnIterationState) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if vectorInfNorm(state.pseudo) < 1e-4 {
+		return false, nil
+	}
+	direction, orthant, slope := owlqnSearchDirection(state)
+	if slope >= -1e-14 {
+		return false, nil
+	}
+	candidate, nextLoss, nextGradient, nextPseudo, accepted, err := owlqnLineSearch(ctx, objective, state, direction, orthant, slope)
+	if err != nil {
+		return false, err
+	}
+	if !accepted {
+		return false, nil
+	}
+	updateOWLQNHistory(state, candidate, nextPseudo)
+	state.coefficients, state.candidate = candidate, state.coefficients
+	state.loss = nextLoss
+	state.gradient = nextGradient
+	state.pseudo = nextPseudo
+	state.value = nextLoss + pcsiOWLQNLambda*vectorL1Norm(candidate)
+	return true, nil
+}
+
+func owlqnSearchDirection(state *owlqnIterationState) ([]float64, []float64, float64) {
+	direction := owlqnDirection(state.pseudo, state.history)
+	orthant := make([]float64, len(state.coefficients))
+	for i := range state.coefficients {
+		switch {
+		case state.coefficients[i] > 0:
+			orthant[i] = 1
+		case state.coefficients[i] < 0:
+			orthant[i] = -1
+		case state.pseudo[i] < 0:
+			orthant[i] = 1
+		case state.pseudo[i] > 0:
+			orthant[i] = -1
 		}
-		if vectorInfNorm(pseudo) < 1e-4 {
-			break
+		// Only coefficients currently at zero are constrained to enter
+		// the selected orthant. A non-zero coefficient must be allowed to
+		// move back toward zero; masking that direction freezes OWL-QN
+		// immediately after an overshooting line-search step.
+		if state.coefficients[i] == 0 && direction[i]*orthant[i] <= 0 {
+			direction[i] = 0
 		}
-		direction := owlqnDirection(pseudo, history)
-		orthant := make([]float64, n)
-		for i := range x {
-			switch {
-			case x[i] > 0:
-				orthant[i] = 1
-			case x[i] < 0:
-				orthant[i] = -1
-			case pseudo[i] < 0:
-				orthant[i] = 1
-			case pseudo[i] > 0:
-				orthant[i] = -1
-			}
-			// Only coefficients currently at zero are constrained to enter
-			// the selected orthant. A non-zero coefficient must be allowed to
-			// move back toward zero; masking that direction freezes OWL-QN
-			// immediately after an overshooting line-search step.
-			if x[i] == 0 && direction[i]*orthant[i] <= 0 {
+	}
+	slope := vectorDot(state.pseudo, direction)
+	if slope >= -1e-14 {
+		for i := range direction {
+			direction[i] = -state.pseudo[i]
+			if state.coefficients[i] == 0 && direction[i]*orthant[i] <= 0 {
 				direction[i] = 0
 			}
 		}
-		slope := vectorDot(pseudo, direction)
-		if slope >= -1e-14 {
-			for i := range direction {
-				direction[i] = -pseudo[i]
-				if x[i] == 0 && direction[i]*orthant[i] <= 0 {
-					direction[i] = 0
-				}
-			}
-			slope = vectorDot(pseudo, direction)
-		}
-		if slope >= -1e-14 {
-			break
-		}
-
-		accepted := false
-		step := 1.0
-		candidate := make([]float64, n)
-		var nextLoss float64
-		var nextGradient, nextPseudo []float64
-		for search := 0; search < 28; search++ {
-			if err := ctx.Err(); err != nil {
-				return nil, nil, err
-			}
-			for i := range x {
-				candidate[i] = x[i] + step*direction[i]
-				if candidate[i]*orthant[i] <= 0 {
-					candidate[i] = 0
-				}
-			}
-			nextLoss, nextGradient, err = objective.evaluate(candidate, true)
-			if err != nil {
-				return nil, nil, err
-			}
-			nextValue := nextLoss + pcsiOWLQNLambda*vectorL1Norm(candidate)
-			if nextValue <= value+1e-4*step*slope {
-				nextPseudo = owlqnPseudoGradient(candidate, nextGradient, pcsiOWLQNLambda)
-				accepted = true
-				break
-			}
-			step *= 0.5
-		}
-		if !accepted {
-			break
-		}
-
-		sVec := make([]float64, n)
-		yVec := make([]float64, n)
-		for i := range x {
-			sVec[i] = candidate[i] - x[i]
-			yVec[i] = nextPseudo[i] - pseudo[i]
-		}
-		curvature := vectorDot(sVec, yVec)
-		if curvature > 1e-12*math.Sqrt(vectorDot(sVec, sVec)*vectorDot(yVec, yVec)) {
-			if len(history) == owlqnHistory {
-				copy(history, history[1:])
-				history = history[:len(history)-1]
-			}
-			history = append(history, owlqnHistoryPair{s: sVec, y: yVec, rho: 1 / curvature})
-		}
-		x, candidate = candidate, x
-		loss, gradient, pseudo = nextLoss, nextGradient, nextPseudo
-		value = loss + pcsiOWLQNLambda*vectorL1Norm(x)
+		slope = vectorDot(state.pseudo, direction)
 	}
+	return direction, orthant, slope
+}
 
-	spatial := make([]float64, n)
-	for column := 0; column < width; column++ {
-		for row := 0; row < height; row++ {
-			objective.coefficientMatrix[row*width+column] = x[column*height+row]
+func owlqnLineSearch(ctx context.Context, objective *pcsiObjective, state *owlqnIterationState, direction, orthant []float64, slope float64) ([]float64, float64, []float64, []float64, bool, error) {
+	candidate := state.candidate
+	step := 1.0
+	for search := 0; search < 28; search++ {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, nil, nil, false, err
 		}
+		for i := range state.coefficients {
+			candidate[i] = state.coefficients[i] + step*direction[i]
+			if candidate[i]*orthant[i] <= 0 {
+				candidate[i] = 0
+			}
+		}
+		nextLoss, nextGradient, err := objective.evaluate(candidate, true)
+		if err != nil {
+			return nil, 0, nil, nil, false, err
+		}
+		nextValue := nextLoss + pcsiOWLQNLambda*vectorL1Norm(candidate)
+		if nextValue <= state.value+1e-4*step*slope {
+			nextPseudo := owlqnPseudoGradient(candidate, nextGradient, pcsiOWLQNLambda)
+			return candidate, nextLoss, nextGradient, nextPseudo, true, nil
+		}
+		step *= 0.5
 	}
-	if err := objective.plan.transform(objective.coefficientMatrix, spatial, true); err != nil {
-		return nil, nil, err
+	return nil, 0, nil, nil, false, nil
+}
+
+func updateOWLQNHistory(state *owlqnIterationState, candidate, nextPseudo []float64) {
+	n := len(state.coefficients)
+	sVec := make([]float64, n)
+	yVec := make([]float64, n)
+	for i := range state.coefficients {
+		sVec[i] = candidate[i] - state.coefficients[i]
+		yVec[i] = nextPseudo[i] - state.pseudo[i]
 	}
-	return spatial, x, nil
+	curvature := vectorDot(sVec, yVec)
+	if curvature <= 1e-12*math.Sqrt(vectorDot(sVec, sVec)*vectorDot(yVec, yVec)) {
+		return
+	}
+	if len(state.history) == owlqnHistory {
+		copy(state.history, state.history[1:])
+		state.history = state.history[:len(state.history)-1]
+	}
+	state.history = append(state.history, owlqnHistoryPair{s: sVec, y: yVec, rho: 1 / curvature})
 }
 
 func owlqnPseudoGradient(x, gradient []float64, lambda float64) []float64 {

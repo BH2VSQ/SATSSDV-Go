@@ -746,102 +746,7 @@ func transcodeJPEGScanMCUs(f *jpegFrame, quality uint8, maxMCUs int, partial boo
 			}
 		}
 
-		mcuErr := func() error {
-			for componentIndex, blockCount := range []int{4, 1, 1} {
-				component := f.components[componentIndex]
-				qsrc := f.quant[component.quantID]
-				qdst := dstQuant[0]
-				if componentIndex > 0 {
-					qdst = dstQuant[1]
-				}
-				for block := 0; block < blockCount; block++ {
-					var coeff [64]int
-					dcCategory, err := reader.huffman(&f.dc[component.dcID])
-					if err != nil {
-						return fmt.Errorf("MCU %d component %d DC: %w", mcu, componentIndex, err)
-					}
-					if dcCategory > 11 {
-						return errors.New("JPEG DC category exceeds baseline range")
-					}
-					delta, err := receiveExtend(&reader, int(dcCategory))
-					if err != nil {
-						return err
-					}
-					srcDC[componentIndex] += delta
-					newDC := roundedDivide(srcDC[componentIndex]*int(qsrc[0]), int(qdst[0]))
-					dstDelta := newDC - dstDC[componentIndex]
-					dstDC[componentIndex] = newDC
-					dcOutCategory := category(dstDelta)
-					if dcOutCategory > 11 {
-						return errors.New("transcoded JPEG DC category exceeds baseline range")
-					}
-					if err := writer.putHuffman(&f.dc[component.dcID], dcOutCategory); err != nil {
-						return err
-					}
-					writer.put(amplitude(dstDelta, dcOutCategory), dcOutCategory)
-
-					k := 1
-					for k < 64 {
-						symbol, err := reader.huffman(&f.ac[component.acID])
-						if err != nil {
-							return fmt.Errorf("MCU %d component %d AC: %w", mcu, componentIndex, err)
-						}
-						if symbol == 0 {
-							break
-						}
-						if symbol == 0xf0 {
-							k += 16
-							if k > 64 {
-								return errors.New("JPEG AC zero run exceeds block")
-							}
-							continue
-						}
-						run, size := int(symbol>>4), int(symbol&0x0f)
-						if size == 0 || size > 10 {
-							return errors.New("invalid JPEG AC coefficient category")
-						}
-						k += run
-						if k >= 64 {
-							return errors.New("JPEG AC run exceeds block")
-						}
-						value, err := receiveExtend(&reader, size)
-						if err != nil {
-							return err
-						}
-						coeff[k] = roundedDivide(value*int(qsrc[k]), int(qdst[k]))
-						k++
-					}
-					zeroRun := 0
-					for k = 1; k < 64; k++ {
-						if coeff[k] == 0 {
-							zeroRun++
-							continue
-						}
-						for zeroRun >= 16 {
-							if err := writer.putHuffman(&f.ac[component.acID], 0xf0); err != nil {
-								return err
-							}
-							zeroRun -= 16
-						}
-						cat := category(coeff[k])
-						if cat == 0 || cat > 10 {
-							return errors.New("transcoded JPEG AC category exceeds baseline range")
-						}
-						if err := writer.putHuffman(&f.ac[component.acID], byte(zeroRun<<4)|cat); err != nil {
-							return err
-						}
-						writer.put(amplitude(coeff[k], cat), cat)
-						zeroRun = 0
-					}
-					if zeroRun > 0 {
-						if err := writer.putHuffman(&f.ac[component.acID], 0); err != nil {
-							return err
-						}
-					}
-				}
-			}
-			return nil
-		}()
+		mcuErr := transcodeJPEGMCU(f, &reader, &writer, &srcDC, &dstDC, dstQuant, mcu)
 		if mcuErr != nil {
 			if partial && decodedMCUs > 0 {
 				reader, writer, srcDC, dstDC = readerBefore, writerBefore, srcBefore, dstBefore
@@ -853,6 +758,111 @@ func transcodeJPEGScanMCUs(f *jpegFrame, quality uint8, maxMCUs int, partial boo
 	}
 	writer.flushOnes()
 	return writer.out, boundaries, decodedMCUs, nil
+}
+
+func transcodeJPEGMCU(
+	frame *jpegFrame,
+	reader *jpegBitReader,
+	writer *jpegBitWriter,
+	sourceDC, destinationDC *[3]int,
+	destinationQuant [2][64]byte,
+	mcu int,
+) error {
+	for componentIndex, blockCount := range [...]int{4, 1, 1} {
+		component := frame.components[componentIndex]
+		sourceQuant := frame.quant[component.quantID]
+		outputQuant := destinationQuant[0]
+		if componentIndex > 0 {
+			outputQuant = destinationQuant[1]
+		}
+		for block := 0; block < blockCount; block++ {
+			var coefficients [64]int
+			dcCategory, err := reader.huffman(&frame.dc[component.dcID])
+			if err != nil {
+				return fmt.Errorf("MCU %d component %d DC: %w", mcu, componentIndex, err)
+			}
+			if dcCategory > 11 {
+				return errors.New("JPEG DC category exceeds baseline range")
+			}
+			delta, err := receiveExtend(reader, int(dcCategory))
+			if err != nil {
+				return err
+			}
+			sourceDC[componentIndex] += delta
+			newDC := roundedDivide(sourceDC[componentIndex]*int(sourceQuant[0]), int(outputQuant[0]))
+			destinationDelta := newDC - destinationDC[componentIndex]
+			destinationDC[componentIndex] = newDC
+			dcOutputCategory := category(destinationDelta)
+			if dcOutputCategory > 11 {
+				return errors.New("transcoded JPEG DC category exceeds baseline range")
+			}
+			if err := writer.putHuffman(&frame.dc[component.dcID], dcOutputCategory); err != nil {
+				return err
+			}
+			writer.put(amplitude(destinationDelta, dcOutputCategory), dcOutputCategory)
+
+			coefficientIndex := 1
+			for coefficientIndex < 64 {
+				symbol, err := reader.huffman(&frame.ac[component.acID])
+				if err != nil {
+					return fmt.Errorf("MCU %d component %d AC: %w", mcu, componentIndex, err)
+				}
+				if symbol == 0 {
+					break
+				}
+				if symbol == 0xf0 {
+					coefficientIndex += 16
+					if coefficientIndex > 64 {
+						return errors.New("JPEG AC zero run exceeds block")
+					}
+					continue
+				}
+				run, size := int(symbol>>4), int(symbol&0x0f)
+				if size == 0 || size > 10 {
+					return errors.New("invalid JPEG AC coefficient category")
+				}
+				coefficientIndex += run
+				if coefficientIndex >= 64 {
+					return errors.New("JPEG AC run exceeds block")
+				}
+				value, err := receiveExtend(reader, size)
+				if err != nil {
+					return err
+				}
+				coefficients[coefficientIndex] = roundedDivide(value*int(sourceQuant[coefficientIndex]), int(outputQuant[coefficientIndex]))
+				coefficientIndex++
+			}
+
+			zeroRun := 0
+			for coefficientIndex = 1; coefficientIndex < 64; coefficientIndex++ {
+				if coefficients[coefficientIndex] == 0 {
+					zeroRun++
+					continue
+				}
+				for zeroRun >= 16 {
+					if err := writer.putHuffman(&frame.ac[component.acID], 0xf0); err != nil {
+						return err
+					}
+					zeroRun -= 16
+				}
+				categoryValue := category(coefficients[coefficientIndex])
+				if categoryValue == 0 || categoryValue > 10 {
+					return errors.New("transcoded JPEG AC category exceeds baseline range")
+				}
+				if err := writer.putHuffman(&frame.ac[component.acID], byte(zeroRun<<4)|categoryValue); err != nil {
+					return err
+				}
+				writer.put(amplitude(coefficients[coefficientIndex], categoryValue), categoryValue)
+				zeroRun = 0
+			}
+			if zeroRun > 0 {
+				if err := writer.putHuffman(&frame.ac[component.acID], 0); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func transcodeJPEGScanPacketized(f *jpegFrame, quality uint8, payloadSize int) ([]byte, map[int]packetMCUBoundary, error) {
@@ -962,46 +972,94 @@ func UpdatePacketsPreviewSparse(canvas *image.RGBA, rawPackets [][]byte) (*image
 	return decodePacketsToPreviewInto(canvas, rawPackets, false, true)
 }
 
+type ssdvPreviewDecode struct {
+	canvas        *image.RGBA
+	first         Packet
+	byID          map[uint16]Packet
+	ids           []int
+	covered       []bool
+	widthMCUs     int
+	totalMCUs     int
+	payloadSize   int
+	templateBytes []byte
+	templateFrame *jpegFrame
+	headerEnd     int
+	quant         [2][64]byte
+	decodedTotal  int
+}
+
 func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMissing, sparseOnly bool) (*image.RGBA, Packet, int, error) {
 	if len(rawPackets) == 0 {
 		return nil, Packet{}, 0, errors.New("SSDV packet set is empty")
 	}
+	first, byID, err := parsePreviewPacketSet(rawPackets)
+	if err != nil {
+		return nil, Packet{}, 0, err
+	}
+	if canvas == nil {
+		canvas = image.NewRGBA(image.Rect(0, 0, first.Width, first.Height))
+		draw.Draw(canvas, canvas.Bounds(), missingMCUFill(), image.Point{}, draw.Src)
+	} else if canvas.Bounds().Dx() != first.Width || canvas.Bounds().Dy() != first.Height {
+		return nil, first, 0, errors.New("SSDV preview canvas dimensions do not match packet image")
+	}
+
+	state, err := newSSDVPreviewDecode(canvas, first, byID)
+	if err != nil {
+		return nil, Packet{}, 0, err
+	}
+	if sparseOnly {
+		state.decodeSparseSegments()
+		if state.decodedTotal == 0 {
+			return nil, first, 0, errors.New("no complete SSDV MCU update segments are currently decodable")
+		}
+		return canvas, first, state.decodedTotal, nil
+	}
+	state.decodeRestartPacketSegments()
+	state.decodeAdjacentPacketSegments()
+	if state.decodedTotal == 0 {
+		return nil, first, 0, errors.New("no complete SSDV MCU blocks are currently decodable")
+	}
+	if fillMissing {
+		state.fillMissingBlocks()
+	}
+	return canvas, first, state.decodedTotal, nil
+}
+
+func parsePreviewPacketSet(rawPackets [][]byte) (Packet, map[uint16]Packet, error) {
 	byID := make(map[uint16]Packet, len(rawPackets))
 	var first Packet
-	for i, raw := range rawPackets {
+	for index, raw := range rawPackets {
 		packet, err := ParsePacket(raw)
 		if err != nil {
-			return nil, Packet{}, 0, fmt.Errorf("SSDV preview packet %d: %w", i, err)
+			return Packet{}, nil, fmt.Errorf("SSDV preview packet %d: %w", index, err)
 		}
-		if i == 0 {
+		if index == 0 {
 			first = packet
-		} else if packet.Callsign != first.Callsign || packet.ImageID != first.ImageID || packet.Width != first.Width || packet.Height != first.Height || packet.Quality != first.Quality || packet.FEC != first.FEC || packet.Subsampling != first.Subsampling {
-			return nil, Packet{}, 0, fmt.Errorf("SSDV preview packet %d belongs to a different image", i)
+		} else if packet.Callsign != first.Callsign || packet.ImageID != first.ImageID ||
+			packet.Width != first.Width || packet.Height != first.Height || packet.Quality != first.Quality ||
+			packet.FEC != first.FEC || packet.Subsampling != first.Subsampling {
+			return Packet{}, nil, fmt.Errorf("SSDV preview packet %d belongs to a different image", index)
 		}
 		if packet.Subsampling != 0 {
-			return nil, Packet{}, 0, errors.New("SSDV block preview currently supports 4:2:0 MCU mode only")
+			return Packet{}, nil, errors.New("SSDV block preview currently supports 4:2:0 MCU mode only")
 		}
 		if existing, ok := byID[packet.PacketID]; ok {
 			if existing.Raw != packet.Raw {
-				return nil, Packet{}, 0, fmt.Errorf("conflicting duplicate SSDV packet ID %d", packet.PacketID)
+				return Packet{}, nil, fmt.Errorf("conflicting duplicate SSDV packet ID %d", packet.PacketID)
 			}
 			continue
 		}
 		byID[packet.PacketID] = packet
 	}
-	if canvas == nil {
-		canvas = image.NewRGBA(image.Rect(0, 0, first.Width, first.Height))
-		draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}, image.Point{}, draw.Src)
-	} else if canvas.Bounds().Dx() != first.Width || canvas.Bounds().Dy() != first.Height {
-		return nil, first, 0, errors.New("SSDV preview canvas dimensions do not match packet image")
-	}
+	return first, byID, nil
+}
+
+func newSSDVPreviewDecode(canvas *image.RGBA, first Packet, byID map[uint16]Packet) (*ssdvPreviewDecode, error) {
 	widthMCUs := first.Width / 16
 	totalMCUs := widthMCUs * (first.Height / 16)
-	covered := make([]bool, totalMCUs)
-
 	templateBytes, templateFrame, headerEnd, err := getSparsePreviewTemplate()
 	if err != nil {
-		return nil, Packet{}, 0, err
+		return nil, err
 	}
 	quant := scaledQuantTables(first.Quality)
 	templateFrame.quant[0], templateFrame.quant[1] = quant[0], quant[1]
@@ -1010,188 +1068,181 @@ func decodePacketsToPreviewInto(canvas *image.RGBA, rawPackets [][]byte, fillMis
 	if first.FEC {
 		payloadSize = FECDataLength
 	}
-
 	ids := make([]int, 0, len(byID))
 	for id := range byID {
 		ids = append(ids, int(id))
 	}
 	sort.Ints(ids)
-	decodedTotal := 0
-	placeStrip := func(strip image.Image, startIndex, count int) {
-		for local := 0; local < count; local++ {
-			index := startIndex + local
-			if index < 0 || index >= totalMCUs {
-				break
-			}
-			x := (index % widthMCUs) * 16
-			y := (index / widthMCUs) * 16
-			src := image.Rect(0, local*16, 16, local*16+16)
-			dst := image.Rect(x, y, x+16, y+16)
-			draw.Draw(canvas, dst, strip, src.Min, draw.Src)
-			if !covered[index] {
-				covered[index] = true
-				decodedTotal++
-			}
+	return &ssdvPreviewDecode{
+		canvas: canvas, first: first, byID: byID, ids: ids,
+		covered: make([]bool, totalMCUs), widthMCUs: widthMCUs, totalMCUs: totalMCUs,
+		payloadSize: payloadSize, templateBytes: templateBytes, templateFrame: templateFrame,
+		headerEnd: headerEnd, quant: quant,
+	}, nil
+}
+
+func (state *ssdvPreviewDecode) placeStrip(strip image.Image, startIndex, count int) {
+	for local := 0; local < count; local++ {
+		index := startIndex + local
+		if index < 0 || index >= state.totalMCUs {
+			break
+		}
+		x := (index % state.widthMCUs) * 16
+		y := (index / state.widthMCUs) * 16
+		source := image.Rect(0, local*16, 16, local*16+16)
+		destination := image.Rect(x, y, x+16, y+16)
+		draw.Draw(state.canvas, destination, strip, source.Min, draw.Src)
+		if !state.covered[index] {
+			state.covered[index] = true
+			state.decodedTotal++
 		}
 	}
-	if sparseOnly {
-		// Sparse GIF frames can omit arbitrary packet ranges. Decode only a
-		// fully present entropy segment bounded by two MCU restart points, or
-		// the final segment from its restart point through the EOI packet. The
-		// latter explicitly handles an EOI tail packet that has no new MCU start.
-		for _, id := range ids {
-			current, ok := byID[uint16(id)]
-			if !ok || current.MCUOffset == 0xff || current.MCUIndex == 0xffff {
-				continue
-			}
-			startID := uint16(id)
-			endID := uint16(0)
-			endOffset := 0
-			endMCU := totalMCUs
-			bounded := false
-			for _, candidateID := range ids {
-				if candidateID <= id {
-					continue
-				}
-				candidate := byID[uint16(candidateID)]
-				if candidate.MCUOffset != 0xff && candidate.MCUIndex != 0xffff && candidate.MCUIndex > current.MCUIndex {
-					endID, endOffset, endMCU, bounded = uint16(candidateID), int(candidate.MCUOffset), int(candidate.MCUIndex), true
-					break
-				}
-			}
-			if !bounded {
-				foundEOI := false
-				for _, candidateID := range ids {
-					if candidateID < id {
-						continue
-					}
-					candidate := byID[uint16(candidateID)]
-					if candidate.EOI {
-						endID, foundEOI = uint16(candidateID), true
-						break
-					}
-				}
-				if !foundEOI {
-					continue
-				}
-			}
-			// Do not bridge omitted packet IDs: the entropy bytes would be
-			// discontinuous and could decode as plausible but incorrect pixels.
-			contiguous := true
-			for packetID := startID; packetID <= endID; packetID++ {
-				if _, exists := byID[packetID]; !exists {
-					contiguous = false
-					break
-				}
-			}
-			if !contiguous {
-				continue
-			}
-			segment := make([]byte, 0, int(endID-startID+1)*payloadSize)
-			for packetID := startID; packetID <= endID; packetID++ {
-				part := byID[packetID]
-				from, to := 0, payloadSize
-				if packetID == startID {
-					from = 15 + int(current.MCUOffset) - 15
-				}
-				if bounded && packetID == endID {
-					to = endOffset
-				}
-				if from < 0 || from > payloadSize || to < from || to > payloadSize {
-					segment = nil
-					break
-				}
-				segment = append(segment, part.Raw[15+from:15+to]...)
-			}
-			if len(segment) == 0 {
-				continue
-			}
-			count := endMCU - int(current.MCUIndex)
-			if count <= 0 {
-				continue
-			}
-			strip, stripErr := decodeMCUStrip(templateBytes, templateFrame, headerEnd, quant, first.Quality, segment, count)
-			if stripErr == nil {
-				placeStrip(strip, int(current.MCUIndex), count)
-			}
+}
+
+func (state *ssdvPreviewDecode) decodeSparseSegments() {
+	for _, id := range state.ids {
+		current := state.byID[uint16(id)]
+		if current.MCUOffset == 0xff || current.MCUIndex == 0xffff {
+			continue
 		}
-		if decodedTotal == 0 {
-			return nil, first, 0, errors.New("no complete SSDV MCU update segments are currently decodable")
+		endID, endOffset, endMCU, bounded, ok := state.findSparseSegmentEnd(id, current)
+		if !ok || !state.packetRangeIsContiguous(uint16(id), endID) {
+			continue
 		}
-		return canvas, first, decodedTotal, nil
+		segment := state.buildSparseSegment(uint16(id), endID, current, endOffset, bounded)
+		if len(segment) == 0 {
+			continue
+		}
+		count := endMCU - int(current.MCUIndex)
+		if count <= 0 {
+			continue
+		}
+		strip, err := decodeMCUStrip(state.templateBytes, state.templateFrame, state.headerEnd, state.quant, state.first.Quality, segment, count)
+		if err == nil {
+			state.placeStrip(strip, int(current.MCUIndex), count)
+		}
 	}
-	for _, id := range ids {
-		packet := byID[uint16(id)]
+}
+
+func (state *ssdvPreviewDecode) findSparseSegmentEnd(id int, current Packet) (uint16, int, int, bool, bool) {
+	for _, candidateID := range state.ids {
+		if candidateID <= id {
+			continue
+		}
+		candidate := state.byID[uint16(candidateID)]
+		if candidate.MCUOffset != 0xff && candidate.MCUIndex != 0xffff && candidate.MCUIndex > current.MCUIndex {
+			return uint16(candidateID), int(candidate.MCUOffset), int(candidate.MCUIndex), true, true
+		}
+	}
+	for _, candidateID := range state.ids {
+		if candidateID < id {
+			continue
+		}
+		if state.byID[uint16(candidateID)].EOI {
+			return uint16(candidateID), 0, state.totalMCUs, false, true
+		}
+	}
+	return 0, 0, 0, false, false
+}
+
+func (state *ssdvPreviewDecode) packetRangeIsContiguous(start, end uint16) bool {
+	for packetID := int(start); packetID <= int(end); packetID++ {
+		if _, exists := state.byID[uint16(packetID)]; !exists {
+			return false
+		}
+	}
+	return true
+}
+
+func (state *ssdvPreviewDecode) buildSparseSegment(startID, endID uint16, current Packet, endOffset int, bounded bool) []byte {
+	segment := make([]byte, 0, (int(endID)-int(startID)+1)*state.payloadSize)
+	for packetID := int(startID); packetID <= int(endID); packetID++ {
+		part := state.byID[uint16(packetID)]
+		from, to := 0, state.payloadSize
+		if uint16(packetID) == startID {
+			from = 15 + int(current.MCUOffset) - 15
+		}
+		if bounded && uint16(packetID) == endID {
+			to = endOffset
+		}
+		if from < 0 || from > state.payloadSize || to < from || to > state.payloadSize {
+			return nil
+		}
+		segment = append(segment, part.Raw[15+from:15+to]...)
+	}
+	return segment
+}
+
+func (state *ssdvPreviewDecode) decodeRestartPacketSegments() {
+	for _, id := range state.ids {
+		packet := state.byID[uint16(id)]
 		if packet.MCUOffset == 0xff || packet.MCUIndex == 0xffff {
-			continue // backward compatibility with old contiguous-stream transmitters
+			continue
 		}
-		if next, ok := byID[uint16(id+1)]; ok && next.MCUOffset != 0xff && next.MCUIndex != 0xffff && next.MCUIndex > packet.MCUIndex {
-			continue // the adjacent-packet strip below can decode this range exactly
-		}
-		if sparseOnly && !packet.EOI {
-			continue // sparse GIF deltas need a following restart point for a bounded segment
+		if next, ok := state.byID[uint16(id+1)]; ok && next.MCUOffset != 0xff &&
+			next.MCUIndex != 0xffff && next.MCUIndex > packet.MCUIndex {
+			continue
 		}
 		start := 15 + int(packet.MCUOffset)
-		end := 15 + payloadSize
-		if start >= end || int(packet.MCUIndex) >= totalMCUs {
+		end := 15 + state.payloadSize
+		if start >= end || int(packet.MCUIndex) >= state.totalMCUs {
 			continue
 		}
-		maxMCUs := totalMCUs - int(packet.MCUIndex)
-		frame := *templateFrame
+		maxMCUs := state.totalMCUs - int(packet.MCUIndex)
+		frame := *state.templateFrame
 		frame.Width, frame.Height, frame.scan = 16, maxMCUs*16, packet.Raw[start:end]
-		frame.quant[0], frame.quant[1] = quant[0], quant[1]
+		frame.quant[0], frame.quant[1] = state.quant[0], state.quant[1]
 		frame.quantSet[0], frame.quantSet[1] = true, true
-		entropy, _, decodedMCUs, decodeErr := transcodeJPEGScanMCUs(&frame, first.Quality, maxMCUs, true, 0, nil)
-		if decodeErr == nil && decodedMCUs > 0 {
-			strip, stripErr := decodeJPEGEntropyStrip(templateBytes, headerEnd, quant, entropy, decodedMCUs)
-			if stripErr == nil {
-				placeStrip(strip, int(packet.MCUIndex), decodedMCUs)
-			}
+		entropy, _, decodedMCUs, err := transcodeJPEGScanMCUs(&frame, state.first.Quality, maxMCUs, true, 0, nil)
+		if err != nil || decodedMCUs == 0 {
+			continue
+		}
+		strip, err := decodeJPEGEntropyStrip(state.templateBytes, state.headerEnd, state.quant, entropy, decodedMCUs)
+		if err == nil {
+			state.placeStrip(strip, int(packet.MCUIndex), decodedMCUs)
 		}
 	}
+}
 
-	// When two neighbouring packets are both present, decode the byte range
-	// between their MCU restart markers as one strip. This recovers the MCU
-	// that straddled the packet boundary without waiting for the entire image.
-	for _, id := range ids {
-		current, ok := byID[uint16(id)]
-		if !ok || current.MCUOffset == 0xff || current.MCUIndex == 0xffff {
+func (state *ssdvPreviewDecode) decodeAdjacentPacketSegments() {
+	for _, id := range state.ids {
+		current := state.byID[uint16(id)]
+		if current.MCUOffset == 0xff || current.MCUIndex == 0xffff {
 			continue
 		}
-		next, ok := byID[uint16(id+1)]
+		next, ok := state.byID[uint16(id+1)]
 		if !ok || next.MCUOffset == 0xff || next.MCUIndex == 0xffff || next.MCUIndex <= current.MCUIndex {
 			continue
 		}
 		startOffset, endOffset := int(current.MCUOffset), int(next.MCUOffset)
-		if startOffset >= payloadSize || endOffset > payloadSize {
+		if startOffset >= state.payloadSize || endOffset > state.payloadSize {
 			continue
 		}
-		segment := make([]byte, 0, (payloadSize-startOffset)+endOffset)
-		segment = append(segment, current.Raw[15+startOffset:15+payloadSize]...)
+		segment := make([]byte, 0, (state.payloadSize-startOffset)+endOffset)
+		segment = append(segment, current.Raw[15+startOffset:15+state.payloadSize]...)
 		segment = append(segment, next.Raw[15:15+endOffset]...)
 		count := int(next.MCUIndex - current.MCUIndex)
-		strip, stripErr := decodeMCUStrip(templateBytes, templateFrame, headerEnd, quant, first.Quality, segment, count)
-		if stripErr == nil {
-			placeStrip(strip, int(current.MCUIndex), count)
+		strip, err := decodeMCUStrip(state.templateBytes, state.templateFrame, state.headerEnd, state.quant, state.first.Quality, segment, count)
+		if err == nil {
+			state.placeStrip(strip, int(current.MCUIndex), count)
 		}
 	}
-	if decodedTotal == 0 {
-		return nil, first, 0, errors.New("no complete SSDV MCU blocks are currently decodable")
-	}
-	// Missing or not-yet-received MCU regions use a uniform light-grey fill.
-	// This keeps the preview neutral and makes block loss obvious without
-	// drawing hatch patterns that can be mistaken for decoded image content.
-	if fillMissing {
-		for index, ok := range covered {
-			if ok {
-				continue
-			}
-			x := (index % widthMCUs) * 16
-			y := (index / widthMCUs) * 16
-			draw.Draw(canvas, image.Rect(x, y, x+16, y+16), &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}, image.Point{}, draw.Src)
+}
+
+func (state *ssdvPreviewDecode) fillMissingBlocks() {
+	fill := missingMCUFill()
+	for index, covered := range state.covered {
+		if covered {
+			continue
 		}
+		x := (index % state.widthMCUs) * 16
+		y := (index / state.widthMCUs) * 16
+		draw.Draw(state.canvas, image.Rect(x, y, x+16, y+16), fill, image.Point{}, draw.Src)
 	}
-	return canvas, first, decodedTotal, nil
+}
+
+func missingMCUFill() *image.Uniform {
+	return &image.Uniform{C: color.RGBA{R: 218, G: 220, B: 222, A: 255}}
 }
 
 // DecodePacketsToJPEG validates, sorts and decodes a complete contiguous SSDV
@@ -1628,10 +1679,31 @@ func patchJPEGHeader(header []byte, width, height int, tables [2][64]byte) error
 	return errors.New("JPEG SOS marker missing while patching header")
 }
 
+// GIFFrameControlOptions contains the typed fields shared by SGV1 and SGV2
+// frame boundary packets. MotionVectors is used only by SGV2.
+type GIFFrameControlOptions struct {
+	Callsign      string
+	ImageID       uint8
+	Width         int
+	Height        int
+	Quality       uint8
+	DelayCS       uint16
+	DataPackets   uint16
+	FrameStart    bool
+	FrameEnd      bool
+	StreamStart   bool
+	StreamEnd     bool
+	Keyframe      bool
+	MotionVectors []GIFMotionVector
+}
+
 // NewGIFControlPacket is the legacy frame-close constructor retained for
 // compatibility with early SATSSDV-Go GIF prototypes.
-func NewGIFControlPacket(callsign string, imageID uint8, width, height int, quality uint8, delayCS uint16, keyframe, streamStart, streamEnd bool) ([]byte, error) {
-	return NewGIFFrameControlPacket(callsign, imageID, width, height, quality, delayCS, 0, false, true, streamStart, streamEnd, keyframe)
+func NewGIFControlPacket(options GIFFrameControlOptions) ([]byte, error) {
+	options.DataPackets = 0
+	options.FrameStart = false
+	options.FrameEnd = true
+	return NewGIFFrameControlPacket(options)
 }
 
 // NewGIFFrameControlPacket creates a versioned frame-boundary packet. A frame
@@ -1639,7 +1711,13 @@ func NewGIFControlPacket(callsign string, imageID uint8, width, height int, qual
 // packets, allowing RX to show an accurate live packet counter before frame
 // close. A frame close marker (PacketID 0xffff) commits the composed frame.
 // Repeated copies are identical and are removed by the transport deduplicator.
-func NewGIFFrameControlPacket(callsign string, imageID uint8, width, height int, quality uint8, delayCS uint16, dataPackets uint16, frameStart, frameEnd, streamStart, streamEnd, keyframe bool) ([]byte, error) {
+func NewGIFFrameControlPacket(options GIFFrameControlOptions) ([]byte, error) {
+	width, height := options.Width, options.Height
+	quality := options.Quality
+	frameStart, frameEnd := options.FrameStart, options.FrameEnd
+	callsign, imageID := options.Callsign, options.ImageID
+	keyframe, streamStart, streamEnd := options.Keyframe, options.StreamStart, options.StreamEnd
+	delayCS, dataPackets := options.DelayCS, options.DataPackets
 	if width < 16 || height < 16 || width > 4080 || height > 4080 || width%16 != 0 || height%16 != 0 {
 		return nil, errors.New("GIF control packet dimensions must be SSDV-aligned multiples of 16")
 	}
@@ -1702,15 +1780,17 @@ func NewGIFFrameControlPacket(callsign string, imageID uint8, width, height int,
 // the SGV1 magic, base flags and data-packet count at their original offsets so
 // SGV1 parsers can still recognize the frame boundaries and ignore the new
 // motion payload. New receivers additionally apply the MCU motion vectors.
-func NewGIFFrameControlPacketV2(callsign string, imageID uint8, width, height int, quality uint8, delayCS uint16, dataPackets uint16, frameStart, frameEnd, streamStart, streamEnd, keyframe bool, vectors []GIFMotionVector) ([]byte, error) {
+func NewGIFFrameControlPacketV2(options GIFFrameControlOptions) ([]byte, error) {
+	width, height := options.Width, options.Height
+	vectors := options.MotionVectors
 	if len(vectors) > 32 {
 		return nil, errors.New("SGV2 motion extension supports at most 32 vectors per frame")
 	}
-	packet, err := NewGIFFrameControlPacket(callsign, imageID, width, height, quality, delayCS, dataPackets, frameStart, frameEnd, streamStart, streamEnd, keyframe)
+	packet, err := NewGIFFrameControlPacket(options)
 	if err != nil {
 		return nil, err
 	}
-	if len(vectors) > 0 && (!frameStart || keyframe) {
+	if len(vectors) > 0 && (!options.FrameStart || options.Keyframe) {
 		return nil, errors.New("SGV2 motion vectors are only valid on delta frame-open controls")
 	}
 	if !validGIFMotionSet(vectors, width, height) {

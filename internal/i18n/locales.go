@@ -157,6 +157,11 @@ func init() {
 	messages[Japanese]["album.exported"] = "{count} 個のファイルをエクスポートしました"
 	messages[Japanese]["album.delete"] = "記録を削除"
 
+	initTemplateMessages()
+	initSettingsMessages()
+}
+
+func initTemplateMessages() {
 	// Dynamic TX template presets and visible operation feedback.
 	for locale, values := range map[Locale]map[string]string{
 		Chinese: {
@@ -191,6 +196,9 @@ func init() {
 			messages[locale][key] = value
 		}
 	}
+}
+
+func initSettingsMessages() {
 	// Settings dialog labels and runtime device-status messages.
 	for locale, values := range map[Locale]map[string]string{
 		Chinese: {

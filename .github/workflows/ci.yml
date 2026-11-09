@@ -77,123 +77,86 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SATSSDV-Go-aislop-code-analysis
+          name: SATSSDV-Go-report-input-aislop
           path: reports/aislop/
+          retention-days: 1
           if-no-files-found: warn
 
   qex-itu-channel-regression:
-    name: QEX / ITU channel + race regression — ${{ matrix.profile }}
+    name: QEX / ITU channel sensitivity + race regression — all profiles
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        profile:
-          - ssdv-ax25
-          - ssdv-ccsds-1200
-          - ssdv-ccsds-2400
-          - pcsi-ccsds-1200
-          - pcsi-ccsds-2400
-          - ssdv-qpsk-1600
-          - ssdv-8psk-1600
-          - ssdv-16qam-1600
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
           cache: true
-      - name: Prepare per-profile test outputs
-        run: mkdir -p reports/channel-csv reports/race
-      - name: Run QEX / ITU channel sensitivity sweep through production TX/RX
+      - name: Prepare unified test output directories
+        run: mkdir -p reports/channel reports/race reports/qex
+      - name: Run QEX / ITU sensitivity sweep through production TX/RX (all profiles)
         env:
           SATSSDV_CHANNEL_TESTS: "1"
-          SATSSDV_CHANNEL_PROFILE: ${{ matrix.profile }}
           SATSSDV_CHANNEL_TRIALS: "10"
-          SATSSDV_CHANNEL_CSV: ${{ github.workspace }}/reports/${{ matrix.profile }}.csv
-        run: |
-          set -o pipefail
-          go test -count=1 -v ./internal/transport \
-            -run '^TestSatelliteChannelSensitivityCharacterization$' \
-            2>&1 | tee "reports/channel-${{ matrix.profile }}.log"
-      - name: Run race and concurrency regression suite
-        if: always() && matrix.profile == 'ssdv-ax25'
+          SATSSDV_CHANNEL_CSV: ${{ github.workspace }}/reports/channel/channel-all-profiles.csv
         shell: bash
         run: |
           set -o pipefail
+          go test -count=1 -timeout 100m -v ./internal/transport \
+            -run '^TestSatelliteChannelSensitivityCharacterization$' \
+            2>&1 | tee reports/channel/channel-all-profiles.log
+      - name: Run race and concurrency regression suite
+        if: always()
+        shell: bash
+        run: |
+          set +e
           LOG=reports/race/race-regression.log
+          : > "$LOG"
+          failures=0
           run_race() {
             printf '\n$' | tee -a "$LOG"
             printf ' %q' "$@" | tee -a "$LOG"
             printf '\n' | tee -a "$LOG"
             "$@" 2>&1 | tee -a "$LOG"
+            result=${PIPESTATUS[0]}
+            if [ "$result" -ne 0 ]; then
+              printf 'COMMAND_EXIT=%s\n' "$result" | tee -a "$LOG"
+              failures=$((failures + 1))
+            fi
           }
           run_race go test -race ./internal/modem/mary
           run_race go test -race ./internal/image/bcsi
-          run_race go test -race ./internal/rx -run '^TestManagerSubmitRejectsAfterClose$|^TestManagerSubmitDoesNotBlockWhenQueueSaturates$|^TestManagerKeepsIngestingPCSIWhileReconstructionRuns$|^TestManagerDiagnosticsReportsQueueAndProcessingProgress$|^TestGIFManagerDeduplicatesRepeatedControlAndAcceptsRepeatedTX$'
+          run_race go test -race ./internal/rx -run '^TestManagerSubmitRejectsAfterClose$'
+          run_race go test -race ./internal/rx -run '^TestManagerSubmitDoesNotBlockWhenQueueSaturates$'
+          run_race go test -race ./internal/rx -run '^TestManagerKeepsIngestingPCSIWhileReconstructionRuns$'
+          run_race go test -race ./internal/rx -run '^TestManagerDiagnosticsReportsQueueAndProcessingProgress$'
+          run_race go test -race ./internal/rx -run '^TestGIFManagerDeduplicatesRepeatedControlAndAcceptsRepeatedTX$'
           run_race go test -race ./internal/transport -run '^TestMAModulationTXFilteredRXAirpath$|^TestMAModulationTXFilteredRXWithAudioNoise$'
-      - name: Upload profile channel measurements
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: SATSSDV-Go-channel-${{ matrix.profile }}
-          path: |
-            reports/${{ matrix.profile }}.csv
-            reports/channel-${{ matrix.profile }}.log
-          if-no-files-found: warn
-      - name: Upload race regression evidence
-        if: always() && matrix.profile == 'ssdv-ax25'
-        uses: actions/upload-artifact@v4
-        with:
-          name: SATSSDV-Go-race-log
-          path: reports/race/race-regression.log
-          if-no-files-found: warn
-
-  qex-itu-channel-report:
-    name: Generate QEX / ITU technical report
-    if: always()
-    needs: [qex-itu-channel-regression]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-      - name: Download channel measurement artifacts
-        if: always()
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: SATSSDV-Go-channel-*
-          path: reports/channel-csv
-          merge-multiple: true
-      - name: Download race detector evidence
-        if: always()
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: SATSSDV-Go-race-log
-          path: reports/race
+          if [ "$failures" -ne 0 ]; then
+            echo "Race regression failed in $failures command(s)." | tee -a "$LOG"
+            exit 1
+          fi
       - name: Install plotting dependency
+        if: always()
         run: python -m pip install --disable-pip-version-check matplotlib
-      - name: Generate QEX / ITU Markdown, CSV, JSON and PNG reports
+      - name: Generate all-profile QEX / ITU Markdown, CSV, JSON and PNG reports
         if: always()
         run: |
           python scripts/generate_qex_report.py \
-            --input-dir reports/channel-csv \
+            --input-dir reports/channel \
             --output-dir reports/qex \
             --trials 10 \
             --race-log reports/race/race-regression.log
-      - name: Upload QEX / ITU channel and race report
+      - name: Upload unified QEX / ITU and race report inputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SATSSDV-Go-QEX-ITU-Channel-Report
+          name: SATSSDV-Go-report-input-qex
           path: |
+            reports/channel/
             reports/qex/
-            reports/channel-csv/
             reports/race/
+          retention-days: 1
           if-no-files-found: warn
 
   qt-linux:
@@ -515,4 +478,51 @@ jobs:
         with:
           name: SATSSDV-Go-macos-${{ matrix.arch }}
           path: SATSSDV-Go-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  ci-report-package:
+    name: Package all CI reports into one ZIP
+    if: always()
+    needs:
+      - aislop-quality-gate
+      - qex-itu-channel-regression
+      - qt-linux
+      - qt-windows
+      - qt-macos
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Prepare unified report input directory
+        run: mkdir -p report-input/aislop report-input/qex
+      - name: Download Aislop report inputs
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: SATSSDV-Go-report-input-aislop
+          path: report-input/aislop
+      - name: Download QEX / ITU and race report inputs
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: SATSSDV-Go-report-input-qex
+          path: report-input/qex
+      - name: Build and validate one complete CI report ZIP
+        env:
+          CI_AISLOP_RESULT: ${{ needs.aislop-quality-gate.result }}
+          CI_QEX_RESULT: ${{ needs.qex-itu-channel-regression.result }}
+          CI_LINUX_RESULT: ${{ needs.qt-linux.result }}
+          CI_WINDOWS_RESULT: ${{ needs.qt-windows.result }}
+          CI_MACOS_RESULT: ${{ needs.qt-macos.result }}
+        run: python scripts/package_ci_reports.py --input-root report-input --output SATSSDV-Go-CI-Reports.zip
+      - name: Upload the single complete CI report package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-Complete-CI-Reports
+          path: SATSSDV-Go-CI-Reports.zip
           if-no-files-found: error

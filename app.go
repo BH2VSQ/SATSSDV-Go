@@ -716,7 +716,11 @@ func (a *App) sendImageJob(ctx context.Context, job txqueue.Job) error {
 	if duplex == nil {
 		return audio.ErrRuntimeUnavailable
 	}
-	prepared, err := tximage.PrepareImagePacketsWithAX25FEC(source, job.Profile, job.Quality, callsign, imageID, rate, uint8(job.AX25SSID), job.AX25To, maryFECProfileValue(maryFECProfile))
+	prepared, err := tximage.PrepareImagePacketsWithOptions(source, tximage.PrepareOptions{
+		ProfileID: job.Profile, Quality: job.Quality, Callsign: callsign, ImageID: imageID,
+		OutputSampleRate: rate, SourceSSID: uint8(job.AX25SSID), Destination: job.AX25To,
+		FECProfile: maryFECProfileValue(maryFECProfile),
+	})
 	if err != nil {
 		return err
 	}

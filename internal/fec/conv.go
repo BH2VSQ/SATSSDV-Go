@@ -627,7 +627,11 @@ func RecoverErasureShards(data [][]byte, parity0, parity1 []byte) (int, error) {
 			}
 			coefficient := alphaTo[index]
 			for pos, value := range recovered {
-				recovered[pos] = gfDiv(value, coefficient)
+				divided, err := gfDiv(value, coefficient)
+				if err != nil {
+					return 0, err
+				}
+				recovered[pos] = divided
 			}
 		}
 		data[index] = recovered
@@ -658,7 +662,11 @@ func RecoverErasureShards(data [][]byte, parity0, parity1 []byte) (int, error) {
 	for pos := 0; pos < shardLen; pos++ {
 		// residual0 = x ^ y; residual1 = a*x ^ b*y.
 		// Therefore x = (residual1 ^ b*residual0) / (a ^ b).
-		x[pos] = gfDiv(residual1[pos]^gfMul(b, residual0[pos]), denominator)
+		value, err := gfDiv(residual1[pos]^gfMul(b, residual0[pos]), denominator)
+		if err != nil {
+			return 0, err
+		}
+		x[pos] = value
 		y[pos] = residual0[pos] ^ x[pos]
 	}
 	data[first], data[second] = x, y

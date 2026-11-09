@@ -411,6 +411,22 @@ func EncodeContextV2(ctx context.Context, frames []Frame, callsign string, baseI
 	return encodeContext(ctx, frames, callsign, baseImageID, quality, 2)
 }
 
+type gifFrameEncodeOptions struct {
+	callsign        string
+	baseImageID     uint8
+	quality         uint8
+	protocolVersion uint8
+	frameIndex      int
+	frameCount      int
+	previous        *image.RGBA
+}
+
+type encodedGIFFrame struct {
+	packets  [][]byte
+	stats    Stats
+	previous *image.RGBA
+}
+
 func encodeContext(ctx context.Context, frames []Frame, callsign string, baseImageID uint8, quality uint8, protocolVersion uint8) ([][]byte, Stats, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -429,124 +445,195 @@ func encodeContext(ctx context.Context, frames []Frame, callsign string, baseIma
 	allPackets := make([][]byte, 0, len(frames)*8)
 	var previous *image.RGBA
 	for frameIndex, frame := range frames {
-		if err := ctx.Err(); err != nil {
-			return nil, stats, err
-		}
-		if frame.Image == nil {
-			return nil, stats, fmt.Errorf("GIF frame %d is nil", frameIndex)
-		}
-		if previous != nil && previous.Bounds() != frame.Image.Bounds() {
-			return nil, stats, errors.New("GIF frames have inconsistent resized dimensions")
-		}
-		frameID := uint8(uint16(baseImageID) + uint16(frameIndex))
-		comparisonBase := previous
-		var motionVectors []ssdv.GIFMotionVector
-		predictedMCUs := 0
-		if protocolVersion >= 2 && previous != nil {
-			comparisonBase, motionVectors, predictedMCUs = PredictMotion(previous, frame.Image)
-		}
-		changed, changedCount, totalMCUs := changedMCUs(comparisonBase, frame.Image)
-		keyframe := previous == nil || frameIndex%KeyframeInterval == 0 ||
-			(float64(changedCount)/float64(max(1, totalMCUs))) >= KeyframeChangeRatio
-		if keyframe {
-			motionVectors = nil
-			predictedMCUs = 0
-			changed, changedCount, totalMCUs = changedMCUs(previous, frame.Image)
-		}
-
-		fullPackets, err := ssdv.EncodeImage(frame.Image, ssdv.EncodeConfig{
-			Callsign: callsign, ImageID: frameID, Quality: quality, FEC: true,
-			GIFMode: true, Keyframe: keyframe,
+		result, err := encodeGIFFrame(ctx, frame, gifFrameEncodeOptions{
+			callsign: callsign, baseImageID: baseImageID, quality: quality,
+			protocolVersion: protocolVersion, frameIndex: frameIndex,
+			frameCount: len(frames), previous: previous,
 		})
 		if err != nil {
-			return nil, stats, fmt.Errorf("encode GIF frame %d: %w", frameIndex, err)
-		}
-		if err := ctx.Err(); err != nil {
 			return nil, stats, err
 		}
-		selected := fullPackets
-		if !keyframe {
-			var sparseAvailable bool
-			selected, sparseAvailable, err = selectChangedSegments(fullPackets, changed, totalMCUs)
-			if err != nil {
-				return nil, stats, fmt.Errorf("select GIF frame %d MCU updates: %w", frameIndex, err)
-			}
-			// A sparse delta is only safe when RX can independently decode every
-			// selected restart-point segment. Validate it before putting anything
-			// on air. If an encoder/profile provides legacy continuous JPEG data,
-			// or a segment is not self-contained, promote this frame to a complete
-			// keyframe instead of sending a full packet set mislabeled as DELTA.
-			if sparseAvailable && changedCount > 0 {
-				_, _, decodedMCUs, previewErr := ssdv.UpdatePacketsPreviewSparse(image.NewRGBA(frame.Image.Bounds()), selected)
-				if previewErr != nil || decodedMCUs == 0 {
-					sparseAvailable = false
-				}
-			}
-			if !sparseAvailable {
-				keyframe = true
-				motionVectors = nil
-				predictedMCUs = 0
-				selected, err = ssdv.EncodeImage(frame.Image, ssdv.EncodeConfig{
-					Callsign: callsign, ImageID: frameID, Quality: quality, FEC: true,
-					GIFMode: true, Keyframe: true,
-				})
-				if err != nil {
-					return nil, stats, fmt.Errorf("re-encode GIF frame %d as a recovery keyframe: %w", frameIndex, err)
-				}
-			}
-		}
-		// Send a frame-open marker before the image data so RX knows the exact
-		// expected data-packet count while the MCU blocks are arriving. The
-		// independent frame-close marker commits the frame after all payloads.
-		var openMarker []byte
-		var markerErr error
-		if protocolVersion >= 2 {
-			openMarker, markerErr = ssdv.NewGIFFrameControlPacketV2(callsign, frameID,
-				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
-				uint16(len(selected)), true, false, frameIndex == 0, false, keyframe, motionVectors)
-		} else {
-			openMarker, markerErr = ssdv.NewGIFFrameControlPacket(callsign, frameID,
-				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
-				uint16(len(selected)), true, false, frameIndex == 0, false, keyframe)
-		}
-		if markerErr != nil {
-			return nil, stats, fmt.Errorf("build GIF frame %d open marker: %w", frameIndex, markerErr)
-		}
-		for copyIndex := 0; copyIndex < ControlPacketCopies; copyIndex++ {
-			allPackets = append(allPackets, append([]byte(nil), openMarker...))
-		}
-		allPackets = append(allPackets, selected...)
-		var closeMarker []byte
-		if protocolVersion >= 2 {
-			closeMarker, markerErr = ssdv.NewGIFFrameControlPacketV2(callsign, frameID,
-				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
-				uint16(len(selected)), false, true, false, frameIndex == len(frames)-1, keyframe, nil)
-		} else {
-			closeMarker, markerErr = ssdv.NewGIFFrameControlPacket(callsign, frameID,
-				frame.Image.Bounds().Dx(), frame.Image.Bounds().Dy(), quality, frame.DelayCS,
-				uint16(len(selected)), false, true, false, frameIndex == len(frames)-1, keyframe)
-		}
-		if markerErr != nil {
-			return nil, stats, fmt.Errorf("build GIF frame %d close marker: %w", frameIndex, markerErr)
-		}
-		for copyIndex := 0; copyIndex < ControlPacketCopies; copyIndex++ {
-			allPackets = append(allPackets, append([]byte(nil), closeMarker...))
-		}
-
-		stats.Frames++
-		if keyframe {
-			stats.Keyframes++
-		}
-		stats.DataPackets += len(selected)
-		stats.ControlPackets += ControlPacketCopies * 2
-		stats.ChangedMCUs += changedCount
-		stats.TotalMCUs += totalMCUs
-		stats.MotionVectors += len(motionVectors)
-		stats.PredictedMCUs += predictedMCUs
-		previous = cloneRGBA(frame.Image)
+		allPackets = append(allPackets, result.packets...)
+		stats.Frames += result.stats.Frames
+		stats.Keyframes += result.stats.Keyframes
+		stats.DataPackets += result.stats.DataPackets
+		stats.ControlPackets += result.stats.ControlPackets
+		stats.ChangedMCUs += result.stats.ChangedMCUs
+		stats.TotalMCUs += result.stats.TotalMCUs
+		stats.MotionVectors += result.stats.MotionVectors
+		stats.PredictedMCUs += result.stats.PredictedMCUs
+		previous = result.previous
 	}
 	stats.TotalPackets = len(allPackets)
 	return allPackets, stats, nil
+}
+
+func encodeGIFFrame(ctx context.Context, frame Frame, options gifFrameEncodeOptions) (encodedGIFFrame, error) {
+	result := encodedGIFFrame{}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if frame.Image == nil {
+		return result, fmt.Errorf("GIF frame %d is nil", options.frameIndex)
+	}
+	previous := options.previous
+	if previous != nil && previous.Bounds() != frame.Image.Bounds() {
+		return result, errors.New("GIF frames have inconsistent resized dimensions")
+	}
+
+	frameID := uint8(uint16(options.baseImageID) + uint16(options.frameIndex))
+	comparisonBase, motionVectors, predictedMCUs := selectFramePrediction(previous, frame.Image, options.protocolVersion)
+	changed, changedCount, totalMCUs := changedMCUs(comparisonBase, frame.Image)
+	keyframe := shouldUseKeyframe(previous, options.frameIndex, changedCount, totalMCUs)
+	if keyframe {
+		motionVectors = nil
+		predictedMCUs = 0
+		changed, changedCount, totalMCUs = changedMCUs(previous, frame.Image)
+	}
+
+	fullPackets, err := ssdv.EncodeImage(frame.Image, ssdv.EncodeConfig{
+		Callsign: options.callsign, ImageID: frameID, Quality: options.quality, FEC: true,
+		GIFMode: true, Keyframe: keyframe,
+	})
+	if err != nil {
+		return result, fmt.Errorf("encode GIF frame %d: %w", options.frameIndex, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	selection := framePacketSelection{
+		frame: frame, fullPackets: fullPackets, changed: changed,
+		changedCount: changedCount, totalMCUs: totalMCUs, keyframe: keyframe,
+		motionVectors: motionVectors, predictedMCUs: predictedMCUs, options: options,
+	}
+	selected, keyframe, motionVectors, predictedMCUs, err := selectFramePackets(selection)
+	if err != nil {
+		return result, err
+	}
+
+	openOptions := frameControlOptions(frame, options, frameID, uint16(len(selected)), true)
+	openOptions.Keyframe = keyframe
+	openOptions.MotionVectors = motionVectors
+	openMarker, err := buildFrameOpenMarker(openOptions, options.protocolVersion)
+	if err != nil {
+		return result, fmt.Errorf("build GIF frame %d open marker: %w", options.frameIndex, err)
+	}
+	packets := appendControlCopies(nil, openMarker)
+	packets = append(packets, selected...)
+
+	closeOptions := frameControlOptions(frame, options, frameID, uint16(len(selected)), false)
+	closeOptions.Keyframe = keyframe
+	closeOptions.StreamEnd = options.frameIndex == options.frameCount-1
+	closeMarker, err := buildFrameCloseMarker(closeOptions, options.protocolVersion)
+	if err != nil {
+		return result, fmt.Errorf("build GIF frame %d close marker: %w", options.frameIndex, err)
+	}
+	packets = appendControlCopies(packets, closeMarker)
+
+	frameStats := Stats{
+		Frames: 1, DataPackets: len(selected), ControlPackets: ControlPacketCopies * 2,
+		ChangedMCUs: changedCount, TotalMCUs: totalMCUs,
+		MotionVectors: len(motionVectors), PredictedMCUs: predictedMCUs,
+	}
+	if keyframe {
+		frameStats.Keyframes = 1
+	}
+	result.packets = packets
+	result.stats = frameStats
+	result.previous = cloneRGBA(frame.Image)
+	return result, nil
+}
+
+func selectFramePrediction(previous, current *image.RGBA, protocolVersion uint8) (*image.RGBA, []ssdv.GIFMotionVector, int) {
+	if protocolVersion < 2 || previous == nil {
+		return previous, nil, 0
+	}
+	return PredictMotion(previous, current)
+}
+
+func shouldUseKeyframe(previous *image.RGBA, frameIndex, changedCount, totalMCUs int) bool {
+	return previous == nil || frameIndex%KeyframeInterval == 0 ||
+		float64(changedCount)/float64(max(1, totalMCUs)) >= KeyframeChangeRatio
+}
+
+type framePacketSelection struct {
+	frame         Frame
+	fullPackets   [][]byte
+	changed       []bool
+	changedCount  int
+	totalMCUs     int
+	keyframe      bool
+	motionVectors []ssdv.GIFMotionVector
+	predictedMCUs int
+	options       gifFrameEncodeOptions
+}
+
+func selectFramePackets(selection framePacketSelection) ([][]byte, bool, []ssdv.GIFMotionVector, int, error) {
+	selected := selection.fullPackets
+	if selection.keyframe {
+		return selected, true, selection.motionVectors, selection.predictedMCUs, nil
+	}
+	var sparseAvailable bool
+	var err error
+	selected, sparseAvailable, err = selectChangedSegments(selection.fullPackets, selection.changed, selection.totalMCUs)
+	if err != nil {
+		return nil, false, nil, 0, fmt.Errorf("select GIF frame %d MCU updates: %w", selection.options.frameIndex, err)
+	}
+	if sparseAvailable && selection.changedCount > 0 {
+		_, _, decodedMCUs, previewErr := ssdv.UpdatePacketsPreviewSparse(image.NewRGBA(selection.frame.Image.Bounds()), selected)
+		if previewErr != nil || decodedMCUs == 0 {
+			sparseAvailable = false
+		}
+	}
+	if sparseAvailable {
+		return selected, false, selection.motionVectors, selection.predictedMCUs, nil
+	}
+
+	selected, err = ssdv.EncodeImage(selection.frame.Image, ssdv.EncodeConfig{
+		Callsign: selection.options.callsign,
+		ImageID:  uint8(uint16(selection.options.baseImageID) + uint16(selection.options.frameIndex)),
+		Quality:  selection.options.quality, FEC: true, GIFMode: true, Keyframe: true,
+	})
+	if err != nil {
+		return nil, false, nil, 0, fmt.Errorf("re-encode GIF frame %d as a recovery keyframe: %w", selection.options.frameIndex, err)
+	}
+	return selected, true, nil, 0, nil
+}
+
+func frameControlOptions(frame Frame, options gifFrameEncodeOptions, frameID uint8, dataPackets uint16, open bool) ssdv.GIFFrameControlOptions {
+	control := ssdv.GIFFrameControlOptions{
+		Callsign: options.callsign, ImageID: frameID,
+		Width: frame.Image.Bounds().Dx(), Height: frame.Image.Bounds().Dy(),
+		Quality: options.quality, DelayCS: frame.DelayCS, DataPackets: dataPackets,
+		Keyframe: false,
+	}
+	if open {
+		control.FrameStart = true
+		control.StreamStart = options.frameIndex == 0
+	}
+	return control
+}
+
+func buildFrameOpenMarker(options ssdv.GIFFrameControlOptions, protocolVersion uint8) ([]byte, error) {
+	if protocolVersion >= 2 {
+		return ssdv.NewGIFFrameControlPacketV2(options)
+	}
+	return ssdv.NewGIFFrameControlPacket(options)
+}
+
+func buildFrameCloseMarker(options ssdv.GIFFrameControlOptions, protocolVersion uint8) ([]byte, error) {
+	options.FrameEnd = true
+	if protocolVersion >= 2 {
+		return ssdv.NewGIFFrameControlPacketV2(options)
+	}
+	return ssdv.NewGIFFrameControlPacket(options)
+}
+
+func appendControlCopies(packets [][]byte, marker []byte) [][]byte {
+	for copyIndex := 0; copyIndex < ControlPacketCopies; copyIndex++ {
+		packets = append(packets, append([]byte(nil), marker...))
+	}
+	return packets
 }
 
 func changedMCUs(previous, current *image.RGBA) ([]bool, int, int) {

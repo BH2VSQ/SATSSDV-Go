@@ -13,7 +13,7 @@ FILES = {
     "docs": (ROOT / "docs/SOFT_FEC_PACKET_RECOVERY.md").read_text(encoding="utf-8"),
 }
 checks = {
-    "M-ary exposes soft bit LLRs": "func (d *StreamDemodulator) FeedSoft" in FILES["mary"] and "minOne - minZero" in FILES["mary"],
+    "M-ary exposes soft bit LLRs": "func (d *StreamDemodulator) FeedSoft" in FILES["mary"] and "llr := minOne[bit] - minZero[bit]" in FILES["mary"],
     "legacy hard-decision API wraps soft demapper": "llrs := d.FeedSoft(samples)" in FILES["mary"],
     "K=7 rate-1/2 convolutional encoder": "ConvPolyA" in FILES["fec"] and "ConvPolyB" in FILES["fec"] and "ConvMemory" in FILES["fec"],
     "soft-decision Viterbi consumes LLR": "func (d *ViterbiDecoder) Feed(llrs []float32)" in FILES["fec"],

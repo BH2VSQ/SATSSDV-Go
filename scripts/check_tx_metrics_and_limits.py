@@ -4,18 +4,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 app = (ROOT / "app.go").read_text(encoding="utf-8")
+gif_tx = (ROOT / "app_gif_tx.go").read_text(encoding="utf-8")
 cpp = (ROOT / "qt6" / "mainwindow.cpp").read_text(encoding="utf-8")
 header = (ROOT / "qt6" / "mainwindow.h").read_text(encoding="utf-8")
 duplex = (ROOT / "internal" / "audio" / "duplex.go").read_text(encoding="utf-8")
 docs = (ROOT / "docs" / "GIF_TX_MODE.md").read_text(encoding="utf-8")
 checks = {
     "bottom protocol development warning is removed": "协议编解码仍在开发验证中" not in cpp,
-    "GIF-specific ten-minute hard cap is removed": "airtime > 10*time.Minute" not in app and "safety limit is 10 minutes" not in app,
+    "GIF-specific ten-minute hard cap is removed": all(token not in app + gif_tx for token in ("airtime > 10*time.Minute", "safety limit is 10 minutes")),
     "GIF docs no longer advertise ten-minute limit": "at most 10 minutes per burst" not in docs,
     "stream has real playback-start lifecycle callback": "TransmitStreamWithStart" in duplex and "onPlaybackStart()" in duplex,
     "TX emits estimated elapsed and remaining time": all(k in app for k in ("estimatedSeconds", "elapsedSeconds", "remainingSeconds")),
     "TX emits total and sent data frame counts": all(k in app for k in ("totalDataFrames", "sentDataFrames")),
-    "GIF counter includes parity transport frames": "EstimateWirePacketCount(packets)" in app and "totalDataFrames := wireFrameCount" in app,
+    "GIF counter includes parity transport frames": "s.encoder.EstimateWirePacketCount(s.packets)" in gif_tx and "wireFrameCount" in gif_tx and "s.wireFrameCount" in gif_tx,
     "static image counter includes M-ary parity frames": "EstimateWirePacketCount(prepared.Packets)" in app and "totalDataFrames, err := prepared.Encoder.EstimateWirePacketCount" in app,
     "Qt has dedicated metrics label": "QLabel *m_txMetrics = nullptr;" in header and 'setObjectName(QStringLiteral("txMetrics"))' in cpp,
     "Qt displays all requested TX metrics": all(k in cpp for k in ("预计 %1", "已发射 %2", "剩余 %3", "数据帧 %4 / %5")),

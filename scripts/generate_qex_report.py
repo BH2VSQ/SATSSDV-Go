@@ -12,10 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 def read_channel_csvs(paths: list[Path]) -> list[dict[str, str]]:
@@ -132,6 +128,11 @@ def write_combined_csv(rows: list[dict[str, str]], output: Path) -> None:
 
 
 def plot_probability_curves(summaries: list[dict[str, Any]], output: Path) -> list[Path]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     images: list[Path] = []
     for family, predicate in (
         ("awgn", lambda item: item["scenario"] == "AWGN"),
@@ -192,7 +193,7 @@ def report_markdown(summaries: list[dict[str, Any]], args: argparse.Namespace) -
         f"- Trials per SNR point (configured): `{args.trials}`",
         f"- Channel groups measured: `{len(summaries)}`",
         f"- Race detector status: `{race_status}`",
-        f"- SNR reference: `2500 Hz equivalent`",
+        "- SNR reference: `2500 Hz equivalent`",
         "",
         "## Scope and interpretation",
         "",
@@ -317,7 +318,7 @@ def main() -> int:
     plots = plot_probability_curves(summaries, args.output_dir)
     report = report_markdown(summaries, args)
     if not summaries:
-        report += "\n**No channel CSV measurements were available.** See the per-profile CI artifacts/logs for the failing test stage.\n"
+        report += "\n**No channel CSV measurements were available.** See `channel-all-profiles.log` in the unified QEX/ITU report package for the failing test stage.\n"
     output = args.output_dir / "QEX-ITU-Channel-Sensitivity.md"
     output.write_text(report, encoding="utf-8")
     print(f"wrote QEX/ITU report ({len(rows)} rows, {len(plots)} plots): {output}")

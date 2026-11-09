@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import sys
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import generate_aislop_report as aislop_report  # noqa: E402
 import generate_qex_report as qex_report  # noqa: E402
+import package_ci_reports as ci_package  # noqa: E402
 
 
 def check(condition: bool, message: str) -> None:
@@ -23,7 +25,36 @@ def check(condition: bool, message: str) -> None:
     print(f"PASS: {message}")
 
 
+def check_no_empty_fstrings(root: Path) -> None:
+    findings: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if any(part in {".git", "__pycache__", "build", "dist"} for part in path.parts):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError) as error:
+            raise AssertionError(f"cannot parse Python source {path}: {error}") from error
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            parent = parents.get(node)
+            is_format_spec = isinstance(parent, ast.FormattedValue) and parent.format_spec is node
+            if (
+                isinstance(node, ast.JoinedStr)
+                and not is_format_spec
+                and not any(isinstance(value, ast.FormattedValue) for value in node.values)
+            ):
+                findings.append(f"{path.relative_to(root)}:{node.lineno}")
+    if findings:
+        raise AssertionError("empty f-strings (ruff/F541): " + ", ".join(findings))
+    print("PASS: no empty f-strings (Aislop ruff/F541 regression guard)")
+
+
 def main() -> int:
+    check_no_empty_fstrings(ROOT)
     check(abs(qex_report.interpolate_p50([-4, 0, 4, 8], [0.0, 0.2, 0.6, 1.0]) - 3.0) < 1e-9,
           "P50 linearly interpolates the first 0.5 probability crossing")
     check(qex_report.isotonic_increasing([0.0, 0.8, 0.6, 1.0], [10, 10, 10, 10]) == [0.0, 0.7, 0.7, 1.0],
@@ -101,6 +132,31 @@ def main() -> int:
         markdown = qex_report.report_markdown(summaries, args)
         check("Race / concurrency regression" in markdown and "P50" in markdown,
               "QEX Markdown includes P50 and race-regression results")
+
+        input_root = temp / "package-input"
+        (input_root / "aislop").mkdir(parents=True)
+        (input_root / "qex").mkdir(parents=True)
+        (input_root / "aislop" / "Aislop-Code-Analysis.md").write_text(
+            "# Aislop report\n", encoding="utf-8"
+        )
+        (input_root / "qex" / "QEX-ITU-Report.md").write_text(
+            "# QEX report\n", encoding="utf-8"
+        )
+        package_path = temp / "complete-ci-reports.zip"
+        ci_package.build_package(input_root, package_path)
+        import zipfile
+
+        with zipfile.ZipFile(package_path) as archive:
+            members = set(archive.namelist())
+        check(
+            {
+                "Aislop/Aislop-Code-Analysis.md",
+                "QEX-ITU/QEX-ITU-Report.md",
+                "CI-Job-Status.json",
+                "README.md",
+            }.issubset(members),
+            "one CI ZIP contains Aislop, QEX/ITU and workflow job status reports",
+        )
 
     print("PASS: all report generator tests")
     return 0
