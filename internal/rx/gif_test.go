@@ -673,7 +673,10 @@ func TestGIFRXContinuesAfterDroppedPacketAndRepairsWhenLateFECPacketArrives(t *t
 }
 
 func TestGIFManagerDrainsHighEntropyBurstWithoutDroppingPackets(t *testing.T) {
-	const width, height = 640, 480
+	// Keep this deterministic queue-overflow regression above the former 512
+	// packet limit without making race-instrumented reconstruction excessively
+	// expensive on hosted CI runners.
+	const width, height = 448, 336
 	rng := rand.New(rand.NewSource(20261108))
 	frames := make([]gifmode.Frame, 2)
 	for frameIndex := range frames {

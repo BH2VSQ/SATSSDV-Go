@@ -32,7 +32,7 @@ RX quality display uses AFSK 1200 in-channel audio SNR and synchronized post-dem
 - PCSI-MMT packetization, RS8 correction and sparse-measurement image reconstruction.
 - Independent experimental BCSI codec code under `internal/image/bcsi`. BCSI is intended to be an optional image compression/reconstruction layer *before* the existing packet/framing and modulation stages; it is not a modulation, symbol mapper or replacement radio profile. The packet fragmentation/reassembly and RX codec dispatch needed to carry BCSI through the current AX.25/CCSDS profiles are not yet integrated, so current on-air TX/RX continues to use the established SSDV/PCSI codec paths.
 - Streaming receive demodulators preserve state across arbitrary audio callback boundaries. Packet validation and image reconstruction run outside the audio callback, and queue overload is bounded rather than allowed to freeze the capture thread.
-- Progressive SSDV and PCSI previews, local image gallery, RX/TX album, portable template packs and repeat transmission.
+- Progressive SSDV and PCSI previews, local image gallery, RX/TX album, portable template packs and repeat transmission. Completed SSDV-GIF streams are fetched through a dedicated GIF RPC and played in the RX preview with `QMovie`; generation-tagged preview requests prevent a delayed still-image response from replacing the final animation.
 
 ## Build requirements
 
@@ -65,11 +65,22 @@ This produces the UI and backend with the audio runtime stub; it is useful for v
 ```sh
 go test ./...
 go vet ./...
+python3 scripts/check_gofmt.py
 python3 scripts/check_native_ui.py
+python3 scripts/check_qt_startup_contract.py
+python3 scripts/check_rx_gif_preview.py
+python3 scripts/check_packaging_contract.py
 python3 scripts/test_backend_rpc.py
+npx --yes aislop@0.20.0 ci
 ```
 
 The Qt build is separately validated through CMake on Qt-enabled CI runners. The Qt client can also be run with an already-built backend by placing `satssdv-backend` (or `satssdv-backend.exe`) beside the desktop executable.
+
+### Release packages
+
+The native Qt CI job publishes Linux x86_64 AppImage, DEB and tar.gz artifacts, plus a Windows x86_64 Inno Setup installer and a self-contained portable ZIP. Linux packages include a SHA-256 checksum file. See [release packaging](docs/RELEASE_PACKAGING.md) for artifact contents and local packaging commands.
+
+The `aislop` quality gate is pinned to v0.20.0. Its project policy is stored in `.aislop/config.yml`; the CI job installs the Go, Python and C/C++ analysis tools and requires a complete scan rather than accepting missing-tool partial results.
 
 ## Notes on compatibility and limitations
 

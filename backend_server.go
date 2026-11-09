@@ -141,7 +141,7 @@ var rpcMethodAllowlist = map[string]bool{
 	"GetSerialPorts": true, "RefreshSerialPorts": true, "StartPTTTest": true, "StopPTTTest": true,
 	"GetPTTTestState": true, "GetPTTError": true, "GetLocales": true, "GetLocaleDictionary": true,
 	"GetTemplates": true, "SaveTemplates": true, "GetAlbum": true, "GetGallery": true,
-	"ImportGalleryImage": true, "GetGalleryImageData": true, "GetLatestRXImageData": true,
+	"ImportGalleryImage": true, "GetGalleryImageData": true, "GetLatestRXImageData": true, "GetLatestRXGIFData": true,
 	"DeleteGalleryImage": true, "GetAlbumImageData": true, "DeleteAlbumRecord": true,
 	"ExportAlbumRecordToDirectory": true, "ExportAlbumToDirectoryPath": true,
 	"ExportTemplatePackTo": true, "ImportTemplatePackFrom": true,

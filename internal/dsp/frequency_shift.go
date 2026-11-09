@@ -72,7 +72,7 @@ func ShiftFrequencyRamp(samples []float32, sampleRate int, startHz, endHz float6
 		if i > 0 {
 			prevT := float64(i-1) / float64(max(1, len(out)-1))
 			prevHz := startHz + (endHz-startHz)*prevT
-			phase += 2 * math.Pi * (prevHz+offsetHz) * 0.5 / float64(sampleRate)
+			phase += 2 * math.Pi * (prevHz + offsetHz) * 0.5 / float64(sampleRate)
 		}
 		c, s := math.Cos(phase), math.Sin(phase)
 		idx := pad + i

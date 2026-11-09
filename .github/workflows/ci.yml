@@ -10,6 +10,49 @@ permissions:
   contents: read
 
 jobs:
+  aislop-quality-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install C/C++ and Go security analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck clang-format clang-tidy
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install aislop companion tools
+        run: npx --yes --package=aislop@0.20.0 aislop-tools
+      - name: Configure native compilation database for clang-tidy
+        run: |
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build qt6-base-dev libasound2-dev libasound2t64 pkg-config
+          cmake -S . -B build-aislop -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSATSSDV_WITH_MALGO=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DGO_EXECUTABLE="$(command -v go)"
+          cmake --build build-aislop --parallel 2
+      - name: Verify quality toolchain
+        run: |
+          go version
+          cppcheck --version
+          clang-format --version
+          clang-tidy --version
+          govulncheck -version
+          npx --yes aislop@0.20.0 doctor
+      - name: Run aislop deterministic quality gate
+        uses: scanaislop/aislop@v0.20.0
+        with:
+          directory: .
+          node-version: "24"
+          format: json
+
   go-test:
     strategy:
       fail-fast: false
@@ -29,10 +72,16 @@ jobs:
         run: go test ./...
       - name: Go vet
         run: go vet ./...
+      - name: Go formatting check
+        run: python scripts/check_gofmt.py
       - name: Native UI architecture checks
         run: python scripts/check_native_ui.py
       - name: Qt single-window and no-console startup checks
         run: python scripts/check_qt_startup_contract.py
+      - name: RX GIF playback and packaging contract checks
+        run: |
+          python scripts/check_rx_gif_preview.py
+          python scripts/check_packaging_contract.py
       - name: Build backend without native audio
         run: go build -tags "" ./...
       - name: Verify backend RPC lifecycle
@@ -51,7 +100,12 @@ jobs:
           go test -race ./internal/modem/mary
           go test -race ./internal/image/bcsi
       - name: Race-check RX queue and reconstruction worker
-        run: go test -race ./internal/rx
+        # Keep race instrumentation on lifecycle, back-pressure, in-flight
+        # reconstruction and GIF packet-state tests; the larger entropy stress
+        # case is covered without -race in the full Go test matrix.
+        run: >-
+          go test -race ./internal/rx
+          -run '^TestManagerSubmitRejectsAfterClose$|^TestManagerSubmitDoesNotBlockWhenQueueSaturates$|^TestManagerKeepsIngestingPCSIWhileReconstructionRuns$|^TestManagerDiagnosticsReportsQueueAndProcessingProgress$|^TestGIFManagerDeduplicatesRepeatedControlAndAcceptsRepeatedTX$'
       - name: Race-check filtered QPSK, 8PSK and 16QAM air paths
         run: go test -race ./internal/transport -run '^TestMAModulationTXFilteredRXAirpath$|^TestMAModulationTXFilteredRXWithAudioNoise$'
 
@@ -101,6 +155,7 @@ jobs:
           cmake -S . -B build-qt6 -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DSATSSDV_WITH_MALGO=ON
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           -DGO_EXECUTABLE="$(command -v go)"
       - name: Build native Qt application
         run: cmake --build build-qt6 --parallel 2 --verbose
@@ -149,6 +204,8 @@ jobs:
           APPIMAGE_FILE="$(find . -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
           test -n "$APPIMAGE_FILE"
           mv "$APPIMAGE_FILE" SATSSDV-Go-linux-x86_64.AppImage
+      - name: Generate Linux artifact checksums
+        run: sha256sum SATSSDV-Go-linux-x86_64.tar.gz SATSSDV-Go-linux-x86_64.deb SATSSDV-Go-linux-x86_64.AppImage > SATSSDV-Go-linux-x86_64.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: SATSSDV-Go-linux-x86_64
@@ -156,6 +213,7 @@ jobs:
             SATSSDV-Go-linux-x86_64.tar.gz
             SATSSDV-Go-linux-x86_64.deb
             SATSSDV-Go-linux-x86_64.AppImage
+            SATSSDV-Go-linux-x86_64.sha256
           if-no-files-found: error
 
   qt-windows:
@@ -226,10 +284,48 @@ jobs:
             --package-dir "$(cygpath -w build-qt6/bin)" \
             --mingw-bin "$(cygpath -w /mingw64/bin)" \
             --objdump "$(cygpath -w /mingw64/bin/objdump.exe)"
+      - name: Stage Windows portable distribution
+        shell: pwsh
+        run: |
+          $portable = Join-Path $env:GITHUB_WORKSPACE "dist/windows/portable"
+          New-Item -ItemType Directory -Path $portable -Force | Out-Null
+          Copy-Item -Path "build-qt6/bin/*" -Destination $portable -Recurse -Force
+          if (-not (Test-Path (Join-Path $portable "SATSSDV-Go.exe"))) {
+            throw "Portable package is missing SATSSDV-Go.exe"
+          }
+          if (-not (Test-Path (Join-Path $portable "satssdv-backend.exe"))) {
+            throw "Portable package is missing satssdv-backend.exe"
+          }
+          Copy-Item "packaging/windows/PORTABLE-README.txt" -Destination $portable
+          $portableZip = Join-Path $env:GITHUB_WORKSPACE "SATSSDV-Go-windows-x86_64-portable.zip"
+          Compress-Archive -Path (Join-Path $portable "*") -DestinationPath $portableZip -CompressionLevel Optimal -Force
+          if ((Get-Item $portableZip).Length -le 0) { throw "Portable ZIP is empty" }
+      - name: Build Windows installer with Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress --yes
+          $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $iscc = Join-Path $programFilesX86 "Inno Setup 6/ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+          $sourceDir = (Resolve-Path "dist/windows/portable").Path
+          & $iscc "/DSourceDir=$sourceDir" "packaging/windows/SATSSDV-Go.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup exited with code $LASTEXITCODE" }
+          $installer = "dist/windows/SATSSDV-Go-Setup-0.16.0.exe"
+          if (-not (Test-Path $installer)) { throw "Installer output missing: $installer" }
+          Copy-Item $installer "SATSSDV-Go-windows-x86_64-Setup.exe" -Force
+      - name: Verify Windows portable and installer outputs
+        shell: pwsh
+        run: |
+          Get-Item "SATSSDV-Go-windows-x86_64-portable.zip", "SATSSDV-Go-windows-x86_64-Setup.exe" |
+            Format-Table Name, Length
+          if ((Get-Item "SATSSDV-Go-windows-x86_64-portable.zip").Length -le 0) { throw "Portable ZIP is empty" }
+          if ((Get-Item "SATSSDV-Go-windows-x86_64-Setup.exe").Length -le 0) { throw "Installer is empty" }
       - uses: actions/upload-artifact@v4
         with:
           name: SATSSDV-Go-windows-x86_64
-          path: build-qt6/bin/
+          path: |
+            SATSSDV-Go-windows-x86_64-portable.zip
+            SATSSDV-Go-windows-x86_64-Setup.exe
           if-no-files-found: error
 
   qt-macos:

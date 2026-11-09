@@ -9,7 +9,7 @@ import (
 	"image"
 	"image/draw"
 	"image/gif"
-	"image/jpeg"
+	_ "image/jpeg"
 	"image/png"
 	"math"
 	"net/http"
@@ -1628,7 +1628,7 @@ func rxDecoderMARYSNR(decoder interface{}) (float64, bool) {
 		Diagnostics() transport.DecoderDiagnostics
 	}:
 		d := value.Diagnostics()
-		if !d.MARYSNRValid || (!d.MARYLocked && !d.MARYSNRHoldover) {
+		if !d.MARYLocked || !d.MARYSNRValid {
 			return 0, false
 		}
 		return d.MARYSNRDB, true
@@ -1636,15 +1636,8 @@ func rxDecoderMARYSNR(decoder interface{}) (float64, bool) {
 		Diagnostics() transport.AutoDecoderDiagnostics
 	}:
 		d := value.Diagnostics()
-		// Auto RX evaluates all three M-ary constellations in parallel. Their
-		// training words are shared, so several candidates may appear locked;
-		// only a profile which has produced a validated image packet is trusted
-		// for the UI SNR value.
-		if d.LockedProfile == "" {
-			return 0, false
-		}
 		for _, candidate := range d.MARYCandidates {
-			if candidate.Profile == d.LockedProfile && candidate.MARYSNRValid && (candidate.MARYLocked || candidate.MARYSNRHoldover) {
+			if candidate.MARYLocked && candidate.MARYSNRValid {
 				return candidate.MARYSNRDB, true
 			}
 		}
@@ -1761,7 +1754,6 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 			previewPNG = data
 			update.HasPreview = true
 			a.setLatestRXPreview(data)
-			update.PreviewDataURL = makeRXPreviewDataURL(data)
 		}
 	}
 
@@ -1797,8 +1789,8 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 			update.PacketPath = path
 		}
 	}
-	// The event carries a bounded JPEG snapshot so Qt can display this exact
-	// packet update; the full PNG remains only in the latest-preview slot.
+	// Binary previews are fetched through GetLatestRXImageData; do not retain
+	// large base64 PNGs in the bounded event history.
 	update.PNGBase64 = ""
 	update.PacketDataBase64 = ""
 	a.emit("rx:image", update)
@@ -1931,46 +1923,6 @@ func (a *App) archiveRXGIF(update rxengine.Update) error {
 	// this slot would make the main RX pane appear frozen after GIF completion.
 	a.setLatestRXGIF(data)
 	return nil
-}
-
-// makeRXPreviewDataURL creates an immutable, bounded preview snapshot for the
-// rx:image event. The UI must display that event's own frame, not fetch a shared
-// "latest image" slot that may already have advanced several packets by the
-// time Qt processes a batch of events.
-func makeRXPreviewDataURL(data []byte) string {
-	if len(data) == 0 || len(data) > 16*1024*1024 {
-		return ""
-	}
-	img, err := png.Decode(bytes.NewReader(data))
-	if err != nil {
-		return ""
-	}
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-	if w <= 0 || h <= 0 {
-		return ""
-	}
-	// A live view does not need source-resolution JPEGs. Keep at most 960x720
-	// while preserving the original resolution for small SSTV/SSDV previews.
-	const maxW, maxH = 960, 720
-	if w > maxW || h > maxH {
-		scale := math.Min(float64(maxW)/float64(w), float64(maxH)/float64(h))
-		nw, nh := max(1, int(math.Round(float64(w)*scale))), max(1, int(math.Round(float64(h)*scale)))
-		scaled := image.NewRGBA(image.Rect(0, 0, nw, nh))
-		for y := 0; y < nh; y++ {
-			sy := bounds.Min.Y + y*h/nh
-			for x := 0; x < nw; x++ {
-				sx := bounds.Min.X + x*w/nw
-				scaled.Set(x, y, img.At(sx, sy))
-			}
-		}
-		img = scaled
-	}
-	var encoded bytes.Buffer
-	if err := jpeg.Encode(&encoded, img, &jpeg.Options{Quality: 78}); err != nil {
-		return ""
-	}
-	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(encoded.Bytes())
 }
 
 func decodeRXPreviewPNG(encoded string) ([]byte, error) {
@@ -2455,6 +2407,22 @@ func (a *App) GetGalleryImageData(id string) (string, error) {
 		return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 	}
 	return "", errors.New("gallery image not found")
+}
+
+// GetLatestRXGIFData returns only the completed animated RX preview.
+// Keeping this separate from the generic latest-image RPC prevents a queued
+// still-image refresh from winning a race with the final GIF event.
+func (a *App) GetLatestRXGIFData() (string, error) {
+	a.rxPreviewMu.RLock()
+	animated := append([]byte(nil), a.rxPreviewGIF...)
+	a.rxPreviewMu.RUnlock()
+	if len(animated) == 0 {
+		return "", nil
+	}
+	if _, err := gif.DecodeConfig(bytes.NewReader(animated)); err != nil {
+		return "", fmt.Errorf("validate latest RX GIF preview: %w", err)
+	}
+	return "data:image/gif;base64," + base64.StdEncoding.EncodeToString(animated), nil
 }
 
 // GetLatestRXImageData returns the newest archived RX image for template layers.

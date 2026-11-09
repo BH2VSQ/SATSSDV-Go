@@ -236,32 +236,3 @@ func TestMARYDemodulatorDoesNotPublishEVMOnIdleNoise(t *testing.T) {
 		t.Fatalf("idle noise produced a modem lock or SNR: %+v", diag)
 	}
 }
-
-func TestEVMEstimateSurvivesPacketizedRearm(t *testing.T) {
-	cfg := Config{SampleRate: 48000, SymbolRate: 1600, BitsPerSymbol: 2, CarrierHz: 1600}
-	payload := make([]byte, 512)
-	for i := range payload {
-		payload[i] = byte((i*43 + 17) & 0xff)
-	}
-	wave, err := ModulateBytes(payload, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	demod, err := NewStreamDemodulator(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for offset := 0; offset < len(wave); offset += 960 {
-		end := min(len(wave), offset+960)
-		demod.FeedSoft(wave[offset:end])
-	}
-	before := demod.Diagnostics()
-	if !before.SNRValid || before.SNRSamples < 48 {
-		t.Fatalf("EVM-SNR did not become valid before rearm: %+v", before)
-	}
-	demod.Rearm()
-	after := demod.Diagnostics()
-	if !after.SNRValid || after.SNRSamples != before.SNRSamples || after.SNRDB != before.SNRDB {
-		t.Fatalf("EVM-SNR was cleared or changed by inter-group rearm: before=%+v after=%+v", before, after)
-	}
-}

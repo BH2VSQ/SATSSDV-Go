@@ -1,0 +1,2 @@
+# Go's canonical formatter emits LF; enforce stable source line endings on every OS.
+*.go text eol=lf

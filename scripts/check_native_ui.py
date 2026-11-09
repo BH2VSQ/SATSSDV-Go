@@ -52,8 +52,12 @@ if ("moveSelectedLayerUp" not in canvas_h or "moveSelectedLayerDown" not in canv
     errors.append("native template canvas must support layer ordering and optional grid snapping")
 if "new TemplateCanvas" not in mainwindow or "＋ 图库图像" not in mainwindow or "＋ 上次接收图像" not in mainwindow:
     errors.append("native template editor is missing canvas or image-layer authoring controls")
-if "refreshLatestRXPreview" not in mainwindow or "hasPreview" not in mainwindow:
-    errors.append("Qt RX preview must fetch large image data through the dedicated RPC")
+if "refreshLatestRXPreview" not in mainwindow or "GetLatestRXImageData" not in mainwindow:
+    errors.append("Qt RX still-image preview must use the dedicated image-data RPC")
+if "refreshLatestRXGIFPreview" not in mainwindow or "GetLatestRXGIFData" not in mainwindow:
+    errors.append("Qt RX GIF completion must use the dedicated animated-GIF RPC")
+if "GetLatestRXGIFData" not in (ROOT / "backend_server.go").read_text(encoding="utf-8"):
+    errors.append("completed RX GIF retrieval must be exposed through the RPC allowlist")
 if "m_statusRequestPending" not in (ROOT / "qt6/mainwindow.h").read_text(encoding="utf-8"):
     errors.append("periodic status polling must be guarded against overlapping requests")
 if "readyReadStandardError" not in (ROOT / "qt6/backend_client.cpp").read_text(encoding="utf-8"):

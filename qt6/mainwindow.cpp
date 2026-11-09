@@ -1334,17 +1334,43 @@ void MainWindow::refreshLatestRXPreview() {
     }
     m_rxPreviewRequestPending = true;
     m_rxPreviewRefreshQueued = false;
-    m_backend->call(QStringLiteral("GetLatestRXImageData"), {}, [this](bool ok, const QJsonValue &value, const QString &error) {
+    const quint64 requestGeneration = m_rxPreviewGeneration;
+    m_backend->call(QStringLiteral("GetLatestRXImageData"), {}, [this, requestGeneration](bool ok, const QJsonValue &value, const QString &error) {
         m_rxPreviewRequestPending = false;
-        if (ok && !value.toString().isEmpty()) {
+        if (requestGeneration == m_rxPreviewGeneration && ok && !value.toString().isEmpty()) {
             m_lastRXPreviewIsGIF = value.toString().startsWith(QStringLiteral("data:image/gif"), Qt::CaseInsensitive);
             showImage(value.toString(), m_rxPreview);
             refreshInlineTemplateEditor();
             refreshTemplateCanvas();
-        } else if (!ok) {
+        } else if (requestGeneration == m_rxPreviewGeneration && !ok) {
             appendLog(uiText(QStringLiteral("刷新接收图像预览失败：")) + error);
         }
         if (m_rxPreviewRefreshQueued) refreshLatestRXPreview();
+    });
+}
+
+void MainWindow::refreshLatestRXGIFPreview() {
+    if (m_rxGIFPreviewRequestPending) {
+        m_rxGIFPreviewRefreshQueued = true;
+        return;
+    }
+    m_rxGIFPreviewRequestPending = true;
+    m_rxGIFPreviewRefreshQueued = false;
+    const quint64 requestGeneration = m_rxPreviewGeneration;
+    m_backend->call(QStringLiteral("GetLatestRXGIFData"), {}, [this, requestGeneration](bool ok, const QJsonValue &value, const QString &error) {
+        m_rxGIFPreviewRequestPending = false;
+        const QString dataUrl = value.toString();
+        if (requestGeneration == m_rxPreviewGeneration && ok && dataUrl.startsWith(QStringLiteral("data:image/gif;base64,"), Qt::CaseInsensitive)) {
+            m_lastRXPreviewIsGIF = true;
+            showImage(dataUrl, m_rxPreview);
+            refreshInlineTemplateEditor();
+            refreshTemplateCanvas();
+        } else if (requestGeneration == m_rxPreviewGeneration && !ok) {
+            appendLog(uiText(QStringLiteral("加载接收 GIF 动图失败：")) + error);
+        } else if (requestGeneration == m_rxPreviewGeneration) {
+            appendLog(uiText(QStringLiteral("GIF 接收结束事件已到达，但后端尚未提供有效动画数据")));
+        }
+        if (m_rxGIFPreviewRefreshQueued) refreshLatestRXGIFPreview();
     });
 }
 
@@ -2082,15 +2108,15 @@ void MainWindow::handleEvent(const QJsonObject &event) {
     const QString name=event.value(QStringLiteral("name")).toString(); const QJsonValue payloadValue=event.value(QStringLiteral("payload"));
     if(name==QStringLiteral("rx:image")){
         const auto payload=payloadValue.toObject();
-        const QString eventPreview = payload.value(QStringLiteral("previewDataUrl")).toString();
-        if (!eventPreview.isEmpty()) {
-            // Use the immutable preview attached to this packet event. Fetching
-            // the shared latest-image slot races event polling and collapses
-            // several packet updates into only the newest snapshot.
-            m_lastRXPreviewIsGIF = false;
-            showImage(eventPreview, m_rxPreview);
-            refreshInlineTemplateEditor();
-        } else if (payload.value(QStringLiteral("gifEnd")).toBool()) {
+        const bool hasPreview = payload.value(QStringLiteral("hasPreview")).toBool();
+        const bool gifStart = payload.value(QStringLiteral("gifStart")).toBool();
+        const bool gifEnd = payload.value(QStringLiteral("gifEnd")).toBool();
+        if (hasPreview || gifStart || gifEnd) ++m_rxPreviewGeneration;
+        if (gifEnd) {
+            // Fetch the final animation on its own RPC lane. A pending PNG
+            // preview request must not collapse or overwrite this completion.
+            refreshLatestRXGIFPreview();
+        } else if (hasPreview) {
             refreshLatestRXPreview();
         }
         m_templateImageCache.remove(QStringLiteral("last-rx"));

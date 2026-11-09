@@ -69,6 +69,17 @@ func TestEventBrokerRetainsBoundedHistory(t *testing.T) {
 	}
 }
 
+func TestRPCInvokeLatestRXGIFData(t *testing.T) {
+	app := NewApp()
+	result, err := invokeApp(app, rpcRequest{Method: "GetLatestRXGIFData"})
+	if err != nil {
+		t.Fatalf("dedicated RX GIF RPC should be allowlisted: %v", err)
+	}
+	if value, ok := result.(string); !ok || value != "" {
+		t.Fatalf("empty GIF cache should return an empty string, got %T %#v", result, result)
+	}
+}
+
 func TestRPCRejectsNonUIAppMethods(t *testing.T) {
 	app := NewApp()
 	if _, err := invokeApp(app, rpcRequest{Method: "TransmitPCM"}); err == nil {

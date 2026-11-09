@@ -39,6 +39,7 @@ private:
     void loadInitialState();
     void refreshStatus();
     void refreshLatestRXPreview();
+    void refreshLatestRXGIFPreview();
     void refreshAlbum();
     void refreshGallery();
     void refreshTemplates();
@@ -87,6 +88,9 @@ private:
     bool m_statusRequestPending = false;
     bool m_rxPreviewRequestPending = false;
     bool m_rxPreviewRefreshQueued = false;
+    bool m_rxGIFPreviewRequestPending = false;
+    bool m_rxGIFPreviewRefreshQueued = false;
+    quint64 m_rxPreviewGeneration = 0;
     bool m_rxActive = false;
     bool m_txActive = false;
     bool m_txToneActive = false;

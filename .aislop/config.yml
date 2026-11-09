@@ -1,0 +1,46 @@
+version: 1
+
+exclude:
+  - .git
+  - build
+  - build-*
+  - dist
+  - CMakeFiles
+  - .wails-parity-backup
+  - reference_implementation
+  - coverage
+
+engines:
+  format: true
+  lint: true
+  code-quality: true
+  ai-slop: true
+  architecture: false
+  security: true
+
+quality:
+  maxFunctionLoc: 120
+  maxFileLoc: 4500
+  maxNesting: 6
+  maxParams: 8
+
+security:
+  audit: true
+  auditTimeout: 30000
+
+scoring:
+  weights:
+    format: 0.5
+    lint: 1.0
+    code-quality: 1.5
+    ai-slop: 1.0
+    architecture: 1.0
+    security: 2.0
+  thresholds:
+    good: 80
+    ok: 60
+
+ci:
+  failBelow: 60
+  failOnMissingTools: true
+  format: json

@@ -78,6 +78,16 @@ func TestReceivedGIFIsDecodedAndArchivedAsAnimatedAlbumItem(t *testing.T) {
 	if !strings.HasPrefix(latestPreview, "data:image/gif;base64,") {
 		t.Fatalf("completed GIF did not become the live RX preview; got %q", latestPreview[:min(len(latestPreview), 48)])
 	}
+	latestGIF, err := app.GetLatestRXGIFData()
+	if err != nil {
+		t.Fatalf("get dedicated latest RX GIF data: %v", err)
+	}
+	if !strings.HasPrefix(latestGIF, "data:image/gif;base64,") {
+		t.Fatalf("dedicated RX GIF endpoint returned %q", latestGIF[:min(len(latestGIF), 48)])
+	}
+	if latestGIF != latestPreview {
+		t.Fatal("dedicated GIF endpoint and generic latest preview disagree after GIF completion")
+	}
 
 	records, err := app.GetAlbum()
 	if err != nil {
