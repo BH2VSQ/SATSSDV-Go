@@ -62,24 +62,25 @@ def main() -> int:
         return 1
 
     updated = original.replace(OLD, NEW, 1)
-    if "m_repeatInterval->setEnabled(!enabled)" in updated:
-        print("FAIL: obsolete assertion remains after replacement. No file was changed.", file=sys.stderr)
-        return 1
-
+    write_started = False
     try:
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         if BACKUP.exists():
             print(f"FAIL: backup already exists: {BACKUP.relative_to(ROOT)}", file=sys.stderr)
             return 1
         shutil.copy2(CHECKER, BACKUP)
+        write_started = True
         CHECKER.write_text(updated, encoding="utf-8", newline="\n")
     except OSError as exc:
-        try:
-            if BACKUP.exists() and CHECKER.exists():
+        if write_started:
+            try:
                 CHECKER.write_text(original, encoding="utf-8", newline="\n")
-        except OSError as rollback_exc:
-            print(f"FAIL: rollback failed: {rollback_exc}", file=sys.stderr)
-        print(f"FAIL: could not update checker; rollback attempted: {exc}", file=sys.stderr)
+            except OSError as rollback_exc:
+                raise RuntimeError(
+                    f"FAIL: could not update {CHECKER.relative_to(ROOT)}: {exc}; "
+                    f"rollback also failed: {rollback_exc}"
+                ) from rollback_exc
+        print(f"FAIL: could not update checker: {exc}", file=sys.stderr)
         return 1
 
     print("PASS: Qt/Wails parity checker updated for the new repeat state machine.")
