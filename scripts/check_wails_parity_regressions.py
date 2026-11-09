@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import re
 
 root = Path(__file__).resolve().parents[1]
 cpp = (root / "qt6/mainwindow.cpp").read_text(encoding="utf-8")

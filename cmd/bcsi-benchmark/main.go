@@ -79,9 +79,15 @@ func main() {
 			bcsiPSNR := imagequality.PSNR(img, bcsiImage)
 			bcsiSSIM := imagequality.SSIM(img, bcsiImage)
 
-			jpeg75, jpeg75Image, _, _ := encodeJPEG(img, 75)
+			jpeg75, jpeg75Image, _, err := encodeJPEG(img, 75)
+			if err != nil {
+				fatal(fmt.Sprintf("encode JPEG Q75: %v", err))
+			}
 			jpegOptQuality, jpegOptBytes := nearestJPEGSize(img, bcsiBytes)
-			_, jpegOptImage, _, _ := encodeJPEG(img, jpegOptQuality)
+			_, jpegOptImage, _, err := encodeJPEG(img, jpegOptQuality)
+			if err != nil {
+				fatal(fmt.Sprintf("encode target-size JPEG Q%d: %v", jpegOptQuality, err))
+			}
 
 			haarQ, haarBytes := nearestHaarSize(img, bcsiBytes)
 			haarStart := time.Now()

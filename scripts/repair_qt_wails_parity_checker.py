@@ -77,8 +77,8 @@ def main() -> int:
         try:
             if BACKUP.exists() and CHECKER.exists():
                 CHECKER.write_text(original, encoding="utf-8", newline="\n")
-        except OSError:
-            pass
+        except OSError as rollback_exc:
+            print(f"FAIL: rollback failed: {rollback_exc}", file=sys.stderr)
         print(f"FAIL: could not update checker; rollback attempted: {exc}", file=sys.stderr)
         return 1
 

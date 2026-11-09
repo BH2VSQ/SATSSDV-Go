@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 import shutil
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1064,9 +1063,11 @@ try:
 except Exception:
     for path in FILES.values():
         backup = backup_dir / path.relative_to(ROOT)
-        if backup.exists(): shutil.copy2(backup, path)
+        if backup.exists():
+            shutil.copy2(backup, path)
     for path in new_files:
-        if path.exists(): path.unlink()
+        if path.exists():
+            path.unlink()
     raise
 
 print("Wails reference parity migration applied.")

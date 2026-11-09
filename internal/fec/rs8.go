@@ -131,7 +131,10 @@ func CorrectRS8(codeword []byte) (int, error) {
 	if len(codeword) != RS8CodeSymbols {
 		return 0, errors.New("RS8 codeword must contain exactly 255 symbols")
 	}
-	syndromes, _ := Syndromes(codeword)
+	syndromes, err := Syndromes(codeword)
+	if err != nil {
+		return 0, err
+	}
 	allZero := true
 	for _, s := range syndromes {
 		if s != 0 {
