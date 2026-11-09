@@ -45,6 +45,7 @@ else:
 canvas_h = (ROOT / "qt6/template_canvas.h").read_text(encoding="utf-8")
 canvas_cpp = (ROOT / "qt6/template_canvas.cpp").read_text(encoding="utf-8")
 mainwindow = (ROOT / "qt6/mainwindow.cpp").read_text(encoding="utf-8")
+rx_source = (ROOT / "app.go").read_text(encoding="utf-8")
 if "mouseMoveEvent" not in canvas_cpp or "DragMode::Resize" not in canvas_cpp or "removeSelectedComponent" not in canvas_cpp:
     errors.append("native template canvas must support drag, resize and deletion")
 if ("moveSelectedLayerUp" not in canvas_h or "moveSelectedLayerDown" not in canvas_h
@@ -53,7 +54,13 @@ if ("moveSelectedLayerUp" not in canvas_h or "moveSelectedLayerDown" not in canv
 if "new TemplateCanvas" not in mainwindow or "＋ 图库图像" not in mainwindow or "＋ 上次接收图像" not in mainwindow:
     errors.append("native template editor is missing canvas or image-layer authoring controls")
 if "refreshLatestRXPreview" not in mainwindow or "GetLatestRXImageData" not in mainwindow:
-    errors.append("Qt RX still-image preview must use the dedicated image-data RPC")
+    errors.append("Qt RX still-image preview must retain the dedicated image-data RPC fallback")
+if 'payload.value(QStringLiteral("previewDataUrl"))' not in mainwindow:
+    errors.append("Qt RX must display the immutable JPEG preview snapshot attached to each image event")
+if "PreviewDataURL" not in (ROOT / "internal/rx/manager.go").read_text(encoding="utf-8"):
+    errors.append("RX update event is missing the bounded PreviewDataURL field")
+if "makeRXPreviewDataURL(data)" not in rx_source:
+    errors.append("Go RX event handler must create a bounded JPEG snapshot for progressive preview")
 if "refreshLatestRXGIFPreview" not in mainwindow or "GetLatestRXGIFData" not in mainwindow:
     errors.append("Qt RX GIF completion must use the dedicated animated-GIF RPC")
 if "GetLatestRXGIFData" not in (ROOT / "backend_server.go").read_text(encoding="utf-8"):
@@ -63,7 +70,6 @@ if "m_statusRequestPending" not in (ROOT / "qt6/mainwindow.h").read_text(encodin
 if "readyReadStandardError" not in (ROOT / "qt6/backend_client.cpp").read_text(encoding="utf-8"):
     errors.append("Qt must drain the Go child process stderr pipe")
 
-rx_source = (ROOT / "app.go").read_text(encoding="utf-8")
 if 'update.PNGBase64 = ""' not in rx_source or 'update.PacketDataBase64 = ""' not in rx_source:
     errors.append("large binary RX payloads must be omitted from retained UI events")
 

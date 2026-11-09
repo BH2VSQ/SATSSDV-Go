@@ -53,40 +53,6 @@ jobs:
           node-version: "24"
           format: json
 
-  go-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26.x"
-          cache: true
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-      - name: Go tests
-        run: go test ./...
-      - name: Go vet
-        run: go vet ./...
-      - name: Go formatting check
-        run: python scripts/check_gofmt.py
-      - name: Native UI architecture checks
-        run: python scripts/check_native_ui.py
-      - name: Qt single-window and no-console startup checks
-        run: python scripts/check_qt_startup_contract.py
-      - name: RX GIF playback and packaging contract checks
-        run: |
-          python scripts/check_rx_gif_preview.py
-          python scripts/check_packaging_contract.py
-      - name: Build backend without native audio
-        run: go build -tags "" ./...
-      - name: Verify backend RPC lifecycle
-        run: python scripts/test_backend_rpc.py
-
   race-regression:
     runs-on: ubuntu-24.04
     steps:
@@ -130,6 +96,7 @@ jobs:
           if-no-files-found: error
 
   qt-linux:
+    name: Linux — Go tests + Qt build + AppImage/DEB/tar.gz
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -137,6 +104,24 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Go tests
+        run: go test ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Go formatting and static contract checks
+        run: |
+          python scripts/check_gofmt.py
+          python scripts/check_native_ui.py
+          python scripts/check_qt_startup_contract.py
+          python scripts/check_rx_gif_preview.py
+          python scripts/check_packaging_contract.py
+      - name: Build backend without native audio
+        run: go build -tags "" ./...
+      - name: Verify backend RPC lifecycle
+        run: python scripts/test_backend_rpc.py
       - name: Install Qt and audio build dependencies
         run: |
           sudo apt-get update
@@ -217,6 +202,7 @@ jobs:
           if-no-files-found: error
 
   qt-windows:
+    name: Windows — Go tests + Qt build + installer/portable
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -228,6 +214,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Go tests
+        run: go test ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Go formatting and static contract checks
+        run: |
+          python scripts/check_gofmt.py
+          python scripts/check_native_ui.py
+          python scripts/check_qt_startup_contract.py
+          python scripts/check_rx_gif_preview.py
+          python scripts/check_packaging_contract.py
+      - name: Build backend without native audio
+        run: go build -tags "" ./...
+      - name: Verify backend RPC lifecycle
+        run: python scripts/test_backend_rpc.py
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -329,6 +330,7 @@ jobs:
           if-no-files-found: error
 
   qt-macos:
+    name: macOS ${{ matrix.arch }} — Go tests + Qt build
     strategy:
       fail-fast: false
       matrix:
@@ -351,6 +353,24 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Go tests
+        run: go test ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Go formatting and static contract checks
+        run: |
+          python scripts/check_gofmt.py
+          python scripts/check_native_ui.py
+          python scripts/check_qt_startup_contract.py
+          python scripts/check_rx_gif_preview.py
+          python scripts/check_packaging_contract.py
+      - name: Build backend without native audio
+        run: go build -tags "" ./...
+      - name: Verify backend RPC lifecycle
+        run: python scripts/test_backend_rpc.py
       - name: Verify native runner architecture
         run: |
           echo "Runner: $(uname -m)"

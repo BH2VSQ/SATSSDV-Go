@@ -7,9 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"image/draw"
 	"image/gif"
-	_ "image/jpeg"
+	"image/jpeg"
 	"image/png"
 	"math"
 	"net/http"
@@ -1754,6 +1755,7 @@ func (a *App) handleRXImageUpdate(update rxengine.Update) {
 			previewPNG = data
 			update.HasPreview = true
 			a.setLatestRXPreview(data)
+			update.PreviewDataURL = makeRXPreviewDataURL(data)
 		}
 	}
 
@@ -1923,6 +1925,59 @@ func (a *App) archiveRXGIF(update rxengine.Update) error {
 	// this slot would make the main RX pane appear frozen after GIF completion.
 	a.setLatestRXGIF(data)
 	return nil
+}
+
+// makeRXPreviewDataURL creates an immutable, bounded JPEG snapshot for one
+// rx:image event. The full-resolution PNG remains available through the image
+// RPC; the event snapshot prevents several queued preview events from all
+// resolving to the same newest image.
+func makeRXPreviewDataURL(data []byte) string {
+	const (
+		maxInputBytes = 16 * 1024 * 1024
+		maxDimension  = 640
+		maxJPEGBytes  = 512 * 1024
+		jpegQuality   = 82
+	)
+	if len(data) == 0 || len(data) > maxInputBytes {
+		return ""
+	}
+	source, format, err := image.Decode(bytes.NewReader(data))
+	if err != nil || format != "png" {
+		return ""
+	}
+	bounds := source.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if width <= 0 || height <= 0 || width > 8192 || height > 8192 || int64(width)*int64(height) > 32*1024*1024 {
+		return ""
+	}
+	scale := math.Min(1, math.Min(float64(maxDimension)/float64(width), float64(maxDimension)/float64(height)))
+	outWidth := max(1, int(math.Round(float64(width)*scale)))
+	outHeight := max(1, int(math.Round(float64(height)*scale)))
+	preview := image.NewRGBA(image.Rect(0, 0, outWidth, outHeight))
+	for y := 0; y < outHeight; y++ {
+		sourceY := bounds.Min.Y + y*height/outHeight
+		for x := 0; x < outWidth; x++ {
+			sourceX := bounds.Min.X + x*width/outWidth
+			red, green, blue, alpha := source.At(sourceX, sourceY).RGBA()
+			// JPEG has no alpha channel. Composite the premultiplied source
+			// components over white so transparent PNG pixels remain legible.
+			if alpha < 0xffff {
+				background := uint32(0xffff) - alpha
+				red += background
+				green += background
+				blue += background
+			}
+			preview.SetRGBA(x, y, color.RGBA{R: uint8(red >> 8), G: uint8(green >> 8), B: uint8(blue >> 8), A: 0xff})
+		}
+	}
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, preview, &jpeg.Options{Quality: jpegQuality}); err != nil {
+		return ""
+	}
+	if encoded.Len() == 0 || encoded.Len() > maxJPEGBytes {
+		return ""
+	}
+	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(encoded.Bytes())
 }
 
 func decodeRXPreviewPNG(encoded string) ([]byte, error) {

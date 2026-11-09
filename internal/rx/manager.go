@@ -48,6 +48,7 @@ type Update struct {
 	ArchivePreview          bool    `json:"archivePreview,omitempty"`
 	PNGBase64               string  `json:"pngBase64,omitempty"`
 	HasPreview              bool    `json:"hasPreview,omitempty"`
+	PreviewDataURL          string  `json:"previewDataUrl,omitempty"`
 	PacketDataBase64        string  `json:"packetDataBase64,omitempty"`
 	PacketPath              string  `json:"packetPath,omitempty"`
 	ImageWidth              int     `json:"imageWidth,omitempty"`

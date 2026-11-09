@@ -21,6 +21,8 @@ checks = {
     "final GIF refresh has independent pending/queued state": "m_rxGIFPreviewRequestPending" in CPP and "m_rxGIFPreviewRefreshQueued" in CPP,
     "stale asynchronous previews cannot overwrite a newer GIF": "m_rxPreviewGeneration" in CPP and "requestGeneration == m_rxPreviewGeneration" in CPP,
     "RX preview requests advance a generation when new data arrives": "if (hasPreview || gifStart || gifEnd) ++m_rxPreviewGeneration;" in CPP,
+    "GIF completion has priority over a per-event JPEG snapshot": "if (gifEnd)" in CPP and "else if (!previewDataUrl.isEmpty())" in CPP,
+    "static preview events carry their own immutable JPEG snapshot": "PreviewDataURL" in (ROOT / "internal/rx" / "manager.go").read_text(encoding="utf-8") and "makeRXPreviewDataURL(data)" in APP,
     "completed RX GIF replaces progressive PNG preview": "a.setLatestRXGIF(data)" in APP,
     "latest RX preview returns GIF MIME type": '"data:image/gif;base64,"' in APP,
     "dedicated GIF RPC validates and returns an animated GIF": "GetLatestRXGIFData" in APP and "gif.DecodeConfig" in APP,

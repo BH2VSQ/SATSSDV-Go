@@ -2111,12 +2111,20 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         const bool hasPreview = payload.value(QStringLiteral("hasPreview")).toBool();
         const bool gifStart = payload.value(QStringLiteral("gifStart")).toBool();
         const bool gifEnd = payload.value(QStringLiteral("gifEnd")).toBool();
+        const QString previewDataUrl = payload.value(QStringLiteral("previewDataUrl")).toString();
         if (hasPreview || gifStart || gifEnd) ++m_rxPreviewGeneration;
         if (gifEnd) {
             // Fetch the final animation on its own RPC lane. A pending PNG
             // preview request must not collapse or overwrite this completion.
             refreshLatestRXGIFPreview();
+        } else if (!previewDataUrl.isEmpty()) {
+            // Render the immutable snapshot belonging to this event. This
+            // preserves intermediate packet previews when event polling batches updates.
+            m_lastRXPreviewIsGIF = false;
+            showImage(previewDataUrl, m_rxPreview);
+            refreshInlineTemplateEditor();
         } else if (hasPreview) {
+            // Backward-compatible fallback for events produced by older backends.
             refreshLatestRXPreview();
         }
         m_templateImageCache.remove(QStringLiteral("last-rx"));
@@ -2151,7 +2159,6 @@ void MainWindow::handleEvent(const QJsonObject &event) {
         const bool gifMode = codec == QStringLiteral("SSDV-GIF") || payload.value(QStringLiteral("gifMode")).toBool();
         const int gifFrame = payload.value(QStringLiteral("gifFrame")).toInt();
         const bool gifFrameComplete = payload.value(QStringLiteral("gifFrameComplete")).toBool();
-        const bool gifEnd = payload.value(QStringLiteral("gifEnd")).toBool();
         const bool gifSaved = payload.value(QStringLiteral("gifSaved")).toBool();
         const bool gifFrameAbandoned = payload.value(QStringLiteral("gifFrameAbandoned")).toBool();
         const bool gifAwaitingKeyframe = payload.value(QStringLiteral("gifAwaitingKeyframe")).toBool();

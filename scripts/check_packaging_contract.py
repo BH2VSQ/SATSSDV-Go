@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Static checks for the cross-platform package and CI output contract."""
 from pathlib import Path
+import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,19 @@ if not README.is_file():
     errors.append("Windows portable package README is missing")
 if "scanaislop/aislop@v0.20.0" not in WORKFLOW:
     errors.append("CI workflow must run the pinned aislop quality gate")
+if "  go-test:" in WORKFLOW:
+    errors.append("Go tests must be merged into each platform's native build job")
+for platform_job in ("qt-linux", "qt-windows", "qt-macos"):
+    marker = f"  {platform_job}:\n"
+    if marker not in WORKFLOW:
+        errors.append(f"CI workflow is missing platform job {platform_job}")
+        continue
+    block_start = WORKFLOW.index(marker)
+    next_match = re.search(r"\n  [a-z0-9_-]+:\n", WORKFLOW[block_start + len(marker):])
+    block_end = len(WORKFLOW) if next_match is None else block_start + len(marker) + next_match.start()
+    block = WORKFLOW[block_start:block_end]
+    if "go test ./..." not in block or "go build -tags" not in block or "cmake --build" not in block:
+        errors.append(f"{platform_job} must run Go tests, backend build and native Qt build in one job")
 if "failOnMissingTools: true" not in (ROOT / ".aislop/config.yml").read_text(encoding="utf-8"):
     errors.append("aislop must fail when required analysis tools are missing")
 if "*.go text eol=lf" not in (ROOT / ".gitattributes").read_text(encoding="utf-8"):
