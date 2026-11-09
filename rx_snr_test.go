@@ -733,8 +733,6 @@ func TestLiveRXAudioSNRIsUnavailableForWidebandProfiles(t *testing.T) {
 		string(domain.SSDVQPSK1600),
 		string(domain.SSDV8PSK1600),
 		string(domain.SSDV16QAM1600),
-		string(domain.SSDVCCSDS2400),
-		string(domain.PCSICCSDS2400),
 	} {
 		got := app.estimateTrackedRXAudioSNR(nil, profile, 48000)
 		if got.Valid || got.SNRDB != 0 {
@@ -796,40 +794,99 @@ func makeSyntheticAFSK1200Audio(samples, sampleRate, bitRate int, markHz, spaceH
 
 func TestLiveRXAudioSNRRemainsAvailableForAFSK1200(t *testing.T) {
 	const sampleRate = 19200
-	profile := string(domain.SSDVCCSDS1200)
-	app := &App{}
+	profiles := []string{
+		string(domain.SSDVAX25),
+		string(domain.SSDVCCSDS1200),
+		string(domain.PCSICCSDS1200),
+	}
 	signal := makeSyntheticAFSK1200Audio(4096, sampleRate, 1200, 1200, 2200, 0x4146534b, 0.25)
-	noise := makeSNRNoise(4096, 1, 0x4146534c)
-	signalPower := spectralBandPower(t, signal, profile, sampleRate)
-	noisePower := spectralBandPower(t, noise, profile, sampleRate)
+	for _, profile := range profiles {
+		t.Run(profile, func(t *testing.T) {
+			app := &App{}
+			const targetSNR = 12.0
+			signalPower := spectralBandPower(t, signal, profile, sampleRate)
+			noiseUnit := makeSNRNoise(4096, 1, 0x4146534c)
+			noisePower := spectralBandPower(t, noiseUnit, profile, sampleRate)
+			noiseGain := math.Sqrt(signalPower / (noisePower * math.Pow(10, targetSNR/10)))
+			for frame := 0; frame < 24; frame++ {
+				baseline := makeSNRNoise(4096, noiseGain, int64(0x41465350+frame))
+				bins := mustSpectrumForSNRTest(t, baseline, sampleRate)
+				got := app.estimateTrackedRXAudioSNR(bins, profile, sampleRate)
+				if got.Valid {
+					t.Fatalf("idle baseline frame %d unexpectedly produced SNR: %+v", frame, got)
+				}
+			}
+			app.rxModemLocked.Store(true)
+			app.rxPacketValidated.Store(true)
+			mixed := make([]float32, 4096)
+			finalNoise := makeSNRNoise(4096, noiseGain, 0x4146535f)
+			for i := range mixed {
+				mixed[i] = signal[i] + finalNoise[i]
+			}
+			bins := mustSpectrumForSNRTest(t, mixed, sampleRate)
+			if hint := estimateRXAudioSNR(bins, profile, sampleRate); !hint.Valid {
+				t.Fatalf("synthetic AFSK dual-tone spectrum was not recognized: %+v", hint)
+			}
+			got := app.estimateTrackedRXAudioSNR(bins, profile, sampleRate)
+			if !got.Valid {
+				t.Fatalf("live AFSK1200 audio SNR not shown after sync/CRC evidence: %+v", got)
+			}
+			expected := 10 * math.Log10(spectralBandPower(t, signal, profile, sampleRate)/spectralBandPower(t, finalNoise, profile, sampleRate))
+			if math.Abs(got.SNRDB-expected) > 3.0 {
+				t.Fatalf("live SNR %.2f dB differs from in-channel synthetic %.2f dB: %+v", got.SNRDB, expected, got)
+			}
+		})
+	}
+}
+
+func TestLiveRXAudioSNRRemainsAvailableForGMSK2400(t *testing.T) {
+	const sampleRate = 19200
+	payload := make([]byte, 256)
+	rng := rand.New(rand.NewSource(0x474d534b))
+	for i := range payload {
+		payload[i] = byte(rng.Intn(256))
+	}
+	unit, err := ccsds.BuildDataUnit(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wave, err := ccsds.Modulate(unit, 2400, 1200, 2400, sampleRate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment := append([]float32(nil), wave[4096:8192]...)
+	var signalPower float64
+	for _, sample := range segment {
+		signalPower += float64(sample) * float64(sample)
+	}
+	signalRMS := math.Sqrt(signalPower / float64(len(segment)))
 	const targetSNR = 12.0
-	noiseGain := math.Sqrt(signalPower / (noisePower * math.Pow(10, targetSNR/10)))
+	noiseRMS := signalRMS / math.Pow(10, targetSNR/20)
+	profile := string(domain.SSDVCCSDS2400)
+	app := &App{}
 	for frame := 0; frame < 24; frame++ {
-		baseline := makeSNRNoise(4096, noiseGain, int64(0x41465350+frame))
-		bins := mustSpectrumForSNRTest(t, baseline, sampleRate)
-		got := app.estimateTrackedRXAudioSNR(bins, profile, sampleRate)
+		noise := makeSNRNoise(len(segment), noiseRMS, int64(0x2400+frame))
+		got := app.estimateTrackedRXAudioSNR(mustSpectrumForSNRTest(t, noise, sampleRate), profile, sampleRate)
 		if got.Valid {
-			t.Fatalf("idle baseline frame %d unexpectedly produced SNR: %+v", frame, got)
+			t.Fatalf("GMSK idle baseline frame %d unexpectedly produced SNR: %+v", frame, got)
 		}
 	}
 	app.rxModemLocked.Store(true)
 	app.rxPacketValidated.Store(true)
-	mixed := make([]float32, 4096)
-	finalNoise := makeSNRNoise(4096, noiseGain, 0x4146535f)
-	for i := range mixed {
-		mixed[i] = signal[i] + finalNoise[i]
+	noise := makeSNRNoise(len(segment), noiseRMS, 0x24ff)
+	for i := range segment {
+		segment[i] += noise[i]
 	}
-	bins := mustSpectrumForSNRTest(t, mixed, sampleRate)
-	hint := estimateRXAudioSNR(bins, profile, sampleRate)
-	if !hint.Valid {
-		t.Fatalf("synthetic AFSK dual-tone spectrum was not recognized: %+v", hint)
+	bins := mustSpectrumForSNRTest(t, segment, sampleRate)
+	if hint := estimateRXAudioSNR(bins, profile, sampleRate); !hint.Valid {
+		t.Fatalf("GMSK modem-shaped spectrum was not recognized: %+v", hint)
 	}
 	got := app.estimateTrackedRXAudioSNR(bins, profile, sampleRate)
 	if !got.Valid {
-		t.Fatalf("AFSK1200 live audio SNR not shown after sync/CRC evidence: %+v", got)
+		t.Fatalf("live CCSDS 2400 GMSK SNR was not published: %+v", got)
 	}
-	expected := 10 * math.Log10(spectralBandPower(t, signal, profile, sampleRate)/spectralBandPower(t, finalNoise, profile, sampleRate))
+	expected := 10 * math.Log10(spectralBandPower(t, wave[4096:8192], profile, sampleRate)/spectralBandPower(t, noise, profile, sampleRate))
 	if math.Abs(got.SNRDB-expected) > 3.0 {
-		t.Fatalf("AFSK1200 live SNR %.2f dB differs from in-channel synthetic %.2f dB: %+v", got.SNRDB, expected, got)
+		t.Fatalf("live GMSK SNR %.2f dB differs from in-channel synthetic %.2f dB: %+v", got.SNRDB, expected, got)
 	}
 }

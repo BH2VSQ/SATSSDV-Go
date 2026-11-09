@@ -517,239 +517,297 @@ func (m *Manager) pruneSessionsLocked(now time.Time) {
 	}
 }
 
+type ssdvPacketWork struct {
+	update         Update
+	session        *ssdvSession
+	ordered        [][]byte
+	prefix         [][]byte
+	previewPackets [][]byte
+	packetArchive  []byte
+	complete       bool
+	shouldPreview  bool
+	legacyStream   bool
+}
+
 func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
-	// Keep the private GIF extension out of the static SSDV assembler. GIF
-	// packets use their own frame/session reconstruction state and sparse MCU
-	// decoder; control markers must never be interpreted as JPEG payloads.
 	if packet.GIFMode || packet.Codec == "SSDV-GIF" {
 		return m.processGIFPacket(packet)
 	}
-	if packet.Codec == "SSDV" {
-		parsed, err := ssdv.ParsePacket(packet.Raw)
-		if err != nil {
-			return Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign, ImageID: packet.ImageID, Error: err.Error()}, true
-		}
-		// The packet header is authoritative. Reuse its RS-corrected bytes so
-		// the archived .ssdv stream is also clean, not the damaged RF payload.
-		packet.Callsign, packet.ImageID, packet.PacketID = parsed.Callsign, parsed.ImageID, parsed.PacketID
-		packet.ImageWidth, packet.ImageHeight, packet.Quality = parsed.Width, parsed.Height, parsed.Quality
-		packet.EOI, packet.Subsampling, packet.MCUOffset, packet.MCUIndex, packet.MCUCount = parsed.EOI, parsed.Subsampling, parsed.MCUOffset, parsed.MCUIndex, parsed.MCUCount
-		packet.FEC = parsed.FEC
-		packet.Raw = append(packet.Raw[:0], parsed.Raw[:]...)
-		key := imageKey(packet.Profile, packet.Callsign, packet.ImageID)
-		m.mu.Lock()
-		m.pruneSessionsLocked(time.Now())
-		ss := m.ssdv[key]
-		started := false
-		if ss != nil && packet.PacketID == 0 {
-			hasPacketZero := len(ss.packetZero) > 0
-			samePacketZero := hasPacketZero && bytes.Equal(ss.packetZero, packet.Raw)
-			idleFor := time.Since(ss.lastUpdate)
-			// Packet 0 can arrive last in an out-of-order burst. Do not reset on
-			// packet number order alone; use its payload fingerprint, completion
-			// state, or a long inter-image pause to distinguish a new image.
-			newSession := (hasPacketZero && !samePacketZero && len(ss.packets) >= 1) ||
-				(hasPacketZero && ss.complete) ||
-				(idleFor > 5*time.Second && (hasPacketZero || len(ss.packets) >= 10))
-			if newSession {
-				ss = nil
-				started = true
-			}
-		}
-		if ss == nil {
-			if len(m.ssdv) >= maxImageSessions*2 {
-				var oldestKey string
-				var oldest time.Time
-				for candidateKey, candidate := range m.ssdv {
-					if oldestKey == "" || candidate.lastUpdate.Before(oldest) {
-						oldestKey, oldest = candidateKey, candidate.lastUpdate
-					}
-				}
-				delete(m.ssdv, oldestKey)
-			}
-			ss = &ssdvSession{packets: make(map[uint16][256]byte), width: packet.ImageWidth, height: packet.ImageHeight, quality: packet.Quality, fec: packet.FEC, subsampling: packet.Subsampling, sessionID: fmt.Sprintf("%d", time.Now().UnixNano())}
-			started = true
-			m.ssdv[key] = ss
-		}
-		ss.lastUpdate = time.Now()
-		if packet.PacketID >= maxSSDVPackets {
-			m.mu.Unlock()
-			return Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign, ImageID: packet.ImageID, Error: "SSDV packet index exceeds the configured session limit"}, true
-		}
-		if packet.ImageWidth > 0 {
-			ss.width = packet.ImageWidth
-		}
-		if packet.ImageHeight > 0 {
-			ss.height = packet.ImageHeight
-		}
-		ss.quality, ss.fec, ss.subsampling = packet.Quality, packet.FEC, packet.Subsampling
-		if _, exists := ss.packets[packet.PacketID]; exists {
-			m.mu.Unlock()
-			return Update{}, false
-		}
-		var raw [256]byte
-		copy(raw[:], packet.Raw)
-		ss.packets[packet.PacketID] = raw
-		if !ss.hasHighestPacketID || packet.PacketID > ss.highestPacketID {
-			ss.highestPacketID, ss.hasHighestPacketID = packet.PacketID, true
-		}
-		if packet.PacketID == 0 {
-			ss.packetZero = append(ss.packetZero[:0], packet.Raw...)
-		}
-		if packet.EOI && int(packet.PacketID)+1 > ss.expected {
-			ss.expected = int(packet.PacketID) + 1
-		}
-		count, expected := len(ss.packets), ss.expected
-		complete, covered := expected > 0, 0
-		for id := 0; id < expected; id++ {
-			if _, ok := ss.packets[uint16(id)]; ok {
-				covered++
-			} else {
-				complete = false
-			}
-		}
-		coverage := 0.0
-		if expected > 0 {
-			coverage = float64(covered) / float64(expected)
-		}
-		ss.complete = complete
-		archivePreview := complete || count >= ss.lastArchivePackets+ssdvArchiveInterval
-		update := Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign, ImageID: packet.ImageID,
-			PacketsReceived: count, PacketsExpected: expected, Coverage: coverage, Complete: complete,
-			ImageWidth: ss.width, ImageHeight: ss.height, Quality: ss.quality, FEC: ss.fec, Subsampling: ss.subsampling,
-			Started: started, SessionID: ss.sessionID, ArchivePreview: archivePreview,
-			HasAX25SSID: packet.HasAX25SSID, AX25SourceSSID: packet.AX25SourceSSID}
-		var ordered, prefix, previewPackets [][]byte
-		var packetArchive []byte
-		legacyStream := parsed.MCUOffset == 0xff || parsed.MCUIndex == 0xffff
-		needOrdered := complete
-		needIDs := complete || archivePreview
-		if legacyStream && !complete {
-			// Legacy streams have no MCU restart points and must retain the
-			// contiguous packet prefix for their row-based fallback decoder.
-			for id := 0; id < maxSSDVPackets; id++ {
-				part, ok := ss.packets[uint16(id)]
-				if !ok {
-					break
-				}
-				prefix = append(prefix, append([]byte(nil), part[:]...))
-			}
-			needOrdered = true
-		}
-		if !legacyStream && !complete {
-			// Each new packet can make at most two MCU segments newly decodable:
-			// the segment from the previous packet's restart marker to this one,
-			// and this packet's segment to the next restart marker (or packet end).
-			// Decoding only these neighbours avoids repeatedly parsing the entire
-			// image packet set on every incoming packet.
-			firstID := packet.PacketID
-			if firstID > 0 {
-				firstID--
-			}
-			lastID := packet.PacketID + 1
-			for id := firstID; id <= lastID; id++ {
-				if part, ok := ss.packets[id]; ok {
-					previewPackets = append(previewPackets, append([]byte(nil), part[:]...))
-				}
-			}
-		}
-		var ids []int
-		if needIDs {
-			ids = make([]int, 0, len(ss.packets))
-			for id := range ss.packets {
-				ids = append(ids, int(id))
-			}
-			sort.Ints(ids)
-		}
-		if needOrdered {
-			ordered = make([][]byte, 0, len(ids))
-			for _, id := range ids {
-				part := ss.packets[uint16(id)]
-				ordered = append(ordered, append([]byte(nil), part[:]...))
-			}
-		}
-		shouldPreview := !complete
-		if archivePreview {
-			packetArchive = make([]byte, 0, len(ids)*256)
-			for _, id := range ids {
-				part := ss.packets[uint16(id)]
-				packetArchive = append(packetArchive, part[:]...)
-			}
-			ss.lastArchivePackets = count
-		}
-
-		m.mu.Unlock()
-		if len(packetArchive) > 0 {
-			update.PacketDataBase64 = base64.StdEncoding.EncodeToString(packetArchive)
-		}
-
-		// Decode outside the manager lock so packet ingestion remains responsive.
-		// New transmitters put a byte-aligned MCU restart point in every SSDV
-		// packet, so each accepted packet can update its own 16x16 block region
-		// immediately without waiting for preceding packet IDs.
-		if complete {
-			jpegData, metadata, decodeErr := ssdv.DecodePacketsToJPEG(ordered)
-			if decodeErr != nil {
-				update.Error = decodeErr.Error()
-			} else {
-				decoded, imageErr := jpeg.Decode(bytes.NewReader(jpegData))
-				if imageErr != nil {
-					update.Error = fmt.Errorf("decode reconstructed SSDV JPEG: %w", imageErr).Error()
-				} else {
-					var pngBuffer bytes.Buffer
-					if imageErr = png.Encode(&pngBuffer, decoded); imageErr != nil {
-						update.Error = fmt.Errorf("encode reconstructed SSDV PNG: %w", imageErr).Error()
-					} else {
-						update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
-						update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
-						ss.lastPreviewImage = cloneRGBA(decodedToRGBA(decoded))
-					}
-				}
-			}
-		} else if shouldPreview && !legacyStream {
-			var preview *image.RGBA
-			var metadata ssdv.Packet
-			var decodeErr error
-			if ss.lastPreviewImage == nil {
-				preview, metadata, _, decodeErr = ssdv.DecodePacketsToPreview(previewPackets)
-			} else {
-				preview, metadata, _, decodeErr = ssdv.UpdatePacketsPreview(ss.lastPreviewImage, previewPackets)
-			}
-			if decodeErr == nil {
-				ss.lastPreviewImage = preview
-				var pngBuffer bytes.Buffer
-				if imageErr := png.Encode(&pngBuffer, preview); imageErr == nil {
-					update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
-					update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
-				}
-			}
-		} else if shouldPreview && legacyStream && len(prefix) > 0 {
-			// Backward-compatible row-prefix fallback for old SSDV transmitters
-			// whose packets use the 0xff/0xffff MCU sentinel.
-			if jpegData, _, _, legacyErr := ssdv.DecodePacketPrefixToJPEG(prefix); legacyErr == nil {
-				if decoded, imageErr := jpeg.Decode(bytes.NewReader(jpegData)); imageErr == nil {
-					canvas := image.NewRGBA(image.Rect(0, 0, ss.width, ss.height))
-					draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{R: 10, G: 16, B: 24, A: 255}}, image.Point{}, draw.Src)
-					draw.Draw(canvas, image.Rect(0, 0, decoded.Bounds().Dx(), decoded.Bounds().Dy()), decoded, decoded.Bounds().Min, draw.Src)
-					ss.lastPreviewImage = canvas
-				}
-			}
-			if ss.lastPreviewImage != nil {
-				canvas := cloneRGBA(ss.lastPreviewImage)
-				drawSSDVDamageRegions(canvas, ss.packets, ss.highestPacketID, ss.hasHighestPacketID, ss.expected)
-				var pngBuffer bytes.Buffer
-				if imageErr := png.Encode(&pngBuffer, canvas); imageErr == nil {
-					update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
-					update.ImageWidth, update.ImageHeight = ss.width, ss.height
-				}
-			}
-		}
-		return update, true
-	}
-	key := imageKey(packet.Profile, packet.Callsign, packet.ImageID)
-	if packet.Codec != "PCSI-MMT" {
+	switch packet.Codec {
+	case "SSDV":
+		return m.processSSDVPacket(packet)
+	case "PCSI-MMT":
+		return m.processPCSIPacket(packet)
+	default:
 		return Update{}, false
 	}
+}
+
+func (m *Manager) processSSDVPacket(packet transport.ReceivedPacket) (Update, bool) {
+	parsed, err := ssdv.ParsePacket(packet.Raw)
+	if err != nil {
+		return Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign, ImageID: packet.ImageID, Error: err.Error()}, true
+	}
+	// The packet header is authoritative. Archive corrected bytes rather than
+	// the damaged RF payload so a later export remains independently decodable.
+	packet.Callsign, packet.ImageID, packet.PacketID = parsed.Callsign, parsed.ImageID, parsed.PacketID
+	packet.ImageWidth, packet.ImageHeight, packet.Quality = parsed.Width, parsed.Height, parsed.Quality
+	packet.EOI, packet.Subsampling = parsed.EOI, parsed.Subsampling
+	packet.MCUOffset, packet.MCUIndex, packet.MCUCount = parsed.MCUOffset, parsed.MCUIndex, parsed.MCUCount
+	packet.FEC = parsed.FEC
+	packet.Raw = append(packet.Raw[:0], parsed.Raw[:]...)
+
+	key := imageKey(packet.Profile, packet.Callsign, packet.ImageID)
+	now := time.Now()
+	m.mu.Lock()
+	m.pruneSessionsLocked(now)
+	session, started := m.getOrCreateSSDVSessionLocked(key, packet, now)
+	work, update, emit := m.collectSSDVPacketLocked(session, packet, parsed, started)
+	m.mu.Unlock()
+	if !emit {
+		return update, false
+	}
+	if update.Error != "" {
+		return update, true
+	}
+	return m.renderSSDVPacketWork(work)
+}
+
+func (m *Manager) getOrCreateSSDVSessionLocked(key string, packet transport.ReceivedPacket, now time.Time) (*ssdvSession, bool) {
+	session := m.ssdv[key]
+	started := false
+	if session != nil && packet.PacketID == 0 {
+		hasPacketZero := len(session.packetZero) > 0
+		samePacketZero := hasPacketZero && bytes.Equal(session.packetZero, packet.Raw)
+		idleFor := now.Sub(session.lastUpdate)
+		// Packet zero can arrive late in an out-of-order burst. Fingerprint,
+		// completion and idle time identify a new image session more reliably.
+		newSession := (hasPacketZero && !samePacketZero && len(session.packets) >= 1) ||
+			(hasPacketZero && session.complete) ||
+			(idleFor > 5*time.Second && (hasPacketZero || len(session.packets) >= 10))
+		if newSession {
+			session = nil
+			started = true
+		}
+	}
+	if session == nil {
+		if len(m.ssdv) >= maxImageSessions*2 {
+			m.evictOldestSSDVSessionLocked()
+		}
+		session = &ssdvSession{
+			packets: make(map[uint16][256]byte), width: packet.ImageWidth,
+			height: packet.ImageHeight, quality: packet.Quality, fec: packet.FEC,
+			subsampling: packet.Subsampling, sessionID: fmt.Sprintf("%d", now.UnixNano()),
+		}
+		started = true
+		m.ssdv[key] = session
+	}
+	session.lastUpdate = now
+	return session, started
+}
+
+func (m *Manager) evictOldestSSDVSessionLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for key, candidate := range m.ssdv {
+		if oldestKey == "" || candidate.lastUpdate.Before(oldest) {
+			oldestKey, oldest = key, candidate.lastUpdate
+		}
+	}
+	if oldestKey != "" {
+		delete(m.ssdv, oldestKey)
+	}
+}
+
+// collectSSDVPacketLocked mutates the packet set and snapshots only the data
+// needed for decoding after the manager mutex is released.
+func (m *Manager) collectSSDVPacketLocked(session *ssdvSession, packet transport.ReceivedPacket, parsed ssdv.Packet, started bool) (ssdvPacketWork, Update, bool) {
+	if packet.PacketID >= maxSSDVPackets {
+		return ssdvPacketWork{}, Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign,
+			ImageID: packet.ImageID, Error: "SSDV packet index exceeds the configured session limit"}, true
+	}
+	if packet.ImageWidth > 0 {
+		session.width = packet.ImageWidth
+	}
+	if packet.ImageHeight > 0 {
+		session.height = packet.ImageHeight
+	}
+	session.quality, session.fec, session.subsampling = packet.Quality, packet.FEC, packet.Subsampling
+	if _, exists := session.packets[packet.PacketID]; exists {
+		return ssdvPacketWork{}, Update{}, false
+	}
+	var raw [256]byte
+	copy(raw[:], packet.Raw)
+	session.packets[packet.PacketID] = raw
+	if !session.hasHighestPacketID || packet.PacketID > session.highestPacketID {
+		session.highestPacketID, session.hasHighestPacketID = packet.PacketID, true
+	}
+	if packet.PacketID == 0 {
+		session.packetZero = append(session.packetZero[:0], packet.Raw...)
+	}
+	if packet.EOI && int(packet.PacketID)+1 > session.expected {
+		session.expected = int(packet.PacketID) + 1
+	}
+	count, expected := len(session.packets), session.expected
+	complete, covered := expected > 0, 0
+	for id := 0; id < expected; id++ {
+		if _, ok := session.packets[uint16(id)]; ok {
+			covered++
+		} else {
+			complete = false
+		}
+	}
+	coverage := 0.0
+	if expected > 0 {
+		coverage = float64(covered) / float64(expected)
+	}
+	session.complete = complete
+	archivePreview := complete || count >= session.lastArchivePackets+ssdvArchiveInterval
+	work := ssdvPacketWork{
+		session: session, complete: complete, shouldPreview: !complete,
+		legacyStream: parsed.MCUOffset == 0xff || parsed.MCUIndex == 0xffff,
+	}
+	work.update = Update{
+		Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign, ImageID: packet.ImageID,
+		PacketsReceived: count, PacketsExpected: expected, Coverage: coverage, Complete: complete,
+		ImageWidth: session.width, ImageHeight: session.height, Quality: session.quality, FEC: session.fec,
+		Subsampling: session.subsampling, Started: started, SessionID: session.sessionID,
+		ArchivePreview: archivePreview, HasAX25SSID: packet.HasAX25SSID, AX25SourceSSID: packet.AX25SourceSSID,
+	}
+	needOrdered := complete
+	needIDs := complete || archivePreview
+	if work.legacyStream && !complete {
+		for id := 0; id < maxSSDVPackets; id++ {
+			part, ok := session.packets[uint16(id)]
+			if !ok {
+				break
+			}
+			work.prefix = append(work.prefix, append([]byte(nil), part[:]...))
+		}
+		needOrdered = true
+	}
+	if !work.legacyStream && !complete {
+		// New packets can unlock at most their adjacent restart segments.
+		firstID := packet.PacketID
+		if firstID > 0 {
+			firstID--
+		}
+		lastID := packet.PacketID + 1
+		for id := firstID; id <= lastID; id++ {
+			if part, ok := session.packets[id]; ok {
+				work.previewPackets = append(work.previewPackets, append([]byte(nil), part[:]...))
+			}
+		}
+	}
+	var ids []int
+	if needIDs {
+		ids = make([]int, 0, len(session.packets))
+		for id := range session.packets {
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+	}
+	if needOrdered {
+		work.ordered = make([][]byte, 0, len(ids))
+		for _, id := range ids {
+			part := session.packets[uint16(id)]
+			work.ordered = append(work.ordered, append([]byte(nil), part[:]...))
+		}
+	}
+	if archivePreview {
+		archive := make([]byte, 0, len(ids)*256)
+		for _, id := range ids {
+			part := session.packets[uint16(id)]
+			archive = append(archive, part[:]...)
+		}
+		work.packetArchive = archive
+		session.lastArchivePackets = count
+	}
+	return work, Update{}, true
+}
+
+func (m *Manager) renderSSDVPacketWork(work ssdvPacketWork) (Update, bool) {
+	update, session := work.update, work.session
+	if len(work.packetArchive) > 0 {
+		update.PacketDataBase64 = base64.StdEncoding.EncodeToString(work.packetArchive)
+	}
+	// Image decode and preview encoding stay outside Manager.mu so packet
+	// ingestion can continue while image reconstruction is running.
+	if work.complete {
+		m.renderCompleteSSDVImage(&update, session, work.ordered)
+	} else if work.shouldPreview && !work.legacyStream {
+		m.renderProgressiveSSDVPreview(&update, session, work.previewPackets)
+	} else if work.shouldPreview && work.legacyStream && len(work.prefix) > 0 {
+		m.renderLegacySSDVPreview(&update, session, work.prefix)
+	}
+	return update, true
+}
+
+func (m *Manager) renderCompleteSSDVImage(update *Update, session *ssdvSession, packets [][]byte) {
+	jpegData, metadata, decodeErr := ssdv.DecodePacketsToJPEG(packets)
+	if decodeErr != nil {
+		update.Error = decodeErr.Error()
+		return
+	}
+	decoded, imageErr := jpeg.Decode(bytes.NewReader(jpegData))
+	if imageErr != nil {
+		update.Error = fmt.Errorf("decode reconstructed SSDV JPEG: %w", imageErr).Error()
+		return
+	}
+	var pngBuffer bytes.Buffer
+	if imageErr = png.Encode(&pngBuffer, decoded); imageErr != nil {
+		update.Error = fmt.Errorf("encode reconstructed SSDV PNG: %w", imageErr).Error()
+		return
+	}
+	update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
+	update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
+	session.lastPreviewImage = cloneRGBA(decodedToRGBA(decoded))
+}
+
+func (m *Manager) renderProgressiveSSDVPreview(update *Update, session *ssdvSession, packets [][]byte) {
+	var preview *image.RGBA
+	var metadata ssdv.Packet
+	var err error
+	if session.lastPreviewImage == nil {
+		preview, metadata, _, err = ssdv.DecodePacketsToPreview(packets)
+	} else {
+		preview, metadata, _, err = ssdv.UpdatePacketsPreview(session.lastPreviewImage, packets)
+	}
+	if err != nil {
+		return
+	}
+	session.lastPreviewImage = preview
+	var pngBuffer bytes.Buffer
+	if err = png.Encode(&pngBuffer, preview); err != nil {
+		return
+	}
+	update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
+	update.ImageWidth, update.ImageHeight = metadata.Width, metadata.Height
+}
+
+func (m *Manager) renderLegacySSDVPreview(update *Update, session *ssdvSession, prefix [][]byte) {
+	if jpegData, _, _, err := ssdv.DecodePacketPrefixToJPEG(prefix); err == nil {
+		if decoded, decodeErr := jpeg.Decode(bytes.NewReader(jpegData)); decodeErr == nil {
+			canvas := image.NewRGBA(image.Rect(0, 0, session.width, session.height))
+			draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{R: 10, G: 16, B: 24, A: 255}}, image.Point{}, draw.Src)
+			draw.Draw(canvas, image.Rect(0, 0, decoded.Bounds().Dx(), decoded.Bounds().Dy()), decoded, decoded.Bounds().Min, draw.Src)
+			session.lastPreviewImage = canvas
+		}
+	}
+	if session.lastPreviewImage == nil {
+		return
+	}
+	canvas := cloneRGBA(session.lastPreviewImage)
+	drawSSDVDamageRegions(canvas, session.packets, session.highestPacketID, session.hasHighestPacketID, session.expected)
+	var pngBuffer bytes.Buffer
+	if err := png.Encode(&pngBuffer, canvas); err != nil {
+		return
+	}
+	update.PNGBase64 = base64.StdEncoding.EncodeToString(pngBuffer.Bytes())
+	update.ImageWidth, update.ImageHeight = session.width, session.height
+}
+
+func (m *Manager) processPCSIPacket(packet transport.ReceivedPacket) (Update, bool) {
 	corrected, _, err := pcsi.CorrectPacket(packet.Raw)
 	if err != nil {
 		return Update{Profile: packet.Profile, Codec: packet.Codec, Callsign: packet.Callsign, ImageID: packet.ImageID, Error: err.Error()}, true
@@ -758,8 +816,15 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 	if err != nil {
 		return Update{Profile: packet.Profile, Codec: packet.Codec, Error: err.Error()}, true
 	}
+	key := imageKey(packet.Profile, info.Callsign, info.ImageID)
 	m.mu.Lock()
 	m.pruneSessionsLocked(time.Now())
+	session, started := m.getOrCreatePCSISessionLocked(key, packet, info, corrected)
+	m.mu.Unlock()
+	return m.addPCSIPacket(session, packet, info, corrected, started)
+}
+
+func (m *Manager) getOrCreatePCSISessionLocked(key string, packet transport.ReceivedPacket, info pcsi.PacketInfo, corrected []byte) (*imageSession, bool) {
 	session := m.sessions[key]
 	started := false
 	if session != nil && info.PacketNumber == 0 {
@@ -770,9 +835,6 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 		previousComplete := session.complete
 		session.mu.Unlock()
 		idleFor := time.Since(session.lastUpdate)
-		// Image-ID reuse is ambiguous at the transport layer. A changed packet
-		// 0 or completed prior image is strong boundary evidence; sequence
-		// ordering alone is not, since packet 0 may be delayed.
 		newSession := (hasPacketZero && !samePacketZero && seenCount >= 1) ||
 			(hasPacketZero && previousComplete) ||
 			(idleFor > 5*time.Second && (hasPacketZero || seenCount >= 10))
@@ -783,23 +845,34 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 	}
 	if session == nil {
 		if len(m.sessions) >= maxImageSessions {
-			var oldestKey string
-			var oldest time.Time
-			for candidateKey, candidate := range m.sessions {
-				if oldestKey == "" || candidate.lastUpdate.Before(oldest) {
-					oldestKey, oldest = candidateKey, candidate.lastUpdate
-				}
-			}
-			delete(m.sessions, oldestKey)
+			m.evictOldestPCSISessionLocked()
 		}
-		session = &imageSession{decoder: pcsi.NewDecoderState(info), profile: packet.Profile, callsign: info.Callsign, imageID: info.ImageID,
-			ax25SSID: packet.AX25SourceSSID, hasAX25SSID: packet.HasAX25SSID,
-			key: key, sessionID: fmt.Sprintf("%d", time.Now().UnixNano())}
+		session = &imageSession{
+			decoder: pcsi.NewDecoderState(info), profile: packet.Profile, callsign: info.Callsign,
+			imageID: info.ImageID, ax25SSID: packet.AX25SourceSSID, hasAX25SSID: packet.HasAX25SSID,
+			key: key, sessionID: fmt.Sprintf("%d", time.Now().UnixNano()),
+		}
 		started = true
 		m.sessions[key] = session
 	}
 	session.lastUpdate = time.Now()
-	m.mu.Unlock()
+	return session, started
+}
+
+func (m *Manager) evictOldestPCSISessionLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for key, candidate := range m.sessions {
+		if oldestKey == "" || candidate.lastUpdate.Before(oldest) {
+			oldestKey, oldest = key, candidate.lastUpdate
+		}
+	}
+	if oldestKey != "" {
+		delete(m.sessions, oldestKey)
+	}
+}
+
+func (m *Manager) addPCSIPacket(session *imageSession, packet transport.ReceivedPacket, info pcsi.PacketInfo, corrected []byte, started bool) (Update, bool) {
 	session.mu.Lock()
 	if session.decoder.Seen[info.PacketNumber] {
 		stats := session.decoder.Stats()
@@ -823,8 +896,6 @@ func (m *Manager) process(packet transport.ReceivedPacket) (Update, bool) {
 		Profile: packet.Profile, Codec: packet.Codec, Callsign: info.Callsign, ImageID: info.ImageID,
 		PacketsReceived: stats.PacketsReceived, PacketsExpected: stats.PacketsExpected, Coverage: stats.Coverage,
 		Started: started, SessionID: session.sessionID, HasAX25SSID: packet.HasAX25SSID, AX25SourceSSID: packet.AX25SourceSSID,
-		// The transport may be complete while the numerical image reconstruction
-		// is still running. Only the reconstruction result sets Complete=true.
 		Complete: false,
 	}
 	shouldReconstruct := stats.PacketsReceived%pcsiPreviewInterval == 0 || complete

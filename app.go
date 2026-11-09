@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
@@ -29,8 +28,6 @@ import (
 	"github.com/BH2VSQ/SATSSDV-Go/internal/gallery"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/gifmode"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/i18n"
-	"github.com/BH2VSQ/SATSSDV-Go/internal/image/ssdv"
-	"github.com/BH2VSQ/SATSSDV-Go/internal/modem/ax25"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/radio/ptt"
 	"github.com/BH2VSQ/SATSSDV-Go/internal/radio/serialptt"
 	rxengine "github.com/BH2VSQ/SATSSDV-Go/internal/rx"
@@ -589,217 +586,14 @@ func (a *App) StartTXRendered(image RenderedTXImage, repeat bool, intervalSecond
 		if parsedProfile.ImageCodec != "SSDV" {
 			return errors.New("GIF template components require an SSDV TX profile")
 		}
-		return a.startTransmissionGIF(image, data, profile, quality, callsign, ax25SSID, audioRate, ax25To, repeat, intervalSeconds)
+		return a.startTransmissionGIF(gifTransmissionRequest{
+			rendered: image, basePNG: data, profileID: profile, quality: quality,
+			callsign: callsign, ax25SSID: ax25SSID, audioRate: audioRate,
+			ax25To: ax25To, repeat: repeat, intervalSeconds: intervalSeconds,
+		})
 	}
 	job := txqueue.Job{ID: image.ID, ImageName: image.Name, ImageDataBase64: image.PNGBase64, Profile: profile, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
 	return a.startTransmission(job, repeat, intervalSeconds)
-}
-
-// startTransmissionGIF runs the attachment's private SATSSDV-Go incremental
-// GIF transport through the existing radio/audio path. It is intentionally
-// limited to SSDV profiles; PCSI has a different packet format.
-func (a *App) startTransmissionGIF(rendered RenderedTXImage, basePNG []byte, profileID, quality, callsign string, ax25SSID, audioRate int, ax25To string, repeat bool, intervalSeconds int) error {
-	a.mu.Lock()
-	maryFECProfile := a.settings.MARYFECProfile
-	a.mu.Unlock()
-	gifData, err := base64.StdEncoding.DecodeString(rendered.GIFBase64)
-	if err != nil || len(gifData) == 0 || len(gifData) > 8*1024*1024 {
-		return errors.New("template GIF must be valid and no larger than 8 MiB")
-	}
-	baseImage, err := png.Decode(bytes.NewReader(basePNG))
-	if err != nil {
-		return fmt.Errorf("decode template base PNG: %w", err)
-	}
-	base := image.NewRGBA(image.Rect(0, 0, baseImage.Bounds().Dx(), baseImage.Bounds().Dy()))
-	draw.Draw(base, base.Bounds(), baseImage, baseImage.Bounds().Min, draw.Src)
-	var overlay *image.RGBA
-	if rendered.OverlayPNGBase64 != "" {
-		overlayData, decodeErr := base64.StdEncoding.DecodeString(rendered.OverlayPNGBase64)
-		if decodeErr != nil || len(overlayData) == 0 || len(overlayData) > 8*1024*1024 {
-			return errors.New("template GIF overlay PNG is invalid or exceeds 8 MiB")
-		}
-		overlayImage, imageErr := png.Decode(bytes.NewReader(overlayData))
-		if imageErr != nil {
-			return fmt.Errorf("decode template overlay PNG: %w", imageErr)
-		}
-		if overlayImage.Bounds().Dx() != base.Bounds().Dx() || overlayImage.Bounds().Dy() != base.Bounds().Dy() {
-			return errors.New("template GIF overlay dimensions do not match the base canvas")
-		}
-		overlay = image.NewRGBA(base.Bounds())
-		draw.Draw(overlay, overlay.Bounds(), overlayImage, overlayImage.Bounds().Min, draw.Src)
-	} else {
-		overlay = image.NewRGBA(base.Bounds())
-	}
-	parsedProfile, err := domain.ParseProfile(profileID)
-	if err != nil {
-		return err
-	}
-	if parsedProfile.ImageCodec != "SSDV" {
-		return errors.New("GIF template components require an SSDV TX profile")
-	}
-	if parsedProfile.LinkLayer == "CCSDS-MARY" && audioRate < 44100 {
-		return errors.New("QPSK/8PSK/16QAM 1600-symbol TX requires an audio sample rate of at least 44100 Hz")
-	}
-	if intervalSeconds < 0 || intervalSeconds > 86400 {
-		return errors.New("TX interval must be between 0 and 86400 seconds")
-	}
-	if strings.TrimSpace(ax25To) == "" {
-		ax25To = "CQ"
-	}
-	if quality == "" {
-		quality = "medium"
-	}
-
-	jobID, imageName, gifRect := rendered.ID, rendered.Name, rendered.GIFRect
-	job := txqueue.Job{ID: jobID, ImageName: imageName, Profile: profileID, Quality: quality, AX25SSID: ax25SSID, AX25To: ax25To}
-	// The GIF can be expensive to decode/packetize. Prepare it in the TX worker,
-	// not on the Qt event thread, then reuse the same burst for each repeat cycle.
-	prepared := false
-	var prepareErr error
-	var frames []gifmode.Frame
-	var archiveGIF []byte
-	var archiveWidth, archiveHeight int
-	var stats gifmode.Stats
-	var waveformRate int
-	var packets [][]byte
-	var encoder *transport.Encoder
-	var estimatedSamples int64
-	var wireFrameCount int
-	var duplex *audio.Duplex
-	var currentCallsign string
-	var baseImageID uint8
-	sender := func(ctx context.Context, _ txqueue.Job) error {
-		if !prepared {
-			frames, prepareErr = gifmode.DecodeTemplate(gifData, quality, base, overlay, gifRect)
-			if prepareErr != nil {
-				prepared = true
-				return prepareErr
-			}
-			if err := ctx.Err(); err != nil {
-				prepared = true
-				return err
-			}
-			archiveWidth = frames[0].Image.Bounds().Dx()
-			archiveHeight = frames[0].Image.Bounds().Dy()
-			archiveGIF, prepareErr = gifmode.EncodeGIF(frames)
-			if prepareErr != nil {
-				prepared = true
-				return fmt.Errorf("prepare TX GIF album preview: %w", prepareErr)
-			}
-			if len(archiveGIF) == 0 || len(archiveGIF) > 16*1024*1024 {
-				prepared = true
-				return errors.New("transmitted GIF preview is empty or exceeds the 16 MiB album limit")
-			}
-			a.mu.Lock()
-			currentCallsign = strings.TrimSpace(a.settings.Callsign)
-			if currentCallsign == "" {
-				currentCallsign = callsign
-			}
-			a.txImageID++
-			baseImageID = a.txImageID
-			if len(frames) > 1 {
-				a.txImageID += uint8(len(frames) - 1)
-			}
-			duplex = a.audioDuplex
-			a.mu.Unlock()
-			if duplex == nil {
-				prepareErr = audio.ErrRuntimeUnavailable
-				prepared = true
-				return prepareErr
-			}
-			encodedPackets, packetStats, encodeErr := gifmode.EncodeContextV2(ctx, frames, currentCallsign, baseImageID, ssdv.DefaultJPEGQuality)
-			if encodeErr != nil {
-				prepareErr = encodeErr
-				prepared = true
-				return prepareErr
-			}
-			packets = encodedPackets
-			stats = packetStats
-			// The compressed album animation is now prepared and packetization is
-			// complete. Do not retain every full-resolution RGBA frame or the source
-			// GIF/template layers for the duration of a potentially long TX burst.
-			frames = nil
-			gifData, base, overlay = nil, nil, nil
-			transportConfig := transport.Config{Profile: domain.TransportMode(profileID), AudioSampleRate: audioRate, MARYFECProfile: maryFECProfileValue(maryFECProfile)}
-			if parsedProfile.LinkLayer == "AX.25 UI / HDLC" {
-				transportConfig.Source = ax25.Address{Callsign: currentCallsign, SSID: uint8(ax25SSID)}
-				transportConfig.Destination = ax25.Address{Callsign: ax25To}
-			}
-			var createErr error
-			encoder, createErr = transport.NewEncoder(transportConfig)
-			if createErr != nil {
-				prepareErr = createErr
-				prepared = true
-				return prepareErr
-			}
-			estimatedSamples, prepareErr = encoder.EstimateOutputSamplesForPackets(packets)
-			if prepareErr != nil {
-				prepared = true
-				return fmt.Errorf("estimate GIF template stream: %w", prepareErr)
-			}
-			var countErr error
-			wireFrameCount, countErr = encoder.EstimateWirePacketCount(packets)
-			if countErr != nil {
-				prepared = true
-				return fmt.Errorf("estimate GIF physical data frames: %w", countErr)
-			}
-			// Discard temporary frame and image buffers before opening the bounded
-			// PCM stream. The encoded 256-byte packet set is retained for repeat TX.
-			runtimedebug.FreeOSMemory()
-			waveformRate, prepareErr = encoder.SampleRate()
-			if prepareErr != nil {
-				prepared = true
-				return fmt.Errorf("prepare GIF template stream: %w", prepareErr)
-			}
-			prepared = true
-			airtime := durationForSamples(estimatedSamples, waveformRate)
-			a.emit("tx:gif-stats", map[string]any{
-				"frames": stats.Frames, "keyframes": stats.Keyframes,
-				"dataPackets": stats.DataPackets, "totalPackets": stats.TotalPackets,
-				"wirePackets": wireFrameCount,
-				"changedMCUs": stats.ChangedMCUs, "totalMCUs": stats.TotalMCUs,
-				"motionVectors": stats.MotionVectors, "predictedMCUs": stats.PredictedMCUs,
-				"estimatedSeconds": int(airtime.Seconds()),
-			})
-		}
-		if prepareErr != nil {
-			return prepareErr
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		var startedAt time.Time
-		estimatedDuration := durationForSamples(estimatedSamples, waveformRate)
-		totalDataFrames := wireFrameCount
-		producer := func(streamCtx context.Context, emit func([]float32) error) error {
-			streamedSamples, streamErr := encoder.StreamPackets(streamCtx, packets, func(block []float32) error {
-				if emitErr := emit(block); emitErr != nil {
-					return emitErr
-				}
-				a.emitTXStreamSpectrum(block, waveformRate)
-				return nil
-			})
-			if streamErr == nil && streamedSamples != estimatedSamples {
-				return fmt.Errorf("GIF stream encoder produced %d samples, estimated %d", streamedSamples, estimatedSamples)
-			}
-			return streamErr
-		}
-		if err := duplex.TransmitStreamWithStart(ctx, estimatedSamples, producer, func() {
-			startedAt = time.Now().UTC()
-			a.emitTXMetrics(startedAt, estimatedDuration, totalDataFrames, 0)
-		}, func(progress float64) {
-			a.emitTXProgress(nil, waveformRate, progress)
-			a.emitTXMetrics(startedAt, estimatedDuration, totalDataFrames, progress)
-		}); err != nil {
-			return err
-		}
-		if err := a.archiveTXGIFData(archiveGIF, archiveWidth, archiveHeight, profileID, currentCallsign, baseImageID, stats, startedAt); err != nil {
-			return fmt.Errorf("archive transmitted GIF: %w", err)
-		}
-		a.emit("tx:gif-sent", map[string]any{"fileName": imageName, "frames": stats.Frames, "packetsSent": stats.TotalPackets, "wirePacketsSent": totalDataFrames, "startedAt": startedAt})
-		return nil
-	}
-	return a.startTransmissionWithSender(job, repeat, intervalSeconds, sender)
 }
 
 func (a *App) startTransmission(job txqueue.Job, repeat bool, intervalSeconds int) error {
@@ -864,6 +658,16 @@ func (a *App) getContext() context.Context {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.ctx
+}
+
+// gifMARYBurstGroupSize limits how many CCSDS units must accumulate before
+// an M-ary GIF receiver can validate and publish the next progressive update.
+// Ordinary image transfers keep the higher-throughput default group size.
+func gifMARYBurstGroupSize(profile domain.Profile) int {
+	if profile.LinkLayer == "CCSDS-MARY" {
+		return 2
+	}
+	return 0
 }
 
 func maryFECProfileValue(value string) int {
@@ -1324,10 +1128,11 @@ func (a *App) estimateTrackedRXAudioSNR(bins []dsp.SpectrumBin, profileID string
 	// bins. Wideband M-ary/GMSK spectra do not leave a dependable in-band noise
 	// reference; return unavailable rather than extrapolate from a stale idle
 	// profile and display an implausibly high number.
-	if profileID == domain.AutoReceiveProfile || strings.Contains(profileID, "1600") || strings.Contains(profileID, "2400") {
+	if profileID == domain.AutoReceiveProfile || strings.Contains(profileID, "1600") {
 		return dsp.BandSNR{}
 	}
-	if profileID != string(domain.SSDVAX25) && profileID != string(domain.SSDVCCSDS1200) && profileID != string(domain.PCSICCSDS1200) {
+	if profileID != string(domain.SSDVAX25) && profileID != string(domain.SSDVCCSDS1200) && profileID != string(domain.PCSICCSDS1200) &&
+		profileID != string(domain.SSDVCCSDS2400) && profileID != string(domain.PCSICCSDS2400) {
 		return dsp.BandSNR{}
 	}
 	low, high := rxAudioSNRPassband(profileID, sampleRate)
@@ -1420,8 +1225,17 @@ func (a *App) handleRXAudio(samples []float32) {
 				}
 			} else {
 				snr = a.estimateTrackedRXAudioSNR(bins, profileID, rate)
-				if strings.Contains(profileID, "2400") {
-					snrReason = "wideband-estimator-unavailable"
+				switch {
+				case strings.Contains(profileID, "2400"):
+					snrReason = "gmsk-awaiting-evidence"
+					if snr.Valid {
+						snrReason = "gmsk-band-tracker"
+					}
+				case strings.Contains(profileID, "1200"):
+					snrReason = "afsk-awaiting-evidence"
+					if snr.Valid {
+						snrReason = "afsk-band-tracker"
+					}
 				}
 			}
 		}

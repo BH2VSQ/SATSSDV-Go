@@ -21,6 +21,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - name: Install C/C++ and Go security analysis tools
         run: |
           sudo apt-get update
@@ -46,54 +49,152 @@ jobs:
           clang-tidy --version
           govulncheck -version
           npx --yes aislop@0.20.0 doctor
-      - name: Run aislop deterministic quality gate
-        uses: scanaislop/aislop@v0.20.0
-        with:
-          directory: .
-          node-version: "24"
-          format: json
-
-  race-regression:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26.x"
-          cache: true
-      - name: Race-check modem and codec packages
+      - name: Run Aislop 0.20.0 and preserve machine-readable output
+        id: aislop
+        shell: bash
         run: |
-          go test -race ./internal/modem/mary
-          go test -race ./internal/image/bcsi
-      - name: Race-check RX queue and reconstruction worker
-        # Keep race instrumentation on lifecycle, back-pressure, in-flight
-        # reconstruction and GIF packet-state tests; the larger entropy stress
-        # case is covered without -race in the full Go test matrix.
-        run: >-
-          go test -race ./internal/rx
-          -run '^TestManagerSubmitRejectsAfterClose$|^TestManagerSubmitDoesNotBlockWhenQueueSaturates$|^TestManagerKeepsIngestingPCSIWhileReconstructionRuns$|^TestManagerDiagnosticsReportsQueueAndProcessingProgress$|^TestGIFManagerDeduplicatesRepeatedControlAndAcceptsRepeatedTX$'
-      - name: Race-check filtered QPSK, 8PSK and 16QAM air paths
-        run: go test -race ./internal/transport -run '^TestMAModulationTXFilteredRXAirpath$|^TestMAModulationTXFilteredRXWithAudioNoise$'
+          mkdir -p reports/aislop
+          set +e
+          npm exec --yes --package=aislop@0.20.0 -- aislop ci "$GITHUB_WORKSPACE" \
+            > reports/aislop/aislop.json \
+            2> reports/aislop/aislop.stderr
+          status=$?
+          printf '%s\n' "$status" > reports/aislop/aislop.exit
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+      - name: Generate Aislop Markdown analysis
+        if: always()
+        env:
+          AISLOP_SCAN_OUTCOME: ${{ steps.aislop.outcome }}
+          AISLOP_SCAN_EXIT: ${{ steps.aislop.outputs.exit_code }}
+        run: |
+          python scripts/generate_aislop_report.py \
+            --json reports/aislop/aislop.json \
+            --output reports/aislop/Aislop-Code-Analysis.md \
+            --scan-outcome "$AISLOP_SCAN_OUTCOME" \
+            --scan-exit "$AISLOP_SCAN_EXIT"
+      - name: Upload Aislop analysis and raw diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-aislop-code-analysis
+          path: reports/aislop/
+          if-no-files-found: warn
 
-  modem-characterization:
+  qex-itu-channel-regression:
+    name: QEX / ITU channel + race regression — ${{ matrix.profile }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        profile:
+          - ssdv-ax25
+          - ssdv-ccsds-1200
+          - ssdv-ccsds-2400
+          - pcsi-ccsds-1200
+          - pcsi-ccsds-2400
+          - ssdv-qpsk-1600
+          - ssdv-8psk-1600
+          - ssdv-16qam-1600
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
           cache: true
-      - name: Run all-profile AWGN and audio-IF sweep
+      - name: Prepare per-profile test outputs
+        run: mkdir -p reports/channel-csv reports/race
+      - name: Run QEX / ITU channel sensitivity sweep through production TX/RX
         env:
-          SATSSDV_CHARACTERIZATION: "1"
-          SATSSDV_CHARACTERIZATION_TRIALS: "2"
-          MODEM_REPORT_PATH: ${{ github.workspace }}/modem-characterization-report.md
-        run: go test -count=1 -v ./internal/transport -run '^TestModeNoiseAndOffsetCharacterization$'
-      - uses: actions/upload-artifact@v4
+          SATSSDV_CHANNEL_TESTS: "1"
+          SATSSDV_CHANNEL_PROFILE: ${{ matrix.profile }}
+          SATSSDV_CHANNEL_TRIALS: "10"
+          SATSSDV_CHANNEL_CSV: ${{ github.workspace }}/reports/${{ matrix.profile }}.csv
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./internal/transport \
+            -run '^TestSatelliteChannelSensitivityCharacterization$' \
+            2>&1 | tee "reports/channel-${{ matrix.profile }}.log"
+      - name: Run race and concurrency regression suite
+        if: always() && matrix.profile == 'ssdv-ax25'
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG=reports/race/race-regression.log
+          run_race() {
+            printf '\n$' | tee -a "$LOG"
+            printf ' %q' "$@" | tee -a "$LOG"
+            printf '\n' | tee -a "$LOG"
+            "$@" 2>&1 | tee -a "$LOG"
+          }
+          run_race go test -race ./internal/modem/mary
+          run_race go test -race ./internal/image/bcsi
+          run_race go test -race ./internal/rx -run '^TestManagerSubmitRejectsAfterClose$|^TestManagerSubmitDoesNotBlockWhenQueueSaturates$|^TestManagerKeepsIngestingPCSIWhileReconstructionRuns$|^TestManagerDiagnosticsReportsQueueAndProcessingProgress$|^TestGIFManagerDeduplicatesRepeatedControlAndAcceptsRepeatedTX$'
+          run_race go test -race ./internal/transport -run '^TestMAModulationTXFilteredRXAirpath$|^TestMAModulationTXFilteredRXWithAudioNoise$'
+      - name: Upload profile channel measurements
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: SATSSDV-Go-modem-characterization
-          path: modem-characterization-report.md
-          if-no-files-found: error
+          name: SATSSDV-Go-channel-${{ matrix.profile }}
+          path: |
+            reports/${{ matrix.profile }}.csv
+            reports/channel-${{ matrix.profile }}.log
+          if-no-files-found: warn
+      - name: Upload race regression evidence
+        if: always() && matrix.profile == 'ssdv-ax25'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-race-log
+          path: reports/race/race-regression.log
+          if-no-files-found: warn
+
+  qex-itu-channel-report:
+    name: Generate QEX / ITU technical report
+    if: always()
+    needs: [qex-itu-channel-regression]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Download channel measurement artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: SATSSDV-Go-channel-*
+          path: reports/channel-csv
+          merge-multiple: true
+      - name: Download race detector evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: SATSSDV-Go-race-log
+          path: reports/race
+      - name: Install plotting dependency
+        run: python -m pip install --disable-pip-version-check matplotlib
+      - name: Generate QEX / ITU Markdown, CSV, JSON and PNG reports
+        if: always()
+        run: |
+          python scripts/generate_qex_report.py \
+            --input-dir reports/channel-csv \
+            --output-dir reports/qex \
+            --trials 10 \
+            --race-log reports/race/race-regression.log
+      - name: Upload QEX / ITU channel and race report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SATSSDV-Go-QEX-ITU-Channel-Report
+          path: |
+            reports/qex/
+            reports/channel-csv/
+            reports/race/
+          if-no-files-found: warn
 
   qt-linux:
     name: Linux — Go tests + Qt build + AppImage/DEB/tar.gz
@@ -118,6 +219,7 @@ jobs:
           python scripts/check_qt_startup_contract.py
           python scripts/check_rx_gif_preview.py
           python scripts/check_packaging_contract.py
+          python scripts/test_report_generators.py
       - name: Build backend without native audio
         run: go build -tags "" ./...
       - name: Verify backend RPC lifecycle
@@ -225,6 +327,7 @@ jobs:
           python scripts/check_qt_startup_contract.py
           python scripts/check_rx_gif_preview.py
           python scripts/check_packaging_contract.py
+          python scripts/test_report_generators.py
       - name: Build backend without native audio
         run: go build -tags "" ./...
       - name: Verify backend RPC lifecycle
@@ -367,6 +470,7 @@ jobs:
           python scripts/check_qt_startup_contract.py
           python scripts/check_rx_gif_preview.py
           python scripts/check_packaging_contract.py
+          python scripts/test_report_generators.py
       - name: Build backend without native audio
         run: go build -tags "" ./...
       - name: Verify backend RPC lifecycle

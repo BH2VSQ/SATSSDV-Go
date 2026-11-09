@@ -32,8 +32,18 @@ else:
             errors.append(f"Windows installer definition is missing {required}")
 if not README.is_file():
     errors.append("Windows portable package README is missing")
-if "scanaislop/aislop@v0.20.0" not in WORKFLOW:
-    errors.append("CI workflow must run the pinned aislop quality gate")
+if "aislop@0.20.0" not in WORKFLOW or "aislop ci" not in WORKFLOW:
+    errors.append("CI workflow must run the pinned Aislop 0.20.0 quality gate")
+if "SATSSDV-Go-aislop-code-analysis" not in WORKFLOW or "generate_aislop_report.py" not in WORKFLOW:
+    errors.append("CI workflow must preserve the raw Aislop JSON and generate a Markdown report")
+if "qex-itu-channel-regression" not in WORKFLOW or "TestSatelliteChannelSensitivityCharacterization" not in WORKFLOW:
+    errors.append("CI workflow must run the QEX/ITU production-path channel sweep")
+if "SATSSDV-Go-QEX-ITU-Channel-Report" not in WORKFLOW or "generate_qex_report.py" not in WORKFLOW:
+    errors.append("CI workflow must publish the QEX/ITU Markdown, CSV, JSON and PNG report")
+if "race-regression:" in WORKFLOW:
+    errors.append("The standalone race-regression job must be replaced by the QEX/ITU regression job")
+if "SATSSDV-Go-race-log" not in WORKFLOW or "go test -race ./internal/rx" not in WORKFLOW:
+    errors.append("QEX/ITU regression must retain and publish the race detector evidence")
 if "  go-test:" in WORKFLOW:
     errors.append("Go tests must be merged into each platform's native build job")
 for platform_job in ("qt-linux", "qt-windows", "qt-macos"):

@@ -670,7 +670,7 @@ func TestSDF3MARYReacquiresAcrossNoisyGroupGuards(t *testing.T) {
 		profile := profile
 		t.Run(string(profile), func(t *testing.T) {
 			packets := makeSoftFECTestPackets(t, 16)
-			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000}) // zero value is the balanced throughput profile.
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 2})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -720,13 +720,71 @@ func TestSDF3MARYReacquiresAcrossNoisyGroupGuards(t *testing.T) {
 					if len(received) != len(packets) {
 						t.Fatalf("at %.0f dB SNR recovered %d/%d packets across noisy group guards; diag=%+v SDF3=%d/%d last=%q", snrDB, len(received), len(packets), decoder.Diagnostics(), decoder.marySDF3PacketsOK, decoder.marySDF3PacketsBad, decoder.marySDF3LastError)
 					}
-					if decoder.marySDF3PacketsOK < 2 {
-						t.Fatalf("expected two independently decoded SDF3 groups, got %d: %+v", decoder.marySDF3PacketsOK, decoder.Diagnostics())
+					wireCount, countErr := encoder.EstimateWirePacketCount(packets)
+					if countErr != nil {
+						t.Fatal(countErr)
 					}
-					if decoder.Diagnostics().MARYReacquireCount < 2 {
+					wantGroups := (wireCount + 1) / 2
+					if decoder.marySDF3PacketsOK != uint64(wantGroups) {
+						t.Fatalf("decoded %d SDF3 groups, want %d two-unit groups for %d wire units: %+v", decoder.marySDF3PacketsOK, wantGroups, wireCount, decoder.Diagnostics())
+					}
+					if decoder.Diagnostics().MARYReacquireCount < uint64(wantGroups) {
 						t.Fatalf("receiver did not reacquire the second group's training word: %+v", decoder.Diagnostics())
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestMARYSmallGroupsReduceProgressivePacketLatency(t *testing.T) {
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			packets := makeSoftFECTestPackets(t, 10)
+			latencySamples := make(map[int]int64, 2)
+			for _, groupSize := range []int{2, 10} {
+				encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: groupSize})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var waveform []float32
+				if _, err := encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+					waveform = append(waveform, block...)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				decoder, err := NewStreamDecoder(profile, 48000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				input := make([]float32, 2413, 2413+len(waveform)+4800)
+				input = append(input, waveform...)
+				input = append(input, make([]float32, 4800)...)
+				var consumed int64
+				for offset := 0; offset < len(input); offset += 1920 {
+					end := min(len(input), offset+1920)
+					decoded, feedErr := decoder.Feed(input[offset:end])
+					if feedErr != nil {
+						t.Fatal(feedErr)
+					}
+					consumed += int64(end - offset)
+					if len(decoded) > 0 {
+						latencySamples[groupSize] = consumed
+						break
+					}
+				}
+				if latencySamples[groupSize] == 0 {
+					t.Fatalf("group size %d did not progressively decode the first packet", groupSize)
+				}
+			}
+			lowLatency := float64(latencySamples[2]) / 48000
+			batched := float64(latencySamples[10]) / 48000
+			t.Logf("first valid packet latency: group=2 %.3fs; group=10 %.3fs", lowLatency, batched)
+			if lowLatency >= batched*0.60 {
+				t.Fatalf("small groups did not materially improve first-packet latency: group=2 %.3fs group=10 %.3fs", lowLatency, batched)
 			}
 		})
 	}

@@ -161,17 +161,13 @@ func (d *StreamDemodulator) FeedSoft(samples []float32) []float32 {
 	// buffered, then release acquisition state so a later training word can
 	// lock the same long-running RX stream again.
 	blockRMS := audioBlockRMS(samples)
-	silenceRatio := 0.10
-	if d.packetizedMode {
-		// SDF3 group boundaries contain a deliberate quiet guard. Captured audio
-		// still contains receiver noise; at 10-12 dB SNR it can be 0.25-0.32 of
-		// the active signal RMS. A 0.20 threshold therefore never releases lock
-		// at the next group preamble. Use a threshold above expected channel noise
-		// but below the active M-ary waveform's block RMS.
-		silenceRatio = 0.36
-	}
-	silenceThreshold := math.Max(1e-5, d.signalRMS*silenceRatio)
-	if d.signalRMS > 0 && blockRMS < silenceThreshold {
+	// Packetized SDF3 bursts carry an exact coded-bit count and CRC boundary.
+	// Amplitude fades are therefore not safe evidence of an inter-burst gap:
+	// releasing the carrier lock during a fade discards the remaining symbols
+	// of a valid FEC group. StreamDecoder explicitly rearms after each declared
+	// group; retain the lock until that protocol boundary is reached.
+	silenceThreshold := math.Max(1e-5, d.signalRMS*0.10)
+	if !d.packetizedMode && d.signalRMS > 0 && blockRMS < silenceThreshold {
 		// Audio callbacks can straddle the final symbol and the receiver's
 		// trailing noise/silence. Do not discard the complete callback just
 		// because its *average* RMS is low: retain every sample up to the last
@@ -568,20 +564,23 @@ func (d *StreamDemodulator) decodeSymbolCount(count int) []float32 {
 		return nil
 	}
 	out := make([]float32, 0, count*d.cfg.BitsPerSymbol)
+	first := d.sps / 4
+	last := d.sps - d.sps/4
+	center := float64(d.sps-1) * 0.5
+	stepScale := 1 / float64(d.sps)
 	for n := 0; n < count; n++ {
 		base := d.cursor + n*d.sps
-		// Apply the residual carrier correction per sample, then integrate the
-		// central half-symbol aperture. Avoiding symbol transitions reduces ISI
-		// and makes both soft decisions and EVM/SNR less sensitive to fades.
+		// Integrate the central half-symbol aperture. Build the per-sample
+		// carrier rotation once, then advance it by recurrence; calling sin/cos
+		// for every sample used to dominate CPU at 16QAM's higher LLR cost.
 		stepPhase := cmplx.Phase(d.stepRotation) // negative estimated CFO, rad/symbol
-		center := float64(d.sps-1) * 0.5
-		first := d.sps / 4
-		last := d.sps - d.sps/4
+		localRotation := cmplx.Rect(1, stepPhase*(float64(first)-center)*stepScale)
+		rotationStep := cmplx.Rect(1, stepPhase*stepScale)
+		symbolRotation := d.phaseRotation
 		var corrected complex128
 		for sampleIndex := first; sampleIndex < last; sampleIndex++ {
-			relative := (float64(sampleIndex) - center) / float64(d.sps)
-			localRotation := cmplx.Rect(1, stepPhase*relative)
-			corrected += complex128(d.baseband[base+sampleIndex]) * d.phaseRotation * localRotation
+			corrected += complex128(d.baseband[base+sampleIndex]) * symbolRotation * localRotation
+			localRotation *= rotationStep
 		}
 		z := corrected / complex(float64(last-first), 0)
 		z *= complex(d.amplitudeScale, 0)
@@ -623,22 +622,30 @@ func (d *StreamDemodulator) decodeAvailableSoft() []float32 {
 
 func appendConstellationLLR(dst []float32, z complex128, bitsPerSymbol int) []float32 {
 	const clamp = 32.0
+	if bitsPerSymbol < 2 || bitsPerSymbol > 4 {
+		return dst
+	}
+	points := maryConstellationPoints[bitsPerSymbol]
+	var minZero, minOne [4]float64
 	for bit := 0; bit < bitsPerSymbol; bit++ {
-		minZero, minOne := math.Inf(1), math.Inf(1)
-		mask := 1 << uint(bitsPerSymbol-1-bit)
-		for label := 0; label < 1<<uint(bitsPerSymbol); label++ {
-			point := complex128(mapLabel(label, bitsPerSymbol))
-			delta := z - point
-			distance := real(delta)*real(delta) + imag(delta)*imag(delta)
+		minZero[bit], minOne[bit] = math.Inf(1), math.Inf(1)
+	}
+	for label, point := range points {
+		delta := z - point
+		distance := real(delta)*real(delta) + imag(delta)*imag(delta)
+		for bit := 0; bit < bitsPerSymbol; bit++ {
+			mask := 1 << uint(bitsPerSymbol-1-bit)
 			if label&mask == 0 {
-				if distance < minZero {
-					minZero = distance
+				if distance < minZero[bit] {
+					minZero[bit] = distance
 				}
-			} else if distance < minOne {
-				minOne = distance
+			} else if distance < minOne[bit] {
+				minOne[bit] = distance
 			}
 		}
-		llr := minOne - minZero
+	}
+	for bit := 0; bit < bitsPerSymbol; bit++ {
+		llr := minOne[bit] - minZero[bit]
 		if llr > clamp {
 			llr = clamp
 		}
@@ -650,12 +657,21 @@ func appendConstellationLLR(dst []float32, z complex128, bitsPerSymbol int) []fl
 	return dst
 }
 
-func mapLabel(label, bitsPerSymbol int) complex64 {
-	bits := make([]bool, bitsPerSymbol)
-	for i := 0; i < bitsPerSymbol; i++ {
-		bits[i] = label&(1<<uint(bitsPerSymbol-1-i)) != 0
+func buildMARYConstellationPoints() [5][]complex128 {
+	var constellations [5][]complex128
+	for bitsPerSymbol := 2; bitsPerSymbol <= 4; bitsPerSymbol++ {
+		count := 1 << uint(bitsPerSymbol)
+		points := make([]complex128, count)
+		var bits [4]bool
+		for label := 0; label < count; label++ {
+			for bit := 0; bit < bitsPerSymbol; bit++ {
+				bits[bit] = label&(1<<uint(bitsPerSymbol-1-bit)) != 0
+			}
+			points[label] = complex128(mapBits(bits[:bitsPerSymbol], bitsPerSymbol))
+		}
+		constellations[bitsPerSymbol] = points
 	}
-	return mapBits(bits, bitsPerSymbol)
+	return constellations
 }
 
 func symbolMean(samples []complex64, base, sps int) complex128 {
@@ -730,6 +746,10 @@ var constellation8 = func() [8]complex64 {
 	}
 	return points
 }()
+
+// maryConstellationPoints is immutable after package initialization. Keeping the
+// bit-labelled points out of the symbol loop avoids per-symbol slice creation.
+var maryConstellationPoints = buildMARYConstellationPoints()
 
 func mapBits(bits []bool, n int) complex64 {
 	value := 0

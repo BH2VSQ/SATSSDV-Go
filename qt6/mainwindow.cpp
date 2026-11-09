@@ -2270,7 +2270,11 @@ void MainWindow::handleEvent(const QJsonObject &event) {
                     m_rxSnrLabel->setToolTip(uiText(QStringLiteral("M-ary 后解调 EVM-SNR 估算值 · 从已同步星座符号测量 · 参考带宽为符号判决孔径，不可直接与全带宽 PCM SNR、RF SNR 或 Eb/N0 比较")));
                 } else {
                     m_rxSnrLabel->setText(uiText(QStringLiteral("SNR %1 dB")).arg(p.value(QStringLiteral("snrDb")).toDouble(), 0, 'f', 1));
-                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 音频 SNR 估算 · 双音频谱特征 + 解调同步 + 最近 1.2 秒内 CRC 校验通过的数据包 · 未经射频校准 · 噪声底 %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+                    if (method == QStringLiteral("gmsk-band-tracker")) {
+                        m_rxSnrLabel->setToolTip(uiText(QStringLiteral("CCSDS 2400 GMSK 音频带内 SNR 估算 · 空闲噪声基线 + AFC 同步 + 最近 1.2 秒内有效数据包 · 未经射频校准 · 噪声底 %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+                    } else {
+                        m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 音频 SNR 估算 · 双音频谱特征 + 解调同步 + 最近 1.2 秒内 CRC 校验通过的数据包 · 未经射频校准 · 噪声底 %1 dBFS/bin")).arg(p.value(QStringLiteral("noiseFloorDbfs")).toDouble(), 0, 'f', 1));
+                    }
                 }
             } else {
                 m_rxSnrLabel->setText(uiText(QStringLiteral("SNR -- dB")));
@@ -2279,6 +2283,10 @@ void MainWindow::handleEvent(const QJsonObject &event) {
                     m_rxSnrLabel->setToolTip(uiText(QStringLiteral("M-ary EVM-SNR 等待载波/定时同步及至少 48 个有效符号")));
                 } else if (reason == QStringLiteral("auto-awaiting-sync")) {
                     m_rxSnrLabel->setToolTip(uiText(QStringLiteral("Auto RX 正在等待已同步的解调候选；M-ary 候选锁定后会显示后解调 EVM-SNR")));
+                } else if (reason == QStringLiteral("gmsk-awaiting-evidence")) {
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("CCSDS 2400 GMSK 音频 SNR 正在等待空闲噪声基线、AFC 同步和有效数据包")));
+                } else if (reason == QStringLiteral("afsk-awaiting-evidence")) {
+                    m_rxSnrLabel->setToolTip(uiText(QStringLiteral("AFSK1200 音频 SNR 正在等待空闲噪声基线、双音频谱特征、解调同步和有效 CRC 数据包")));
                 } else if (reason == QStringLiteral("wideband-estimator-unavailable")) {
                     m_rxSnrLabel->setToolTip(uiText(QStringLiteral("当前模式暂不提供可靠的解调域 SNR 估算，因此不显示频谱推算值。")));
                 } else {

@@ -16,3 +16,7 @@ Thumbs.db
 # Local aislop agent sessions and score snapshots (keep project config tracked).
 .aislop/agent/
 .aislop/baseline.json
+
+# Python test/utility bytecode
+__pycache__/
+*.py[cod]
