@@ -178,6 +178,86 @@ func TestGIFFramesDecodeEndToEndThroughCCSDSAndRXManager(t *testing.T) {
 	}
 }
 
+func TestMARYGIFRXManagerPublishesProgressPerPacket(t *testing.T) {
+	frame := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	for y := 0; y < frame.Bounds().Dy(); y++ {
+		for x := 0; x < frame.Bounds().Dx(); x++ {
+			frame.SetRGBA(x, y, color.RGBA{R: uint8((x*3 + y) % 251), G: uint8((y*5 + x/2) % 253), B: uint8((x + y*7) % 247), A: 255})
+		}
+	}
+	packets, _, err := gifmode.Encode([]gifmode.Frame{{Image: frame, DelayCS: 12}}, "N0CALL", 142, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			encoder, err := transport.NewEncoder(transport.Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var waveform []float32
+			if _, err := encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+				waveform = append(waveform, block...)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			decoder, err := transport.NewStreamDecoder(profile, 48000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manager := &Manager{gifStreams: make(map[string]*gifStreamSession), sessions: make(map[string]*imageSession), ssdv: make(map[string]*ssdvSession)}
+			uniqueSourcePackets := make(map[uint16]struct{}, len(packets))
+			for _, raw := range packets {
+				id := uint16(raw[7])<<8 | uint16(raw[8])
+				uniqueSourcePackets[id] = struct{}{}
+			}
+			updates, previews, decodedPackets := 0, 0, 0
+			lastReceived := 0
+			var final Update
+			for offset := 0; offset < len(waveform); offset += 480 {
+				end := min(offset+480, len(waveform))
+				received, feedErr := decoder.Feed(waveform[offset:end])
+				if feedErr != nil {
+					t.Fatalf("M-ary GIF PCM loopback: %v", feedErr)
+				}
+				if len(received) > 1 {
+					t.Fatalf("one audio callback delivered %d image packets instead of progressive packet delivery", len(received))
+				}
+				for _, packet := range received {
+					decodedPackets++
+					update, ok := manager.process(packet)
+					if !ok {
+						t.Fatalf("RX manager did not publish progress for received packet %d", packet.PacketID)
+					}
+					updates++
+					if update.PacketsReceived != lastReceived+1 {
+						t.Fatalf("packet progress jumped from %d to %d at packet %d", lastReceived, update.PacketsReceived, packet.PacketID)
+					}
+					lastReceived = update.PacketsReceived
+					if update.PNGBase64 != "" {
+						previews++
+					}
+					if update.GIFEnd {
+						final = update
+					}
+				}
+			}
+			if decodedPackets != len(uniqueSourcePackets) || updates != len(uniqueSourcePackets) {
+				t.Fatalf("decoded=%d manager updates=%d unique source GIF packets=%d (raw copies=%d); decoder=%+v", decodedPackets, updates, len(uniqueSourcePackets), len(packets), decoder.Diagnostics())
+			}
+			if previews == 0 {
+				t.Fatal("no progressive GIF preview was produced")
+			}
+			if final.SessionID == "" || !final.GIFEnd || !final.GIFFrameComplete {
+				t.Fatalf("GIF stream did not complete through M-ary receive: final=%+v diagnostics=%+v", final, decoder.Diagnostics())
+			}
+		})
+	}
+}
+
 func TestGIFManagerAppliesSparseFrameUpdates(t *testing.T) {
 	first := image.NewRGBA(image.Rect(0, 0, 320, 240))
 	draw.Draw(first, first.Bounds(), image.NewUniform(color.RGBA{R: 25, G: 55, B: 85, A: 255}), image.Point{}, draw.Src)

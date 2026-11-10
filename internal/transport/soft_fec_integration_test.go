@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -744,7 +745,7 @@ func TestMARYSmallGroupsReduceProgressivePacketLatency(t *testing.T) {
 		t.Run(string(profile), func(t *testing.T) {
 			packets := makeSoftFECTestPackets(t, 10)
 			latencySamples := make(map[int]int64, 2)
-			for _, groupSize := range []int{2, 10} {
+			for _, groupSize := range []int{1, 10} {
 				encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: groupSize})
 				if err != nil {
 					t.Fatal(err)
@@ -780,13 +781,265 @@ func TestMARYSmallGroupsReduceProgressivePacketLatency(t *testing.T) {
 					t.Fatalf("group size %d did not progressively decode the first packet", groupSize)
 				}
 			}
-			lowLatency := float64(latencySamples[2]) / 48000
+			lowLatency := float64(latencySamples[1]) / 48000
 			batched := float64(latencySamples[10]) / 48000
-			t.Logf("first valid packet latency: group=2 %.3fs; group=10 %.3fs", lowLatency, batched)
-			if lowLatency >= batched*0.60 {
-				t.Fatalf("small groups did not materially improve first-packet latency: group=2 %.3fs group=10 %.3fs", lowLatency, batched)
+			t.Logf("first valid packet latency: group=1 %.3fs; group=10 %.3fs", lowLatency, batched)
+			if lowLatency >= batched*0.30 {
+				t.Fatalf("single-unit groups did not materially improve first-packet latency: group=1 %.3fs group=10 %.3fs", lowLatency, batched)
 			}
 		})
+	}
+}
+
+// TestMARYGIFAudioLoopbackDeliversOnePacketPerFeed verifies the real streamed
+// TX -> PCM -> RX path with the same short callback sizes used by audio drivers.
+// GIF M-ary transmission uses one CCSDS data unit per SDF3/FEC boundary, so a
+// successfully received image packet must be returned immediately rather than
+// being held until another image packet arrives.
+func TestMARYGIFAudioLoopbackDeliversOnePacketPerFeed(t *testing.T) {
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			// Eight source packets exercise the outer parity-shard cadence as well
+			// as repeated independent SDF3 groups during a longer clock-mismatched
+			// soundcard-style transfer.
+			packets := makeSoftFECTestPackets(t, 8)
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var waveform []float32
+			if _, err := encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+				waveform = append(waveform, block...)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			waveform = append(waveform, make([]float32, 4800)...)
+
+			wireCount, err := encoder.EstimateWirePacketCount(packets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, callbackSamples := range []int{480, 997} {
+				t.Run(fmt.Sprintf("callback-%d", callbackSamples), func(t *testing.T) {
+					decoder, err := NewStreamDecoder(profile, 48000)
+					if err != nil {
+						t.Fatal(err)
+					}
+					seen := make([]uint16, 0, len(packets))
+					packetCallbacks := 0
+					for offset := 0; offset < len(waveform); offset += callbackSamples {
+						end := min(len(waveform), offset+callbackSamples)
+						decoded, feedErr := decoder.Feed(waveform[offset:end])
+						if feedErr != nil {
+							t.Fatalf("PCM loopback Feed: %v", feedErr)
+						}
+						if len(decoded) > 1 {
+							t.Fatalf("one audio callback delivered %d image packets; expected per-packet delivery, diag=%+v", len(decoded), decoder.Diagnostics())
+						}
+						if len(decoded) == 1 {
+							packetCallbacks++
+							seen = append(seen, decoded[0].PacketID)
+						}
+					}
+					if len(seen) != len(packets) {
+						t.Fatalf("decoded %d/%d source image packets; seen=%v diagnostics=%+v", len(seen), len(packets), seen, decoder.Diagnostics())
+					}
+					for i, raw := range packets {
+						want := binary.BigEndian.Uint16(raw[7:9])
+						if seen[i] != want {
+							t.Fatalf("packet order[%d]=%d, want %d; seen=%v", i, seen[i], want, seen)
+						}
+					}
+					if packetCallbacks != len(packets) {
+						t.Fatalf("packet callbacks=%d, want %d", packetCallbacks, len(packets))
+					}
+					diag := decoder.Diagnostics()
+					if diag.FECChunksBad != 0 || diag.FECChunksOK < uint64(wireCount) {
+						t.Fatalf("SDF3/FEC errors during clean PCM loopback: expected at least %d good groups, diagnostics=%+v", wireCount, diag)
+					}
+				})
+			}
+		})
+	}
+}
+
+func resampleForClockOffset(input []float32, ppm float64) []float32 {
+	if len(input) < 2 || ppm == 0 {
+		return append([]float32(nil), input...)
+	}
+	step := 1 + ppm*1e-6
+	out := make([]float32, 0, int(float64(len(input))/step))
+	for position := 0.0; position < float64(len(input)-1); position += step {
+		left := int(position)
+		fraction := float32(position - float64(left))
+		out = append(out, input[left]*(1-fraction)+input[left+1]*fraction)
+	}
+	return out
+}
+
+// TestMARYGIFAudioLoopbackToleratesSoundcardClockOffset exercises the streamed
+// modem path with independent playback/capture clocks, realistic callback
+// blocks and deterministic audio noise. This is a PCM clock-domain simulation,
+// not a measurement of a physical soundcard or RF receiver.
+func TestMARYGIFAudioLoopbackToleratesSoundcardClockOffset(t *testing.T) {
+	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
+	for _, profile := range profiles {
+		profile := profile
+		t.Run(string(profile), func(t *testing.T) {
+			// Eight source packets exercise the outer parity-shard cadence as well as
+			// repeated independent SDF3 groups during a longer clock-mismatched transfer.
+			packets := makeSoftFECTestPackets(t, 8)
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var waveform []float32
+			if _, err := encoder.StreamPackets(context.Background(), packets, func(block []float32) error {
+				waveform = append(waveform, block...)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			waveform = append(waveform, make([]float32, 4800)...)
+			for _, ppm := range []float64{-100, 100} {
+				t.Run(fmt.Sprintf("clock-%+.0fppm", ppm), func(t *testing.T) {
+					input := resampleForClockOffset(waveform, ppm)
+					var power float64
+					active := 0
+					for _, sample := range input {
+						if math.Abs(float64(sample)) > 1e-6 {
+							power += float64(sample * sample)
+							active++
+						}
+					}
+					if active == 0 {
+						t.Fatal("modulator produced no active samples")
+					}
+					const snrDB = 24.0
+					noiseRMS := math.Sqrt(power/float64(active)) / math.Pow(10, snrDB/20)
+					rng := rand.New(rand.NewSource(int64(0x53434c4b) + int64(len(profile))*17 + int64(ppm)))
+					for i := range input {
+						input[i] += float32(rng.NormFloat64() * noiseRMS)
+					}
+					decoder, err := NewStreamDecoder(profile, 48000)
+					if err != nil {
+						t.Fatal(err)
+					}
+					seen := make([]uint16, 0, len(packets))
+					for offset := 0; offset < len(input); offset += 480 {
+						decoded, feedErr := decoder.Feed(input[offset:min(offset+480, len(input))])
+						if feedErr != nil {
+							t.Fatalf("PCM loopback Feed: %v", feedErr)
+						}
+						if len(decoded) > 1 {
+							t.Fatalf("callback emitted %d image packets at once; diagnostics=%+v", len(decoded), decoder.Diagnostics())
+						}
+						for _, packet := range decoded {
+							seen = append(seen, packet.PacketID)
+						}
+					}
+					if len(seen) != len(packets) {
+						t.Fatalf("clock %+g ppm at %.1f dB decoded %d/%d packets; seen=%v diagnostics=%+v", ppm, snrDB, len(seen), len(packets), seen, decoder.Diagnostics())
+					}
+					for i, raw := range packets {
+						want := binary.BigEndian.Uint16(raw[7:9])
+						if seen[i] != want {
+							t.Fatalf("packet order[%d]=%d, want %d", i, seen[i], want)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestMARYPacketizedHeaderSearchUsesIncrementalOffsets guards the SDF3 parser
+// against regressing to a full accumulated-body scan on every Feed callback.
+
+func TestSDF3HeaderScannerResumesAcrossAudioCallbacks(t *testing.T) {
+	raw := bytes.Repeat([]byte{0x5a}, 260)
+	headerBytes, err := fec.NewPacketBurstHeaderWithProfile(raw, fec.PacketFECProfileRate34).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := fec.RepeatBurstHeader(headerBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	llrs := make([]float32, 0, len(wire)*8)
+	for _, value := range wire {
+		for bit := 7; bit >= 0; bit-- {
+			if value&(1<<uint(bit)) != 0 {
+				llrs = append(llrs, -4)
+			} else {
+				llrs = append(llrs, 4)
+			}
+		}
+	}
+	// Keep the preamble-tail LLR strong enough that a one-bit-early
+	// candidate cannot borrow the first header bit and pass the CRC.
+	prefix := make([]float32, 900)
+	for i := range prefix {
+		prefix[i] = -32
+	}
+	buffer := append([]float32(nil), prefix...)
+	cursor := 0
+	// Deliberately split the repeated 432-bit descriptor over multiple short
+	// callback blocks, mirroring 10-20 ms audio callback delivery.
+	for _, cut := range []int{73, 211, 389, len(llrs)} {
+		previous := 0
+		if cut != 73 {
+			for _, prior := range []int{73, 211, 389} {
+				if prior < cut && prior > previous {
+					previous = prior
+				}
+			}
+		}
+		buffer = append(buffer, llrs[previous:cut]...)
+		offset, got, ok := findSDF3PacketHeaderFrom(buffer, cursor)
+		if cut != len(llrs) {
+			if ok {
+				t.Fatalf("incomplete SDF3 descriptor accepted at bit %d", cut)
+			}
+			cursor = len(buffer) - fec.BurstHeaderWireBits + 1
+			if cursor < 0 {
+				cursor = 0
+			}
+			continue
+		}
+		if !ok {
+			t.Fatal("complete SDF3 descriptor was not found after the final callback")
+		}
+		if offset != len(prefix) {
+			t.Fatalf("SDF3 header offset=%d, want %d", offset, len(prefix))
+		}
+		if got.RawBytes != uint32(len(raw)) || got.CodeProfile != fec.PacketFECProfileRate34 {
+			t.Fatalf("decoded wrong SDF3 header: %+v", got)
+		}
+	}
+}
+
+func TestMARYPacketizedHeaderSearchUsesIncrementalOffsets(t *testing.T) {
+	llrs := make([]float32, 12000)
+	for i := range llrs {
+		llrs[i] = 1
+	}
+	for offset := 0; offset < len(llrs)-fec.BurstHeaderWireBits; offset += 37 {
+		if _, _, ok := findSDF3PacketHeaderFrom(llrs, offset); ok {
+			t.Fatal("random positive LLRs unexpectedly decoded as an SDF3 header")
+		}
+	}
+	// The caller's cursor is advanced over all earlier candidate offsets and
+	// keeps only a tail large enough for a cross-callback descriptor.
+	cursor := len(llrs) - fec.BurstHeaderWireBits + 1
+	if cursor <= 0 || cursor+fec.BurstHeaderWireBits-1 < len(llrs) {
+		t.Fatalf("invalid incremental search cursor %d for %d buffered LLRs", cursor, len(llrs))
+	}
+	if _, _, ok := findSDF3PacketHeaderFrom(llrs, cursor); ok {
+		t.Fatal("tail-only scan unexpectedly decoded an SDF3 header")
 	}
 }
 

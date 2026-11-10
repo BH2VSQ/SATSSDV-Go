@@ -660,12 +660,14 @@ func (a *App) getContext() context.Context {
 	return a.ctx
 }
 
-// gifMARYBurstGroupSize limits how many CCSDS units must accumulate before
-// an M-ary GIF receiver can validate and publish the next progressive update.
-// Ordinary image transfers keep the higher-throughput default group size.
+// gifMARYBurstGroupSize gives each M-ary GIF data packet its own SDF3/FEC
+// boundary. This lets RX validate and publish one image packet immediately,
+// localizes a damaged unit to one packet, and prevents a later packet from
+// being held behind an earlier unit in the same FEC group. Ordinary image
+// transfers keep the larger throughput-oriented default group size.
 func gifMARYBurstGroupSize(profile domain.Profile) int {
 	if profile.LinkLayer == "CCSDS-MARY" {
-		return 2
+		return 1
 	}
 	return 0
 }
@@ -1188,6 +1190,10 @@ func (a *App) handleRXAudio(samples []float32) {
 		return
 	}
 	a.rxStats.audioSamples.Add(uint64(len(samples)))
+	// Hand the original, ordered PCM block to the decoder before doing any
+	// spectrum/level visualization work. Capture callbacks must prioritize
+	// preserving modem samples; visualization is secondary and rate-limited.
+	a.enqueueRXSamples(samples)
 	a.mu.Lock()
 	rate := a.settings.AudioSampleRate
 	profileID := a.settings.RXProfile
@@ -1261,9 +1267,8 @@ func (a *App) handleRXAudio(samples []float32) {
 			"snrEvidenceBins": snr.EvidenceBins,
 		})
 	}
-	// Always forward every capture block to the ordered decoder queue. Only
-	// display telemetry is throttled; demodulation input is never rate-limited.
-	a.enqueueRXSamples(samples)
+	// Display telemetry is throttled; demodulation input was already forwarded
+	// above and is never rate-limited by FFT or event publication work.
 }
 
 func (a *App) enqueueRXSamples(samples []float32) {
@@ -1416,8 +1421,16 @@ func (a *App) emitRXDiagnostics(decoder interface{}, profile string, rate int, q
 	a.rxStats.lastErrorMu.RLock()
 	lastError, lastErrorAt = a.rxStats.lastError, a.rxStats.lastErrorAt
 	a.rxStats.lastErrorMu.RUnlock()
+	captureQueueDrops := uint64(0)
+	a.mu.Lock()
+	runtimeAudio := a.audioRuntime
+	a.mu.Unlock()
+	if stats, ok := runtimeAudio.(interface{ CaptureQueueDrops() uint64 }); ok {
+		captureQueueDrops = stats.CaptureQueueDrops()
+	}
 	payload := map[string]interface{}{
 		"profile": profile, "sampleRate": rate,
+		"captureQueueDrops":    captureQueueDrops,
 		"audioBlocks":          a.rxStats.audioBlocks.Load(),
 		"audioSamples":         a.rxStats.audioSamples.Load(),
 		"inputDiscontinuities": a.rxStats.inputDiscontinuities.Load(),

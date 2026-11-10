@@ -61,6 +61,8 @@ if "PreviewDataURL" not in (ROOT / "internal/rx/manager.go").read_text(encoding=
     errors.append("RX update event is missing the bounded PreviewDataURL field")
 if "makeRXPreviewDataURL(data)" not in rx_source:
     errors.append("Go RX event handler must create a bounded JPEG snapshot for progressive preview")
+if '"captureQueueDrops"' not in rx_source or 'captureQueueDrops' not in mainwindow:
+    errors.append("RX diagnostics must report native capture-queue PCM drops in the Qt UI")
 if "refreshLatestRXGIFPreview" not in mainwindow or "GetLatestRXGIFData" not in mainwindow:
     errors.append("Qt RX GIF completion must use the dedicated animated-GIF RPC")
 if "GetLatestRXGIFData" not in (ROOT / "backend_server.go").read_text(encoding="utf-8"):

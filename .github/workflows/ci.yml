@@ -105,6 +105,16 @@ jobs:
           go test -count=1 -timeout 100m -v ./internal/transport \
             -run '^TestSatelliteChannelSensitivityCharacterization$' \
             2>&1 | tee reports/channel/channel-all-profiles.log
+      - name: Run M-ary GIF per-packet PCM loopback regression
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 20m -v ./internal/transport ./internal/rx ./internal/audio \
+            -run '^(TestMARYGIFAudioLoopbackDeliversOnePacketPerFeed|TestMARYGIFAudioLoopbackToleratesSoundcardClockOffset|TestMARYGIFRXManagerPublishesProgressPerPacket|TestEnqueueCapturePCMDoesNotDrainAcceptedAudio|TestMARYSmallGroupsReduceProgressivePacketLatency|TestSDF3HeaderScannerResumesAcrossAudioCallbacks|TestMARYPacketizedHeaderSearchUsesIncrementalOffsets)$' \
+            2>&1 | tee reports/channel/mary-gif-loopback.log
+          go test -count=1 -v . -run '^TestGIFMARYGroupSizePrioritizesProgressiveLatency$' \
+            2>&1 | tee -a reports/channel/mary-gif-loopback.log
       - name: Run race and concurrency regression suite
         if: always()
         shell: bash

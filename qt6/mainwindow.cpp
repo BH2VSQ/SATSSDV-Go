@@ -2303,15 +2303,18 @@ void MainWindow::handleRXDiagnosticsEvent(const QJsonObject &p) {
                 .arg(gif.value(QStringLiteral("decodeAttempts")).toInteger())
                 .arg(gif.value(QStringLiteral("lastDecodeError")).toString());
         }
-        const qint64 queueDrops=p.value(QStringLiteral("queueDrops")).toInteger()+manager.value(QStringLiteral("queueDropped")).toInteger()+p.value(QStringLiteral("managerSubmitDrops")).toInteger();
+        const qint64 captureQueueDrops=p.value(QStringLiteral("captureQueueDrops")).toInteger();
+        const qint64 queueDrops=p.value(QStringLiteral("queueDrops")).toInteger()+manager.value(QStringLiteral("queueDropped")).toInteger()+p.value(QStringLiteral("managerSubmitDrops")).toInteger()+captureQueueDrops;
         m_rxDiagnostics->setText(QStringLiteral("AUD %1 blk · DEC %2 blk / %3 pkt · Q %4/%5 · DROP %6 · %7 %8 · FEC %9 %10/%11 · %12")
             .arg(p.value(QStringLiteral("audioBlocks")).toInteger())
             .arg(p.value(QStringLiteral("decoderBlocks")).toInteger())
             .arg(p.value(QStringLiteral("decoderPackets")).toInteger())
             .arg(p.value(QStringLiteral("queueDepth")).toInt()).arg(p.value(QStringLiteral("queueCapacity")).toInt())
             .arg(queueDrops).arg(profile).arg(modemState).arg(fecMode).arg(fecOK).arg(fecBad).arg(gifState));
-        const QString tip=QStringLiteral("Input samples=%1; input discontinuities=%2; decoder resets=%3; decoder errors=%4; panics=%5; RX manager=%6/%7 dropped=%8 processed=%9; MARY buffered=%10 samples, reacquires=%11; %12; FEC error=%13; last error=%14")
+        const QString tip=QStringLiteral("Input samples=%1; capture queue drops=%2; RX queue drops=%3; input discontinuities=%4; decoder resets=%5; decoder errors=%6; panics=%7; RX manager=%8/%9 dropped=%10 processed=%11; MARY buffered=%12 samples, reacquires=%13; %14; FEC error=%15; last error=%16")
             .arg(p.value(QStringLiteral("audioSamples")).toInteger())
+            .arg(captureQueueDrops)
+            .arg(p.value(QStringLiteral("queueDrops")).toInteger())
             .arg(p.value(QStringLiteral("inputDiscontinuities")).toInteger())
             .arg(p.value(QStringLiteral("decoderResets")).toInteger())
             .arg(p.value(QStringLiteral("decoderErrors")).toInteger())

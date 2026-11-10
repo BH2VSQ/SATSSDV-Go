@@ -59,11 +59,11 @@ type MalgoRuntime struct {
 	playbackID string
 	closed     atomic.Bool
 
-	captureMu     sync.Mutex
-	capture       *malgo.Device
-	captureCancel context.CancelFunc
-	captureDone   chan struct{}
-	dropped       atomic.Uint64
+	captureMu         sync.Mutex
+	capture           *malgo.Device
+	captureCancel     context.CancelFunc
+	captureDone       chan struct{}
+	captureQueueDrops atomic.Uint64
 
 	playbackLifeMu sync.Mutex
 	playbackMu     sync.Mutex
@@ -163,8 +163,15 @@ func (m *MalgoRuntime) StartCapture(ctx context.Context, callback func([]float32
 		cfg.Capture.DeviceID = id
 		defer C.free(id)
 	}
-	queue := make(chan []float32, 16)
+	// The callback worker can briefly stall while the application publishes RX
+	// spectrum telemetry. A larger bounded queue absorbs those transient stalls
+	// without turning them into decoder resets and lost modem samples.
+	const captureQueueCapacity = 256
+	queue := make(chan []float32, captureQueueCapacity)
 	workerCtx, cancel := context.WithCancel(context.Background())
+	// Miniaudio serializes capture callbacks. The queue helper preserves FIFO
+	// history and marks any gap before the first subsequent accepted PCM block.
+	gapPending := false
 	dev, err := malgo.InitDevice(m.ctx.Context, cfg, malgo.DeviceCallbacks{Data: func(_, input []byte, _ uint32) {
 		if workerCtx.Err() != nil || len(input) < 4 {
 			return
@@ -173,23 +180,7 @@ func (m *MalgoRuntime) StartCapture(ctx context.Context, callback func([]float32
 		for i := range block {
 			block[i] = math.Float32frombits(binary.LittleEndian.Uint32(input[i*4 : i*4+4]))
 		}
-		select {
-		case queue <- block:
-		default:
-			select {
-			case <-queue:
-			default:
-			}
-			select {
-			case queue <- nil:
-			default:
-			}
-			select {
-			case queue <- block:
-			default:
-				m.dropped.Add(1)
-			}
-		}
+		enqueueCapturePCM(queue, block, &gapPending, &m.captureQueueDrops)
 	}})
 	if err != nil {
 		cancel()
@@ -221,6 +212,15 @@ func (m *MalgoRuntime) StartCapture(ctx context.Context, callback func([]float32
 		}
 	}()
 	return nil
+}
+
+// CaptureQueueDrops reports PCM blocks discarded because the capture worker
+// queue was saturated. It is cumulative for the runtime lifetime.
+func (m *MalgoRuntime) CaptureQueueDrops() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.captureQueueDrops.Load()
 }
 
 func (m *MalgoRuntime) StopCapture() error {

@@ -14,8 +14,8 @@ func TestGIFMARYGroupSizePrioritizesProgressiveLatency(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := gifMARYBurstGroupSize(profile); got != 2 {
-			t.Fatalf("GIF M-ary mode %s group size = %d, want 2", mode, got)
+		if got := gifMARYBurstGroupSize(profile); got != 1 {
+			t.Fatalf("GIF M-ary mode %s group size = %d, want 1", mode, got)
 		}
 	}
 	for _, mode := range []domain.TransportMode{domain.SSDVAX25, domain.SSDVCCSDS1200, domain.SSDVCCSDS2400} {

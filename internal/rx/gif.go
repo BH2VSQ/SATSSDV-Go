@@ -25,48 +25,44 @@ type gifSegmentKey struct {
 }
 
 type gifFrameBuffer struct {
-	imageID            uint8
-	packets            map[uint16][256]byte
-	keyframe           bool
-	width              int
-	height             int
-	quality            uint8
-	fec                bool
-	delayCS            uint16
-	frameIndex         uint16
-	expectedPackets    int
-	controlExpected    int
-	startSeen          bool
-	endSeen            bool
-	receivedPackets    int // unique frame-open, data and frame-close packets
-	startedAt          time.Time
-	completedAt        time.Time
-	baseCanvas         *image.RGBA // SGV2 motion-compensated base for this frame
-	previewCanvas      *image.RGBA // mutated only by the RX manager worker
-	previewPNG         []byte      // latest independently decodable partial frame snapshot
-	decodedMCUs        int         // cumulative unique MCU coverage, not per-update coverage
-	decodedSegments    map[gifSegmentKey]struct{}
-	boundaryPacketIDs  []uint16
-	eoiPacketID        uint16
-	hasEOI             bool
-	coveredMCUs        []bool
-	lastPreviewAt      time.Time
-	lastPreviewPackets int
-	snapshotIndex      int // index in stream.frames; -1 until first archive snapshot
-	committed          bool
-	decodeAttempts     uint64
-	lastDecodeAt       time.Time
-	lastDecodeError    string
+	imageID           uint8
+	packets           map[uint16][256]byte
+	keyframe          bool
+	width             int
+	height            int
+	quality           uint8
+	fec               bool
+	delayCS           uint16
+	frameIndex        uint16
+	expectedPackets   int
+	controlExpected   int
+	startSeen         bool
+	endSeen           bool
+	receivedPackets   int // unique frame-open, data and frame-close packets
+	startedAt         time.Time
+	completedAt       time.Time
+	baseCanvas        *image.RGBA // SGV2 motion-compensated base for this frame
+	previewCanvas     *image.RGBA // mutated only by the RX manager worker
+	previewPNG        []byte      // latest independently decodable partial frame snapshot
+	decodedMCUs       int         // cumulative unique MCU coverage, not per-update coverage
+	decodedSegments   map[gifSegmentKey]struct{}
+	boundaryPacketIDs []uint16
+	eoiPacketID       uint16
+	hasEOI            bool
+	coveredMCUs       []bool
+	snapshotIndex     int // index in stream.frames; -1 until first archive snapshot
+	committed         bool
+	decodeAttempts    uint64
+	lastDecodeAt      time.Time
+	lastDecodeError   string
 }
 
 const (
-	maxGIFStreams             = 4
-	maxGIFExportFrames        = 120
-	maxGIFExportPNGSize       = 32 << 20
-	maxGIFRecentFrames        = 3
-	gifLatePacketWindow       = 12 * time.Second
-	gifPreviewPacketStride    = 8
-	gifPreviewPublishInterval = 250 * time.Millisecond
+	maxGIFStreams       = 4
+	maxGIFExportFrames  = 120
+	maxGIFExportPNGSize = 32 << 20
+	maxGIFRecentFrames  = 3
+	gifLatePacketWindow = 12 * time.Second
 )
 
 type gifStreamSession struct {
@@ -324,7 +320,7 @@ func (m *Manager) processGIFDataPacketLocked(key string, stream *gifStreamSessio
 		stream.incomplete = len(stream.incompleteFrames) > 0
 	}
 
-	shouldPublish := decodedNow > 0 && shouldPublishGIFPreview(frame, now, lateFrame)
+	shouldPublish := decodedNow > 0 && frame.previewCanvas != nil
 	update := gifProgressUpdate(stream, frame, packet, frame.committed, frame.previewCanvas, frame.decodedMCUs)
 	update.GIFAwaitingKeyframe = stream.awaitingKeyframe
 	update.GIFStreamIncomplete = stream.incomplete
@@ -333,18 +329,13 @@ func (m *Manager) processGIFDataPacketLocked(key string, stream *gifStreamSessio
 	update.GIFEnd = stream.complete
 	update.Complete = stream.complete && !stream.incomplete
 	if !shouldPublish {
-		// Keep lightweight progress callbacks sparse. The audio RX worker can
-		// now drain bursts without PNG encoding and Base64 allocation per packet.
-		if !lateFrame && !parsed.EOI && frame.receivedPackets%4 != 0 {
-			m.mu.Unlock()
-			return Update{}, false
-		}
+		// Emit one lightweight progress update for every unique image data packet.
+		// Attach a new PNG only when the packet completes at least one MCU; if it
+		// does not, advance the UI packet counter without encoding an identical image.
 		m.mu.Unlock()
 		return update, true
 	}
 	preview := cloneRGBA(frame.previewCanvas)
-	frame.lastPreviewPackets = frame.receivedPackets
-	frame.lastPreviewAt = now
 	m.mu.Unlock()
 
 	pngBytes, encodeErr := encodeGIFPreviewPNG(preview)
@@ -510,8 +501,6 @@ func (m *Manager) publishGIFClosedFrame(key string, stream *gifStreamSession, pa
 	m.mu.Lock()
 	if current := m.gifStreams[key]; current == stream {
 		frame.previewPNG = append(frame.previewPNG[:0], pngBytes...)
-		frame.lastPreviewAt = time.Now()
-		frame.lastPreviewPackets = frame.receivedPackets
 		storeGIFFrameSnapshotLocked(stream, frame)
 		stream.archiveDirty = true
 		stream.lastUpdate = time.Now()
@@ -898,19 +887,6 @@ func decodeAllReadyGIFSegments(frame *gifFrameBuffer) (int, error) {
 		newlyDecoded += decoded
 	}
 	return newlyDecoded, nil
-}
-
-func shouldPublishGIFPreview(frame *gifFrameBuffer, now time.Time, force bool) bool {
-	if frame == nil || frame.previewCanvas == nil {
-		return false
-	}
-	if force || len(frame.previewPNG) == 0 {
-		return true
-	}
-	if frame.receivedPackets-frame.lastPreviewPackets >= gifPreviewPacketStride {
-		return true
-	}
-	return now.Sub(frame.lastPreviewAt) >= gifPreviewPublishInterval
 }
 
 func storeGIFFrameSnapshotLocked(stream *gifStreamSession, frame *gifFrameBuffer) bool {

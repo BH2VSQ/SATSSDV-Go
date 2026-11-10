@@ -60,30 +60,31 @@ type StreamDecoder struct {
 	// image ID is reused by a transmitter or after its 8-bit ID wraps.
 	imageStates map[string]*packetDedupState
 
-	maryFECMode         int8 // -1 undecided, 0 legacy hard-decision, 1 soft-FEC burst
-	maryHeaderSoft      []float32
-	maryFECHeader       fec.BurstHeader
-	maryFECDecoder      *fec.ViterbiDecoder
-	maryFECSoft         []float32
-	maryFECBlocksDone   int64
-	maryFECBitsDone     int64
-	maryFECDecodedBits  int64
-	maryFECDecodedBytes uint32
-	maryFECByte         byte
-	maryFECByteBits     uint8
-	maryFECCRC          uint32
-	maryFECFinished     bool
-	maryFECError        error
-	maryPacketHeader    *fec.PacketBurstHeader
-	maryPacketSoft      []float32
-	maryPacketBodyBits  int
-	marySDF3PacketsOK   uint64
-	marySDF3PacketsBad  uint64
-	marySDF3Resyncs     uint64
-	marySDF3LastError   string
-	inputSamples        uint64
-	decodedPackets      uint64
-	lastValidPacketAt   time.Time
+	maryFECMode              int8 // -1 undecided, 0 legacy hard-decision, 1 soft-FEC burst
+	maryHeaderSoft           []float32
+	maryFECHeader            fec.BurstHeader
+	maryFECDecoder           *fec.ViterbiDecoder
+	maryFECSoft              []float32
+	maryFECBlocksDone        int64
+	maryFECBitsDone          int64
+	maryFECDecodedBits       int64
+	maryFECDecodedBytes      uint32
+	maryFECByte              byte
+	maryFECByteBits          uint8
+	maryFECCRC               uint32
+	maryFECFinished          bool
+	maryFECError             error
+	maryPacketHeader         *fec.PacketBurstHeader
+	maryPacketSoft           []float32
+	maryPacketBodyBits       int
+	maryPacketNextHeaderScan int
+	marySDF3PacketsOK        uint64
+	marySDF3PacketsBad       uint64
+	marySDF3Resyncs          uint64
+	marySDF3LastError        string
+	inputSamples             uint64
+	decodedPackets           uint64
+	lastValidPacketAt        time.Time
 
 	packetFECRecent        map[string]map[uint16][]byte
 	packetFECRecentOrder   map[string][]uint16
@@ -389,6 +390,7 @@ func (d *StreamDecoder) resetMARYFEC() {
 	d.maryPacketHeader = nil
 	d.maryPacketSoft = nil
 	d.maryPacketBodyBits = 0
+	d.maryPacketNextHeaderScan = 0
 }
 
 func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
@@ -411,6 +413,7 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 			if parseErr == nil {
 				d.maryPacketHeader = &packetHeader
 				d.maryPacketBodyBits = int(packetHeader.InterleavedBits())
+				d.maryPacketNextHeaderScan = 0
 			} else {
 				// The first SDF3 group header may itself be damaged. Enter the
 				// grouped scanner anyway; it will find the next valid group header
@@ -490,16 +493,25 @@ func (d *StreamDecoder) consumeMARYPacketizedSoft(llrs []float32) []ReceivedPack
 		}
 
 		// A valid next SDF3 descriptor before the advertised body length means
-		// the current radio/audio chunk was truncated. Abandon only that one CCSDS
-		// unit and immediately continue at the next independently protected unit.
-		if offset, next, ok := findSDF3PacketHeader(d.maryPacketSoft); ok && offset < d.maryPacketBodyBits {
+		// the current radio/audio chunk was truncated. Scan only newly completed
+		// candidate offsets: re-scanning the accumulated FEC body on every audio
+		// callback makes the live decoder's work grow quadratically with duration.
+		if offset, next, ok := findSDF3PacketHeaderFrom(d.maryPacketSoft, d.maryPacketNextHeaderScan); ok && offset < d.maryPacketBodyBits {
 			d.marySDF3PacketsBad++
 			d.marySDF3LastError = "previous SDF3 group truncated before next header"
 			d.maryPacketSoft = d.maryPacketSoft[offset+fec.BurstHeaderWireBits:]
 			d.maryPacketHeader = &next
 			d.maryPacketBodyBits = int(next.InterleavedBits())
+			d.maryPacketNextHeaderScan = 0
 			d.marySDF3Resyncs++
 			continue
+		}
+		// Keep the final headerBits-1 positions eligible because a descriptor can
+		// straddle two arbitrary audio callback blocks. All earlier offsets have
+		// already been checked exactly once for this current body.
+		d.maryPacketNextHeaderScan = len(d.maryPacketSoft) - fec.BurstHeaderWireBits + 1
+		if d.maryPacketNextHeaderScan < 0 {
+			d.maryPacketNextHeaderScan = 0
 		}
 		if len(d.maryPacketSoft) < d.maryPacketBodyBits {
 			return packets
@@ -510,6 +522,7 @@ func (d *StreamDecoder) consumeMARYPacketizedSoft(llrs []float32) []ReceivedPack
 		d.maryPacketSoft = d.maryPacketSoft[d.maryPacketBodyBits:]
 		d.maryPacketHeader = nil
 		d.maryPacketBodyBits = 0
+		d.maryPacketNextHeaderScan = 0
 		raw, err := decodeSDF3PacketBody(header, body)
 		if err != nil {
 			d.marySDF3PacketsBad++
@@ -542,8 +555,18 @@ func (d *StreamDecoder) consumeMARYPacketizedSoft(llrs []float32) []ReceivedPack
 }
 
 func findSDF3PacketHeader(llrs []float32) (int, fec.PacketBurstHeader, bool) {
+	return findSDF3PacketHeaderFrom(llrs, 0)
+}
+
+// findSDF3PacketHeaderFrom resumes the descriptor search at start. This keeps
+// packetized receive work linear as soft bits arrive in short audio callback
+// blocks instead of checking every old body offset repeatedly.
+func findSDF3PacketHeaderFrom(llrs []float32, start int) (int, fec.PacketBurstHeader, bool) {
 	const headerBits = fec.BurstHeaderWireBits
-	for offset := 0; offset+headerBits <= len(llrs); offset++ {
+	if start < 0 {
+		start = 0
+	}
+	for offset := start; offset+headerBits <= len(llrs); offset++ {
 		if !hasSDF3MagicAt(llrs, offset) {
 			continue
 		}
