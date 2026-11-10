@@ -483,6 +483,8 @@ MainWindow::MainWindow(BackendClient *backend, const QString &startupError, QWid
         loadInitialState();
         connect(&m_eventTimer, &QTimer::timeout, this, [this] { pollEvents(); });
         connect(&m_statusTimer, &QTimer::timeout, this, [this] { refreshStatus(); });
+        m_rxImageRenderTimer.setSingleShot(true);
+        connect(&m_rxImageRenderTimer, &QTimer::timeout, this, [this] { processNextRXImageEvent(); });
         m_eventTimer.start(80);
         m_statusTimer.start(2000);
         refreshStatus();
@@ -503,6 +505,8 @@ MainWindow::MainWindow(BackendClient *backend, const QString &startupError, QWid
 void MainWindow::stopBackgroundPolling() {
     m_eventTimer.stop();
     m_statusTimer.stop();
+    m_rxImageRenderTimer.stop();
+    m_rxImageEventQueue.clear();
 }
 
 void MainWindow::buildUi() {
@@ -2133,11 +2137,37 @@ void MainWindow::addAlbumCardActions(QWidget *card, QVBoxLayout *layout, const Q
 }
 
 void MainWindow::pollEvents() {
-    if(!m_backend->isRunning())return;
-    m_backend->pollEvents(m_eventSequence,[this](const QJsonArray &events,quint64 next,bool reset,const QString &error){
-        if(!error.isEmpty()){return;} if(reset){m_eventSequence=0;}
-        for(const auto &item:events)handleEvent(item.toObject()); m_eventSequence=next;
+    if (!m_backend->isRunning()) return;
+    m_backend->pollEvents(m_eventSequence, [this](const QJsonArray &events, quint64 next, bool reset, const QString &error) {
+        if (!error.isEmpty()) return;
+        if (reset) {
+            m_eventSequence = 0;
+            m_rxImageEventQueue.clear();
+            m_rxImageRenderTimer.stop();
+        }
+        for (const auto &item : events) {
+            const QJsonObject event = item.toObject();
+            if (event.value(QStringLiteral("name")).toString() == QStringLiteral("rx:image")) {
+                m_rxImageEventQueue.enqueue(event.value(QStringLiteral("payload")).toObject());
+            } else {
+                handleEvent(event);
+            }
+        }
+        m_eventSequence = next;
+        if (!m_rxImageEventQueue.isEmpty() && !m_rxImageRenderTimer.isActive()) {
+            // Give Qt one paint/event-loop turn between image packets. Processing
+            // every rx:image event inline inside pollEvents() collapsed multiple
+            // snapshots into the last paint, even though the Go backend emitted
+            // an immutable preview for every accepted SSDV packet.
+            m_rxImageRenderTimer.start(16);
+        }
     });
+}
+
+void MainWindow::processNextRXImageEvent() {
+    if (m_rxImageEventQueue.isEmpty()) return;
+    handleRXImageEvent(m_rxImageEventQueue.dequeue());
+    if (!m_rxImageEventQueue.isEmpty()) m_rxImageRenderTimer.start(16);
 }
 
 void MainWindow::handleEvent(const QJsonObject &event) {
@@ -2187,19 +2217,22 @@ void MainWindow::handleRXImageEvent(const QJsonObject &payload) {
             // preserves intermediate packet previews when event polling batches updates.
             m_lastRXPreviewIsGIF = false;
             showImage(previewDataUrl, m_rxPreview);
-            refreshInlineTemplateEditor();
         } else if (hasPreview) {
             // Backward-compatible fallback for events produced by older backends.
             refreshLatestRXPreview();
         }
-        m_templateImageCache.remove(QStringLiteral("last-rx"));
-        refreshTemplateCanvas();
+        if (!previewDataUrl.isEmpty() || gifStart || gifEnd) {
+            m_templateImageCache.remove(QStringLiteral("last-rx"));
+            refreshTemplateCanvas();
+        }
         const QString profile = payload.value(QStringLiteral("profile")).toString();
         const QString callsign = payload.value(QStringLiteral("callsign")).toString();
         if (!callsign.trimmed().isEmpty() && !m_hisCallManuallyEdited) {
             const bool cqTemplate = selectedTemplate().value(QStringLiteral("name")).toString().trimmed().compare(QStringLiteral("CQ"), Qt::CaseInsensitive) == 0;
-            if (!(m_txProfile && m_txProfile->currentData().toString() == QStringLiteral("ssdv-ax25") && cqTemplate)) {
-                m_hisCall->setText(callsign.trimmed().toUpper());
+            const QString normalizedCall = callsign.trimmed().toUpper();
+            if (!(m_txProfile && m_txProfile->currentData().toString() == QStringLiteral("ssdv-ax25") && cqTemplate)
+                && m_hisCall->text() != normalizedCall) {
+                m_hisCall->setText(normalizedCall);
                 refreshTemplateCanvas();
             }
         }
@@ -2263,6 +2296,10 @@ void MainWindow::handleRXDiagnosticsEvent(const QJsonObject &p) {
         QString fecMode=decoder.value(QStringLiteral("fecMode")).toString();
         qint64 fecOK=decoder.value(QStringLiteral("fecChunksOk")).toInteger();
         qint64 fecBad=decoder.value(QStringLiteral("fecChunksBad")).toInteger();
+        qint64 sdf3HeaderFailures=decoder.value(QStringLiteral("sdf3HeaderFailures")).toInteger();
+        qint64 sdf3HeaderRecoveries=decoder.value(QStringLiteral("sdf3HeaderRecoveries")).toInteger();
+        double clockOffsetPpm=decoder.value(QStringLiteral("maryClockOffsetPpm")).toDouble();
+        double samplesPerSymbol=decoder.value(QStringLiteral("marySamplesPerSymbol")).toDouble();
         QString fecError=decoder.value(QStringLiteral("lastFecError")).toString();
         const QString autoLocked=decoder.value(QStringLiteral("lockedProfile")).toString();
         if(!autoLocked.isEmpty()) profile=autoLocked;
@@ -2277,6 +2314,10 @@ void MainWindow::handleRXDiagnosticsEvent(const QJsonObject &p) {
                 fecMode=candidate.value(QStringLiteral("fecMode")).toString();
                 fecOK=candidate.value(QStringLiteral("fecChunksOk")).toInteger();
                 fecBad=candidate.value(QStringLiteral("fecChunksBad")).toInteger();
+                sdf3HeaderFailures=candidate.value(QStringLiteral("sdf3HeaderFailures")).toInteger();
+                sdf3HeaderRecoveries=candidate.value(QStringLiteral("sdf3HeaderRecoveries")).toInteger();
+                clockOffsetPpm=candidate.value(QStringLiteral("maryClockOffsetPpm")).toDouble();
+                samplesPerSymbol=candidate.value(QStringLiteral("marySamplesPerSymbol")).toDouble();
                 fecError=candidate.value(QStringLiteral("lastFecError")).toString();
                 break;
             }
@@ -2305,13 +2346,14 @@ void MainWindow::handleRXDiagnosticsEvent(const QJsonObject &p) {
         }
         const qint64 captureQueueDrops=p.value(QStringLiteral("captureQueueDrops")).toInteger();
         const qint64 queueDrops=p.value(QStringLiteral("queueDrops")).toInteger()+manager.value(QStringLiteral("queueDropped")).toInteger()+p.value(QStringLiteral("managerSubmitDrops")).toInteger()+captureQueueDrops;
-        m_rxDiagnostics->setText(QStringLiteral("AUD %1 blk · DEC %2 blk / %3 pkt · Q %4/%5 · DROP %6 · %7 %8 · FEC %9 %10/%11 · %12")
+        m_rxDiagnostics->setText(QStringLiteral("AUD %1 blk · DEC %2 blk / %3 pkt · Q %4/%5 · DROP %6 · %7 %8 · FEC %9 %10/%11 · CLK %12 ppm · HDR %13/%14 · %15")
             .arg(p.value(QStringLiteral("audioBlocks")).toInteger())
             .arg(p.value(QStringLiteral("decoderBlocks")).toInteger())
             .arg(p.value(QStringLiteral("decoderPackets")).toInteger())
             .arg(p.value(QStringLiteral("queueDepth")).toInt()).arg(p.value(QStringLiteral("queueCapacity")).toInt())
-            .arg(queueDrops).arg(profile).arg(modemState).arg(fecMode).arg(fecOK).arg(fecBad).arg(gifState));
-        const QString tip=QStringLiteral("Input samples=%1; capture queue drops=%2; RX queue drops=%3; input discontinuities=%4; decoder resets=%5; decoder errors=%6; panics=%7; RX manager=%8/%9 dropped=%10 processed=%11; MARY buffered=%12 samples, reacquires=%13; %14; FEC error=%15; last error=%16")
+            .arg(queueDrops).arg(profile).arg(modemState).arg(fecMode).arg(fecOK).arg(fecBad)
+            .arg(clockOffsetPpm,0,'f',0).arg(sdf3HeaderFailures).arg(sdf3HeaderRecoveries).arg(gifState));
+        const QString tip=QStringLiteral("Input samples=%1; capture queue drops=%2; RX queue drops=%3; input discontinuities=%4; decoder resets=%5; decoder errors=%6; panics=%7; RX manager=%8/%9 dropped=%10 processed=%11; MARY buffered=%12 samples, reacquires=%13, samples/symbol=%14, clock offset=%15 ppm; SDF3 header misses=%16 recoveries=%17; %18; FEC error=%19; last error=%20")
             .arg(p.value(QStringLiteral("audioSamples")).toInteger())
             .arg(captureQueueDrops)
             .arg(p.value(QStringLiteral("queueDrops")).toInteger())
@@ -2322,7 +2364,8 @@ void MainWindow::handleRXDiagnosticsEvent(const QJsonObject &p) {
             .arg(manager.value(QStringLiteral("queueDepth")).toInt()).arg(manager.value(QStringLiteral("queueCapacity")).toInt())
             .arg(manager.value(QStringLiteral("queueDropped")).toInteger())
             .arg(manager.value(QStringLiteral("processedPackets")).toInteger())
-            .arg(buffered).arg(reacquires).arg(gifDetails).arg(fecError).arg(p.value(QStringLiteral("lastError")).toString());
+            .arg(buffered).arg(reacquires).arg(samplesPerSymbol,0,'f',4).arg(clockOffsetPpm,0,'f',1)
+            .arg(sdf3HeaderFailures).arg(sdf3HeaderRecoveries).arg(gifDetails).arg(fecError).arg(p.value(QStringLiteral("lastError")).toString());
         m_rxDiagnostics->setToolTip(tip);
 }
 

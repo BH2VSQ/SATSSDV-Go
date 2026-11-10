@@ -21,6 +21,7 @@
 #include <QSlider>
 #include <QColor>
 #include <QHash>
+#include <QQueue>
 
 class SpectrumWaterfallWidget;
 class ImagePreviewLabel;
@@ -65,6 +66,7 @@ private:
     void toggleTX();
     void applyLanguage(const QString &locale);
     void pollEvents();
+    void processNextRXImageEvent();
     void handleEvent(const QJsonObject &event);
     void handleRXImageEvent(const QJsonObject &payload);
     void handleRXDiagnosticsEvent(const QJsonObject &payload);
@@ -98,6 +100,8 @@ private:
     BackendClient *m_backend = nullptr;
     QTimer m_eventTimer;
     QTimer m_statusTimer;
+    QTimer m_rxImageRenderTimer;
+    QQueue<QJsonObject> m_rxImageEventQueue;
     quint64 m_eventSequence = 0;
     bool m_statusRequestPending = false;
     bool m_rxPreviewRequestPending = false;

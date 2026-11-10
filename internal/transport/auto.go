@@ -171,8 +171,17 @@ func (d *AutoStreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 	}
 
 	if useMary {
-		for mode, decoder := range d.mary {
+		// Keep candidate order deterministic. Once a branch validates an SDF3
+		// descriptor (repeated magic plus header CRC), the modulation profile is
+		// known even though the first image packet's FEC body is still arriving.
+		// Lock at that protocol boundary instead of spending CPU on all three
+		// full soft-demod/FEC branches until an entire SSDV packet is delivered.
+		for _, mode := range []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600} {
 			if locked != "" && locked != mode {
+				continue
+			}
+			decoder := d.mary[mode]
+			if decoder == nil {
 				continue
 			}
 			decoded, err := decoder.Feed(samples)
@@ -184,6 +193,18 @@ func (d *AutoStreamDecoder) Feed(samples []float32) ([]ReceivedPacket, error) {
 				if d.accept(packet) {
 					packets = append(packets, packet)
 				}
+			}
+			if d.lockedProfile == "" {
+				diagnostics := decoder.Diagnostics()
+				if diagnostics.FECMode == "sdf3-packetized" || diagnostics.FECChunksOK > 0 || diagnostics.SDF3HeaderRecoveries > 0 {
+					d.lockedProfile = mode
+					// This is validated protocol evidence, so it also starts the
+					// normal idle timeout while the first body finishes decoding.
+					d.lastPacketAt = time.Now()
+				}
+			}
+			if d.lockedProfile != "" {
+				break
 			}
 		}
 	}

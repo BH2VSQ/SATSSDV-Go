@@ -111,9 +111,22 @@ jobs:
         run: |
           set -o pipefail
           go test -count=1 -timeout 20m -v ./internal/transport ./internal/rx ./internal/audio \
-            -run '^(TestMARYGIFAudioLoopbackDeliversOnePacketPerFeed|TestMARYGIFAudioLoopbackToleratesSoundcardClockOffset|TestMARYGIFRXManagerPublishesProgressPerPacket|TestEnqueueCapturePCMDoesNotDrainAcceptedAudio|TestMARYSmallGroupsReduceProgressivePacketLatency|TestSDF3HeaderScannerResumesAcrossAudioCallbacks|TestMARYPacketizedHeaderSearchUsesIncrementalOffsets)$' \
+            -run '^(TestMARYGIFAudioLoopbackDeliversOnePacketPerFeed|TestMARYGIFAudioLoopbackToleratesSoundcardClockOffset|TestMARYGIFRXManagerPublishesProgressPerPacket|TestEnqueueCapturePCMDoesNotDrainAcceptedAudio|TestMARYSmallGroupsReduceProgressivePacketLatency|TestSDF3HeaderScannerResumesAcrossAudioCallbacks|TestMARYPacketizedHeaderSearchUsesIncrementalOffsets|TestSDF3HeaderProbeRecoversAfterBadInitialDescriptor)$' \
             2>&1 | tee reports/channel/mary-gif-loopback.log
+          # Run long profile cases in isolated processes to cap peak RAM and GC pressure.
+          go test -count=1 -timeout 8m -v ./internal/transport \
+            -run '^TestMARYLongGIFLoopbackAutoDetection/ssdv-qpsk-1600$' \
+            2>&1 | tee -a reports/channel/mary-gif-loopback.log
+          go test -count=1 -timeout 8m -v ./internal/transport \
+            -run '^TestMARYLongGIFLoopbackAutoDetection/ssdv-8psk-1600$' \
+            2>&1 | tee -a reports/channel/mary-gif-loopback.log
+          go test -count=1 -timeout 8m -v ./internal/transport \
+            -run '^TestMARYLongGIFLoopbackAutoDetection/ssdv-16qam-1600$' \
+            2>&1 | tee -a reports/channel/mary-gif-loopback.log
           go test -count=1 -v . -run '^TestGIFMARYGroupSizePrioritizesProgressiveLatency$' \
+            2>&1 | tee -a reports/channel/mary-gif-loopback.log
+          go test -count=1 -timeout 5m -v ./internal/modem/mary \
+            -run '^TestMAModulationSampleClockOffsetRecovery$' \
             2>&1 | tee -a reports/channel/mary-gif-loopback.log
       - name: Run race and concurrency regression suite
         if: always()

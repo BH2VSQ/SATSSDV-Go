@@ -4,6 +4,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CPP = (ROOT / "qt6" / "mainwindow.cpp").read_text(encoding="utf-8")
+HEADER = (ROOT / "qt6" / "mainwindow.h").read_text(encoding="utf-8")
+TRANSPORT = (ROOT / "internal" / "transport" / "stream.go").read_text(encoding="utf-8")
 APP = (ROOT / "app.go").read_text(encoding="utf-8")
 TEST = (ROOT / "app_gif_rx_test.go").read_text(encoding="utf-8")
 
@@ -28,6 +30,13 @@ checks = {
     "dedicated GIF RPC validates and returns an animated GIF": "GetLatestRXGIFData" in APP and "gif.DecodeConfig" in APP,
     "live RX GIF completion is covered by integration test": "app.handleRXImageUpdate(finalUpdate)" in TEST and "completed GIF did not become the live RX preview" in TEST,
     "dedicated GIF RPC is covered by integration test": "app.GetLatestRXGIFData()" in TEST and "dedicated RX GIF endpoint" in TEST,
+    "RX image snapshots are queued rather than rendered inline during polling": "m_rxImageEventQueue.enqueue" in CPP and "processNextRXImageEvent" in CPP,
+    "Qt renders one RX image event per event-loop turn": "m_rxImageEventQueue.dequeue()" in CPP and "m_rxImageRenderTimer.start(16)" in CPP,
+    "RX image queue and timer have stable ownership in MainWindow": "QQueue<QJsonObject> m_rxImageEventQueue" in HEADER and "QTimer m_rxImageRenderTimer" in HEADER,
+    "RX image rendering is dispatched through a single-shot timer": "m_rxImageRenderTimer.setSingleShot(true)" in CPP,
+    "per-packet preview avoids rebuilding the unrelated TX editor": "refreshInlineTemplateEditor();" not in CPP[CPP.index("void MainWindow::handleRXImageEvent"):CPP.index("void MainWindow::handleRXDiagnosticsEvent")],
+    "damaged SDF3 acquisition remains in soft-probing mode": "legacy-probing-sdf3" in TRANSPORT and "consumeMARYLegacyProbe" in TRANSPORT,
+    "SDF3 soft probing can recover at a later valid packet header": "marySDF3HeaderRecoveries++" in TRANSPORT and "findSDF3PacketHeaderFrom(combined, 0)" in TRANSPORT,
 }
 
 failed = [name for name, ok in checks.items() if not ok]

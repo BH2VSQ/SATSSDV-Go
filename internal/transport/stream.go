@@ -60,8 +60,9 @@ type StreamDecoder struct {
 	// image ID is reused by a transmitter or after its 8-bit ID wraps.
 	imageStates map[string]*packetDedupState
 
-	maryFECMode              int8 // -1 undecided, 0 legacy hard-decision, 1 soft-FEC burst
+	maryFECMode              int8 // -1 undecided, 0 legacy hard-decision, 1 SDF2 soft-FEC, 2 SDF3 packetized, 3 legacy with SDF3 probing
 	maryHeaderSoft           []float32
+	maryLegacyProbeSoft      []float32
 	maryFECHeader            fec.BurstHeader
 	maryFECDecoder           *fec.ViterbiDecoder
 	maryFECSoft              []float32
@@ -81,6 +82,8 @@ type StreamDecoder struct {
 	marySDF3PacketsOK        uint64
 	marySDF3PacketsBad       uint64
 	marySDF3Resyncs          uint64
+	marySDF3HeaderFailures   uint64
+	marySDF3HeaderRecoveries uint64
 	marySDF3LastError        string
 	inputSamples             uint64
 	decodedPackets           uint64
@@ -93,30 +96,34 @@ type StreamDecoder struct {
 }
 
 type DecoderDiagnostics struct {
-	Profile             string  `json:"profile"`
-	InputSamples        uint64  `json:"inputSamples"`
-	DecodedPackets      uint64  `json:"decodedPackets"`
-	ValidPacketRecent   bool    `json:"validPacketRecent"`
-	LastPacketAgeMS     int64   `json:"lastPacketAgeMs"`
-	MARYLocked          bool    `json:"maryLocked"`
-	FSKLocked           bool    `json:"fskLocked"`
-	GMSKLocked          bool    `json:"gmskLocked"`
-	MARYBufferedSamples int     `json:"maryBufferedSamples"`
-	MARYSignalRMS       float64 `json:"marySignalRms"`
-	MARYSilenceSamples  int     `json:"marySilenceSamples"`
-	MARYPacketizedMode  bool    `json:"maryPacketizedMode"`
-	MARYReacquireCount  uint64  `json:"maryReacquireCount"`
-	MARYEVMRMS          float64 `json:"maryEvmRms"`
-	MARYSNRDB           float64 `json:"marySnrDb"`
-	MARYEVMSamples      uint64  `json:"maryEvmSamples"`
-	MARYSNRValid        bool    `json:"marySnrValid"`
-	FECMode             string  `json:"fecMode"`
-	FECBufferedBits     int     `json:"fecBufferedBits"`
-	FECExpectedBits     int     `json:"fecExpectedBits"`
-	FECChunksOK         uint64  `json:"fecChunksOk"`
-	FECChunksBad        uint64  `json:"fecChunksBad"`
-	FECResyncs          uint64  `json:"fecResyncs"`
-	LastFECError        string  `json:"lastFecError,omitempty"`
+	Profile              string  `json:"profile"`
+	InputSamples         uint64  `json:"inputSamples"`
+	DecodedPackets       uint64  `json:"decodedPackets"`
+	ValidPacketRecent    bool    `json:"validPacketRecent"`
+	LastPacketAgeMS      int64   `json:"lastPacketAgeMs"`
+	MARYLocked           bool    `json:"maryLocked"`
+	FSKLocked            bool    `json:"fskLocked"`
+	GMSKLocked           bool    `json:"gmskLocked"`
+	MARYBufferedSamples  int     `json:"maryBufferedSamples"`
+	MARYSignalRMS        float64 `json:"marySignalRms"`
+	MARYSilenceSamples   int     `json:"marySilenceSamples"`
+	MARYPacketizedMode   bool    `json:"maryPacketizedMode"`
+	MARYReacquireCount   uint64  `json:"maryReacquireCount"`
+	MARYEVMRMS           float64 `json:"maryEvmRms"`
+	MARYSNRDB            float64 `json:"marySnrDb"`
+	MARYSamplesPerSymbol float64 `json:"marySamplesPerSymbol"`
+	MARYClockOffsetPPM   float64 `json:"maryClockOffsetPpm"`
+	MARYEVMSamples       uint64  `json:"maryEvmSamples"`
+	MARYSNRValid         bool    `json:"marySnrValid"`
+	FECMode              string  `json:"fecMode"`
+	FECBufferedBits      int     `json:"fecBufferedBits"`
+	FECExpectedBits      int     `json:"fecExpectedBits"`
+	FECChunksOK          uint64  `json:"fecChunksOk"`
+	FECChunksBad         uint64  `json:"fecChunksBad"`
+	FECResyncs           uint64  `json:"fecResyncs"`
+	SDF3HeaderFailures   uint64  `json:"sdf3HeaderFailures"`
+	SDF3HeaderRecoveries uint64  `json:"sdf3HeaderRecoveries"`
+	LastFECError         string  `json:"lastFecError,omitempty"`
 }
 
 func (d *StreamDecoder) Diagnostics() DecoderDiagnostics {
@@ -125,6 +132,7 @@ func (d *StreamDecoder) Diagnostics() DecoderDiagnostics {
 	}
 	status := DecoderDiagnostics{Profile: string(d.profile.ID), InputSamples: d.inputSamples, DecodedPackets: d.decodedPackets,
 		FECChunksOK: d.marySDF3PacketsOK, FECChunksBad: d.marySDF3PacketsBad, FECResyncs: d.marySDF3Resyncs,
+		SDF3HeaderFailures: d.marySDF3HeaderFailures, SDF3HeaderRecoveries: d.marySDF3HeaderRecoveries,
 		LastFECError: d.marySDF3LastError}
 	if !d.lastValidPacketAt.IsZero() {
 		status.LastPacketAgeMS = time.Since(d.lastValidPacketAt).Milliseconds()
@@ -146,6 +154,8 @@ func (d *StreamDecoder) Diagnostics() DecoderDiagnostics {
 		status.MARYReacquireCount = modem.ReacquireCount
 		status.MARYEVMRMS = modem.EVMRMS
 		status.MARYSNRDB = modem.SNRDB
+		status.MARYSamplesPerSymbol = modem.SamplesPerSymbol
+		status.MARYClockOffsetPPM = modem.ClockOffsetPPM
 		status.MARYEVMSamples = modem.SNRSamples
 		status.MARYSNRValid = modem.SNRValid
 	}
@@ -154,6 +164,10 @@ func (d *StreamDecoder) Diagnostics() DecoderDiagnostics {
 		status.FECMode = "acquiring"
 	case 0:
 		status.FECMode = "legacy-hard"
+	case 3:
+		status.FECMode = "legacy-probing-sdf3"
+		status.FECBufferedBits = len(d.maryLegacyProbeSoft)
+		status.FECExpectedBits = fec.BurstHeaderWireBits
 	case 1:
 		status.FECMode = "sdf2-image-burst"
 		status.FECBufferedBits = len(d.maryFECSoft) + len(d.maryHeaderSoft)
@@ -375,6 +389,7 @@ func (d *StreamDecoder) resetMARYFEC() {
 	}
 	d.maryFECMode = -1
 	d.maryHeaderSoft = nil
+	d.maryLegacyProbeSoft = nil
 	d.maryFECHeader = fec.BurstHeader{}
 	d.maryFECDecoder = nil
 	d.maryFECSoft = nil
@@ -403,35 +418,36 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 		if len(d.maryHeaderSoft) < headerBits {
 			return nil
 		}
-		headerBytes, combineErr := fec.CombineRepeatedBurstHeader(d.maryHeaderSoft[:headerBits])
-		if combineErr == nil && len(headerBytes) >= 4 && string(headerBytes[:4]) == "SDF3" {
-			packetHeader, parseErr := fec.ParsePacketBurstHeader(headerBytes)
+
+		// Search the complete acquisition window instead of assuming that the
+		// demodulator's first returned payload bit is exactly bit zero of the
+		// repeated SDF3 descriptor. One or two late/early symbols during carrier
+		// acquisition must not permanently demote a new-format stream to legacy.
+		if offset, packetHeader, ok := findSDF3PacketHeaderFrom(d.maryHeaderSoft, 0); ok {
+			if offset > 0 {
+				d.marySDF3Resyncs++
+			}
 			d.maryFECMode = 2
 			d.mary.SetPacketizedMode(true)
-			remaining := append([]float32(nil), d.maryHeaderSoft[headerBits:]...)
+			d.maryPacketHeader = &packetHeader
+			d.maryPacketBodyBits = int(packetHeader.InterleavedBits())
+			remaining := append([]float32(nil), d.maryHeaderSoft[offset+headerBits:]...)
 			d.maryHeaderSoft = nil
-			if parseErr == nil {
-				d.maryPacketHeader = &packetHeader
-				d.maryPacketBodyBits = int(packetHeader.InterleavedBits())
-				d.maryPacketNextHeaderScan = 0
-			} else {
-				// The first SDF3 group header may itself be damaged. Enter the
-				// grouped scanner anyway; it will find the next valid group header
-				// rather than interpreting the remaining burst as legacy bits.
-				d.maryPacketSoft = append(d.maryPacketSoft, headerBytesToLLRs(remaining)...)
-				d.marySDF3LastError = parseErr.Error()
-			}
 			return d.consumeMARYPacketizedSoft(remaining)
 		}
 
-		var header fec.BurstHeader
-		var err error
-		if combineErr == nil {
-			header, err = fec.ParseBurstHeader(headerBytes)
-		} else {
-			err = combineErr
-		}
-		if err == nil {
+		// Keep SDF2 compatibility for older image-burst recordings. A damaged
+		// descriptor is a recoverable acquisition miss, except for a recognizable
+		// SDF2 marker whose own header CRC proves corruption.
+		headerBytes, combineErr := fec.CombineRepeatedBurstHeader(d.maryHeaderSoft[:headerBits])
+		if combineErr == nil && len(headerBytes) >= 4 && string(headerBytes[:4]) == "SDF2" {
+			header, err := fec.ParseBurstHeader(headerBytes)
+			if err != nil {
+				d.maryFECError = err
+				d.maryFECFinished = true
+				d.maryHeaderSoft = nil
+				return nil
+			}
 			d.maryFECMode = 1
 			d.maryFECHeader = header
 			d.maryFECDecoder = fec.NewViterbiDecoder()
@@ -439,30 +455,70 @@ func (d *StreamDecoder) consumeMARYSoft(llrs []float32) []ReceivedPacket {
 			d.maryHeaderSoft = nil
 			return d.consumeMARYFECSoft(remaining)
 		}
-		// A recognizable SDF2 marker with a failed CRC is a damaged new-format
-		// header, not a legacy burst. Do not silently reinterpret coded payload
-		// bits as old hard-decision CCSDS data.
-		if combineErr == nil && len(headerBytes) >= 4 && string(headerBytes[:4]) == "SDF2" {
-			d.maryFECError = err
-			d.maryFECFinished = true
-			d.maryHeaderSoft = nil
-			return nil
-		}
-		// The first bytes of a legacy M-ary burst are the CCSDS randomizer
-		// preamble. If no recognized descriptor is present, preserve the old
-		// hard-decision path byte-for-byte.
-		d.maryFECMode = 0
-		legacy := softToBits(d.maryHeaderSoft)
+
+		// Do not permanently switch to hard-decision legacy parsing after one
+		// failed SDF3 header. Keep a rolling soft-bit window and continue probing
+		// every later packet boundary; the next good descriptor can restore SDF3
+		// decoding even when continuous RF noise prevents silence-based re-lock.
+		d.marySDF3HeaderFailures++
+		d.maryFECMode = 3
+		d.maryLegacyProbeSoft = append(d.maryLegacyProbeSoft[:0], d.maryHeaderSoft...)
 		d.maryHeaderSoft = nil
-		return d.consumeCCSDSBits(legacy)
+		return d.consumeMARYLegacyProbe(nil)
 	}
-	if d.maryFECMode == 0 {
+	switch d.maryFECMode {
+	case 0:
 		return d.consumeCCSDSBits(softToBits(llrs))
-	}
-	if d.maryFECMode == 2 {
+	case 1:
+		return d.consumeMARYFECSoft(llrs)
+	case 2:
 		return d.consumeMARYPacketizedSoft(llrs)
+	case 3:
+		return d.consumeMARYLegacyProbe(llrs)
+	default:
+		return nil
 	}
-	return d.consumeMARYFECSoft(llrs)
+}
+
+// consumeMARYLegacyProbe preserves legacy bitstream reception while retaining
+// enough soft bits to find a later valid SDF3 descriptor. Only bits that have
+// moved out of the overlap window are committed to the legacy CCSDS scanner.
+// A descriptor is accepted only after repetition combining and its header CRC.
+func (d *StreamDecoder) consumeMARYLegacyProbe(llrs []float32) []ReceivedPacket {
+	combined := make([]float32, 0, len(d.maryLegacyProbeSoft)+len(llrs))
+	combined = append(combined, d.maryLegacyProbeSoft...)
+	combined = append(combined, llrs...)
+	if len(combined) == 0 {
+		return nil
+	}
+
+	if offset, header, ok := findSDF3PacketHeaderFrom(combined, 0); ok {
+		var packets []ReceivedPacket
+		if offset > 0 {
+			packets = append(packets, d.consumeCCSDSBits(softToBits(combined[:offset]))...)
+			d.marySDF3Resyncs++
+		}
+		d.maryLegacyProbeSoft = nil
+		d.maryFECMode = 2
+		d.marySDF3HeaderRecoveries++
+		d.mary.SetPacketizedMode(true)
+		d.maryPacketHeader = &header
+		d.maryPacketBodyBits = int(header.InterleavedBits())
+		d.maryPacketNextHeaderScan = 0
+		remaining := combined[offset+fec.BurstHeaderWireBits:]
+		packets = append(packets, d.consumeMARYPacketizedSoft(remaining)...)
+		return packets
+	}
+
+	keep := fec.BurstHeaderWireBits - 1
+	stableEnd := len(combined) - keep
+	if stableEnd <= 0 {
+		d.maryLegacyProbeSoft = combined
+		return nil
+	}
+	packets := d.consumeCCSDSBits(softToBits(combined[:stableEnd]))
+	d.maryLegacyProbeSoft = append(d.maryLegacyProbeSoft[:0], combined[stableEnd:]...)
+	return packets
 }
 
 // headerBytesToLLRs is intentionally a no-op copy helper used to make ownership

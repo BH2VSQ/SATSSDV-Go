@@ -21,29 +21,30 @@ type Config struct {
 }
 
 type StreamDemodulator struct {
-	cfg             Config
-	sps             int
-	baseband        []complex64
-	sampleCount     int64
-	searchPos       int
-	locked          bool
-	cursor          int
-	phase           float64
-	phaseStep       float64
-	symbolIndex     int64
-	phaseRotation   complex128
-	stepRotation    complex128
-	amplitudeScale  float64
-	silenceSamples  int
-	signalRMS       float64
-	burstGeneration uint64
-	reacquireCount  uint64
-	packetizedMode  bool
-	evmSignalPower  float64
-	evmErrorPower   float64
-	evmSymbols      uint64
-	cosLUT          []float64
-	sinLUT          []float64
+	cfg              Config
+	sps              int
+	samplesPerSymbol float64
+	baseband         []complex64
+	sampleCount      int64
+	searchPos        int
+	locked           bool
+	cursor           float64
+	phase            float64
+	phaseStep        float64
+	symbolIndex      int64
+	phaseRotation    complex128
+	stepRotation     complex128
+	amplitudeScale   float64
+	silenceSamples   int
+	signalRMS        float64
+	burstGeneration  uint64
+	reacquireCount   uint64
+	packetizedMode   bool
+	evmSignalPower   float64
+	evmErrorPower    float64
+	evmSymbols       uint64
+	cosLUT           []float64
+	sinLUT           []float64
 }
 
 func NewStreamDemodulator(cfg Config) (*StreamDemodulator, error) {
@@ -64,7 +65,7 @@ func NewStreamDemodulator(cfg Config) (*StreamDemodulator, error) {
 		angle := 2 * math.Pi * float64(cfg.CarrierHz) * float64(i) / float64(cfg.SampleRate)
 		cosLUT[i], sinLUT[i] = math.Cos(angle), math.Sin(angle)
 	}
-	return &StreamDemodulator{cfg: cfg, sps: sps, cosLUT: cosLUT, sinLUT: sinLUT}, nil
+	return &StreamDemodulator{cfg: cfg, sps: sps, samplesPerSymbol: float64(sps), cosLUT: cosLUT, sinLUT: sinLUT}, nil
 }
 
 func (d *StreamDemodulator) Reset() {
@@ -76,6 +77,7 @@ func (d *StreamDemodulator) Reset() {
 	d.searchPos = 0
 	d.locked = false
 	d.cursor = 0
+	d.samplesPerSymbol = float64(d.sps)
 	d.phase = 0
 	d.phaseStep = 0
 	d.symbolIndex = 0
@@ -302,6 +304,7 @@ func (d *StreamDemodulator) releaseAcquisition() {
 	d.searchPos = 0
 	d.locked = false
 	d.cursor = 0
+	d.samplesPerSymbol = float64(d.sps)
 	d.phase = 0
 	d.phaseStep = 0
 	d.symbolIndex = 0
@@ -414,71 +417,195 @@ func (d *StreamDemodulator) evaluateTrainingAt(start int, sampleAccurate bool) (
 
 // refineTrainingCandidate performs the expensive carrier refinement once at
 // the selected symbol boundary and recomputes the coherent phase estimate.
-func (d *StreamDemodulator) refineTrainingCandidate(start int, candidate trainingCandidate) trainingCandidate {
-	stepPhase := d.refineTrainingStep(start, candidate.phaseStep)
-	rotation := complex(1.0, 0.0)
-	sampleRotation := cmplx.Rect(1, -stepPhase/float64(d.sps))
-	var correlation complex128
-	magnitude := 0.0
-	for symbol := 0; symbol < trainingSymbols; symbol++ {
-		sign := complex(float64(trainingSequence[symbol]), 0)
-		base := start + symbol*d.sps
-		for sampleIndex := 0; sampleIndex < d.sps; sampleIndex++ {
-			sample := complex128(d.baseband[base+sampleIndex])
-			correlation += sample * sign * rotation
-			magnitude += cmplx.Abs(sample)
-			rotation *= sampleRotation
+// estimateTrainingTiming derives the symbol period from the known BPSK
+// transition edges in the 96-symbol acquisition word. It is deliberately
+// bounded: weak or ambiguous edges fall back to nominal integer timing rather
+// than poisoning an otherwise usable burst.
+func (d *StreamDemodulator) estimateTrainingTiming(start int, candidate trainingCandidate) (float64, float64, bool) {
+	nominal := float64(d.sps)
+	coarseHz := candidate.phaseStep * float64(d.cfg.SymbolRate) / (2 * math.Pi)
+	initialPhase := candidate.phase
+	type edgePoint struct{ symbol, sample float64 }
+	points := make([]edgePoint, 0, trainingSymbols/2)
+	searchRadius := math.Max(3, nominal*0.30)
+	for k := 0; k < trainingSymbols-1; k++ {
+		if trainingSequence[k] == trainingSequence[k+1] {
+			continue
+		}
+		expected := float64(start) + float64(k+1)*nominal
+		lo := int(math.Floor(expected - searchRadius))
+		hi := int(math.Ceil(expected + searchRadius))
+		if lo < 0 {
+			lo = 0
+		}
+		if hi >= len(d.baseband)-1 {
+			hi = len(d.baseband) - 2
+		}
+		bestDist := math.Inf(1)
+		bestEdge := 0.0
+		found := false
+		oldSign := float64(trainingSequence[k])
+		for n := lo; n <= hi; n++ {
+			t0 := float64(n - start)
+			t1 := t0 + 1
+			phase0 := -initialPhase - 2*math.Pi*coarseHz*t0/float64(d.cfg.SampleRate)
+			phase1 := -initialPhase - 2*math.Pi*coarseHz*t1/float64(d.cfg.SampleRate)
+			v0 := real(complex128(d.baseband[n])*cmplx.Rect(1, phase0)) * oldSign
+			v1 := real(complex128(d.baseband[n+1])*cmplx.Rect(1, phase1)) * oldSign
+			if v0 < 0 || v1 > 0 || v0 == v1 {
+				continue
+			}
+			fraction := v0 / (v0 - v1)
+			edge := float64(n) + fraction
+			dist := math.Abs(edge - expected)
+			if dist < bestDist {
+				bestDist, bestEdge, found = dist, edge, true
+			}
+		}
+		if found {
+			points = append(points, edgePoint{symbol: float64(k + 1), sample: bestEdge})
 		}
 	}
-	candidate.phase = cmplx.Phase(correlation)
-	candidate.phaseStep = stepPhase
-	candidate.score = cmplx.Abs(correlation) / (magnitude + 1e-15)
-	return candidate
+	if len(points) < 20 {
+		return float64(start), nominal, false
+	}
+	// Fit y = phase + symbol*period. Reject outliers using a median absolute
+	// residual gate, then refit; this prevents one noisy edge from shifting
+	// every data symbol in a long SDF3 group.
+	fit := func(in []edgePoint) (float64, float64, float64, bool) {
+		if len(in) < 2 {
+			return 0, 0, 0, false
+		}
+		var mx, my float64
+		for _, p := range in {
+			mx += p.symbol
+			my += p.sample
+		}
+		mx /= float64(len(in))
+		my /= float64(len(in))
+		var numerator, denominator float64
+		for _, p := range in {
+			dx := p.symbol - mx
+			numerator += dx * (p.sample - my)
+			denominator += dx * dx
+		}
+		if denominator <= 0 {
+			return 0, 0, 0, false
+		}
+		period := numerator / denominator
+		phase := my - period*mx
+		var sumSq float64
+		for _, p := range in {
+			residual := p.sample - (phase + p.symbol*period)
+			sumSq += residual * residual
+		}
+		return phase, period, math.Sqrt(sumSq / float64(len(in))), true
+	}
+	phase, period, rms, ok := fit(points)
+	if !ok {
+		return float64(start), nominal, false
+	}
+	filtered := make([]edgePoint, 0, len(points))
+	gate := math.Max(0.28, math.Min(0.75, rms*2.5))
+	for _, p := range points {
+		if math.Abs(p.sample-(phase+p.symbol*period)) <= gate {
+			filtered = append(filtered, p)
+		}
+	}
+	if len(filtered) >= 20 && len(filtered) < len(points) {
+		phase, period, rms, ok = fit(filtered)
+	}
+	if !ok || len(filtered) < 20 || math.IsNaN(period) || math.IsInf(period, 0) {
+		return float64(start), nominal, false
+	}
+	ppm := (period/nominal - 1) * 1e6
+	if math.Abs(ppm) > 2000 || rms > 0.65 || phase < float64(start)-2 || phase > float64(start)+2 {
+		return float64(start), nominal, false
+	}
+	return phase, period, true
 }
 
-// refineTrainingStep performs a fine frequency search around the CFO estimate
-// obtained from adjacent training-symbol means. It maximizes the coherent
-// correlation of the entire known 96-symbol training word after de-rotation.
-// Searching a +/-12 Hz neighborhood at 1 Hz resolution keeps acquisition
-// bounded while correcting the several-hertz bias from mixer-image leakage.
-func (d *StreamDemodulator) refineTrainingStep(start int, coarseStep float64) float64 {
-	coarseHz := coarseStep * float64(d.cfg.SymbolRate) / (2 * math.Pi)
+func sampleComplexLinear(samples []complex64, position float64) complex128 {
+	if len(samples) == 0 || position < 0 || position >= float64(len(samples)-1) {
+		return 0
+	}
+	index := int(position)
+	fraction := position - float64(index)
+	a, b := complex128(samples[index]), complex128(samples[index+1])
+	return a + (b-a)*complex(fraction, 0)
+}
+
+// refineTrainingCandidateTimed performs a bounded CFO search using the
+// fractional symbol period measured from the training edges. This separates
+// sample-clock error from carrier-frequency offset.
+func (d *StreamDemodulator) refineTrainingCandidateTimed(start, period float64, candidate trainingCandidate) trainingCandidate {
+	coarseHz := candidate.phaseStep * float64(d.cfg.SymbolRate) / (2 * math.Pi)
 	const searchSpanHz = 12.0
 	const searchStepHz = 1.0
 	minimumHz := math.Max(-float64(d.cfg.SymbolRate)*0.49, coarseHz-searchSpanHz)
 	maximumHz := math.Min(float64(d.cfg.SymbolRate)*0.49, coarseHz+searchSpanHz)
-	window := trainingSymbols * d.sps
-	if start < 0 || start+window > len(d.baseband) {
-		return coarseStep
-	}
-	magnitude := 0.0
-	for i := 0; i < window; i++ {
-		magnitude += cmplx.Abs(complex128(d.baseband[start+i]))
-	}
-	if magnitude <= 1e-15 {
-		return coarseStep
-	}
 	bestHz := coarseHz
-	bestCorrelation := -1.0
+	bestScore := -1.0
+	var bestCorrelation complex128
+	bestMagnitude := 0.0
+	bestAmplitude := 0.0
 	for frequencyHz := minimumHz; frequencyHz <= maximumHz+searchStepHz*0.25; frequencyHz += searchStepHz {
-		rotation := complex(1.0, 0.0)
-		sampleRotation := cmplx.Rect(1, -2*math.Pi*frequencyHz/float64(d.cfg.SampleRate))
 		var correlation complex128
+		magnitude := 0.0
+		amplitudeSum := 0.0
+		sampleRotation := cmplx.Rect(1, -2*math.Pi*frequencyHz/float64(d.cfg.SampleRate))
 		for symbol := 0; symbol < trainingSymbols; symbol++ {
+			symbolStart := start + float64(symbol)*period
+			rotation := cmplx.Rect(1, -2*math.Pi*frequencyHz*float64(symbol)*period/float64(d.cfg.SampleRate))
 			sign := complex(float64(trainingSequence[symbol]), 0)
-			base := start + symbol*d.sps
-			for sampleIndex := 0; sampleIndex < d.sps; sampleIndex++ {
-				correlation += complex128(d.baseband[base+sampleIndex]) * sign * rotation
+			var symbolCorrelation complex128
+			samplesUsed := 0
+			for sampleOffset := 0.0; sampleOffset < period; sampleOffset += 1 {
+				sample := sampleComplexLinear(d.baseband, symbolStart+sampleOffset)
+				corrected := sample * rotation
+				correlation += corrected * sign
+				symbolCorrelation += corrected
+				magnitude += cmplx.Abs(sample)
 				rotation *= sampleRotation
+				samplesUsed++
+			}
+			if samplesUsed > 0 {
+				amplitudeSum += cmplx.Abs(symbolCorrelation / complex(float64(samplesUsed), 0))
 			}
 		}
-		score := cmplx.Abs(correlation) / magnitude
-		if score > bestCorrelation {
-			bestCorrelation = score
-			bestHz = frequencyHz
+		score := cmplx.Abs(correlation) / (magnitude + 1e-15)
+		if score > bestScore {
+			bestScore, bestHz, bestCorrelation, bestMagnitude = score, frequencyHz, correlation, magnitude
+			bestAmplitude = amplitudeSum / trainingSymbols
 		}
 	}
-	return 2 * math.Pi * bestHz / float64(d.cfg.SymbolRate)
+	if bestMagnitude <= 1e-15 {
+		return candidate
+	}
+	candidate.phase = cmplx.Phase(bestCorrelation)
+	candidate.phaseStep = 2 * math.Pi * bestHz * period / float64(d.cfg.SampleRate)
+	candidate.amplitude = bestAmplitude
+	candidate.score = bestScore
+	return candidate
+}
+
+func (d *StreamDemodulator) applyTrainingLockTimed(start, period float64, candidate trainingCandidate) {
+	if candidate.amplitude > 1e-6 {
+		d.amplitudeScale = 1 / candidate.amplitude
+	} else {
+		d.amplitudeScale = 1
+	}
+	d.phase = candidate.phase
+	d.phaseStep = candidate.phaseStep
+	d.samplesPerSymbol = period
+	d.phaseRotation = cmplx.Rect(1, -(d.phase + d.phaseStep*(trainingSymbols+0.5)))
+	d.stepRotation = cmplx.Rect(1, -d.phaseStep)
+	d.cursor = start + float64(trainingSymbols)*period
+	d.symbolIndex = 0
+	d.evmSignalPower = 0
+	d.evmErrorPower = 0
+	d.evmSymbols = 0
+	d.reacquireCount++
 }
 
 func (d *StreamDemodulator) tryAcquire() {
@@ -486,8 +613,6 @@ func (d *StreamDemodulator) tryAcquire() {
 	if len(d.baseband) < window {
 		return
 	}
-	// First search at 1/8-symbol resolution to keep the idle receiver cheap.
-	// Once a promising preamble is found, refine its start sample-by-sample.
 	step := d.sps / 8
 	if step < 1 {
 		step = 1
@@ -498,7 +623,6 @@ func (d *StreamDemodulator) tryAcquire() {
 		if !valid || candidate.score < 0.18 {
 			continue
 		}
-
 		bestStart := -1
 		best := trainingCandidate{}
 		lo := start - step + 1
@@ -515,88 +639,76 @@ func (d *StreamDemodulator) tryAcquire() {
 				bestStart, best = refinedStart, refined
 			}
 		}
-		// A high-confidence match is required before locking. The sample-level
-		// metric rejects the broad off-boundary plateau of the coarse score.
 		if bestStart < 0 || best.score < 0.70 {
 			continue
 		}
-		// Refine carrier offset once per actual acquisition, not once per timing
-		// candidate. This retains the fine CFO accuracy without an O(samples ×
-		// frequency-search) burst of CPU work in the real-time decoder.
-		best = d.refineTrainingCandidate(bestStart, best)
+		timingStart, timingPeriod, timingOK := d.estimateTrainingTiming(bestStart, best)
+		if !timingOK {
+			timingStart = float64(bestStart)
+			timingPeriod = float64(d.sps)
+		}
+		best = d.refineTrainingCandidateTimed(timingStart, timingPeriod, best)
 		if best.score < 0.70 {
 			continue
 		}
-		d.applyTrainingLock(bestStart, best)
+		d.applyTrainingLockTimed(timingStart, timingPeriod, best)
 		d.locked = true
 		return
 	}
 	d.searchPos = last + 1
 }
 
-func (d *StreamDemodulator) applyTrainingLock(start int, candidate trainingCandidate) {
-	if candidate.amplitude > 1e-6 {
-		d.amplitudeScale = 1 / candidate.amplitude
-	} else {
-		d.amplitudeScale = 1
-	}
-	d.phase = candidate.phase
-	d.phaseStep = candidate.phaseStep
-	d.phaseRotation = cmplx.Rect(1, -(d.phase + d.phaseStep*(trainingSymbols+0.5)))
-	d.stepRotation = cmplx.Rect(1, -d.phaseStep)
-	d.cursor = start + trainingSymbols*d.sps
-	d.symbolIndex = 0
-	d.evmSignalPower = 0
-	d.evmErrorPower = 0
-	d.evmSymbols = 0
-	d.reacquireCount++
-}
-
 func (d *StreamDemodulator) compactBaseband() {
-	if d.cursor > len(d.baseband)/2 {
-		d.baseband = append([]complex64(nil), d.baseband[d.cursor:]...)
-		d.cursor = 0
+	if d.cursor > float64(len(d.baseband))/2 {
+		drop := int(d.cursor)
+		if drop > len(d.baseband) {
+			drop = len(d.baseband)
+		}
+		d.baseband = append([]complex64(nil), d.baseband[drop:]...)
+		d.cursor -= float64(drop)
+		if d.cursor < 0 {
+			d.cursor = 0
+		}
 	}
 }
 
 func (d *StreamDemodulator) decodeSymbolCount(count int) []float32 {
-	if count <= 0 || d.cursor+count*d.sps > len(d.baseband) {
+	period := d.samplesPerSymbol
+	if period <= 0 {
+		period = float64(d.sps)
+	}
+	if count <= 0 || d.cursor+float64(count-1)*period+period*0.75 >= float64(len(d.baseband)-1) {
 		return nil
 	}
 	out := make([]float32, 0, count*d.cfg.BitsPerSymbol)
-	first := d.sps / 4
-	last := d.sps - d.sps/4
-	center := float64(d.sps-1) * 0.5
-	stepScale := 1 / float64(d.sps)
+	stepPhase := cmplx.Phase(d.stepRotation)
 	for n := 0; n < count; n++ {
-		base := d.cursor + n*d.sps
-		// Integrate the central half-symbol aperture. Build the per-sample
-		// carrier rotation once, then advance it by recurrence; calling sin/cos
-		// for every sample used to dominate CPU at 16QAM's higher LLR cost.
-		stepPhase := cmplx.Phase(d.stepRotation) // negative estimated CFO, rad/symbol
-		localRotation := cmplx.Rect(1, stepPhase*(float64(first)-center)*stepScale)
-		rotationStep := cmplx.Rect(1, stepPhase*stepScale)
+		symbolStart := d.cursor
+		first := symbolStart + period*0.25
+		last := symbolStart + period*0.75
+		center := symbolStart + period*0.5
+		rotationStep := cmplx.Rect(1, stepPhase/period)
+		localRotation := cmplx.Rect(1, stepPhase*(first-center)/period)
 		symbolRotation := d.phaseRotation
 		var corrected complex128
-		for sampleIndex := first; sampleIndex < last; sampleIndex++ {
-			corrected += complex128(d.baseband[base+sampleIndex]) * symbolRotation * localRotation
+		samplesUsed := 0
+		for samplePosition := first; samplePosition < last; samplePosition += 1 {
+			corrected += sampleComplexLinear(d.baseband, samplePosition) * symbolRotation * localRotation
 			localRotation *= rotationStep
+			samplesUsed++
 		}
-		z := corrected / complex(float64(last-first), 0)
+		if samplesUsed == 0 {
+			return out
+		}
+		z := corrected / complex(float64(samplesUsed), 0)
 		z *= complex(d.amplitudeScale, 0)
 		decision := nearestConstellationPoint(z, d.cfg.BitsPerSymbol)
-		// Measure the post-synchronization error vector against the nearest ideal
-		// constellation point. Unlike an audio-spectrum noise-floor guess, this
-		// estimate is made inside the actual receive matched aperture and tracks
-		// residual noise, phase error and amplitude distortion. It is an EVM-based
-		// audio SNR estimate, not RF-calibrated SNR or Eb/N0.
 		errorVector := z - decision
 		errorPower := real(errorVector)*real(errorVector) + imag(errorVector)*imag(errorVector)
 		referencePower := real(decision)*real(decision) + imag(decision)*imag(decision)
 		const evmAlpha = 0.04
 		if d.evmSymbols == 0 {
-			d.evmErrorPower = errorPower
-			d.evmSignalPower = referencePower
+			d.evmErrorPower, d.evmSignalPower = errorPower, referencePower
 		} else {
 			d.evmErrorPower += evmAlpha * (errorPower - d.evmErrorPower)
 			d.evmSignalPower += evmAlpha * (referencePower - d.evmSignalPower)
@@ -608,13 +720,18 @@ func (d *StreamDemodulator) decodeSymbolCount(count int) []float32 {
 		d.phaseRotation *= d.stepRotation
 		out = appendConstellationLLR(out, z, d.cfg.BitsPerSymbol)
 		d.symbolIndex++
+		d.cursor += period
 	}
-	d.cursor += count * d.sps
 	return out
 }
 
 func (d *StreamDemodulator) decodeAvailableSoft() []float32 {
-	count := (len(d.baseband) - d.cursor) / d.sps
+	period := d.samplesPerSymbol
+	if period <= 0 {
+		period = float64(d.sps)
+	}
+	lastSafeStart := float64(len(d.baseband)-1) - period*0.75
+	count := int(math.Floor((lastSafeStart-d.cursor)/period)) + 1
 	out := d.decodeSymbolCount(count)
 	d.compactBaseband()
 	return out
@@ -896,17 +1013,19 @@ func gcd(a, b int) int {
 // UI can distinguish a modem that is still receiving samples from one that has
 // lost symbol lock or is waiting for a fresh training word.
 type StreamDiagnostics struct {
-	ReacquireCount  uint64
-	PacketizedMode  bool
-	Locked          bool
-	BufferedSamples int
-	SignalRMS       float64
-	SilenceSamples  int
-	BurstGeneration uint64
-	EVMRMS          float64
-	SNRDB           float64
-	SNRSamples      uint64
-	SNRValid        bool
+	ReacquireCount   uint64
+	PacketizedMode   bool
+	Locked           bool
+	BufferedSamples  int
+	SignalRMS        float64
+	SilenceSamples   int
+	BurstGeneration  uint64
+	SamplesPerSymbol float64
+	ClockOffsetPPM   float64
+	EVMRMS           float64
+	SNRDB            float64
+	SNRSamples       uint64
+	SNRValid         bool
 }
 
 func finiteEVM(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
@@ -915,9 +1034,14 @@ func (d *StreamDemodulator) Diagnostics() StreamDiagnostics {
 	if d == nil {
 		return StreamDiagnostics{}
 	}
+	period := d.samplesPerSymbol
+	if period <= 0 {
+		period = float64(d.sps)
+	}
 	status := StreamDiagnostics{
 		ReacquireCount: d.reacquireCount, PacketizedMode: d.packetizedMode, Locked: d.locked, BufferedSamples: len(d.baseband), SignalRMS: d.signalRMS,
-		SilenceSamples: d.silenceSamples, BurstGeneration: d.burstGeneration, SNRSamples: d.evmSymbols,
+		SilenceSamples: d.silenceSamples, BurstGeneration: d.burstGeneration, SamplesPerSymbol: period,
+		ClockOffsetPPM: (period/float64(d.sps) - 1) * 1e6, SNRSamples: d.evmSymbols,
 	}
 	if d.locked && d.evmSymbols >= 48 && d.evmSignalPower > 1e-8 {
 		evm2 := d.evmErrorPower / d.evmSignalPower

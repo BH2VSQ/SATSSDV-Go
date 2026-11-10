@@ -1149,3 +1149,55 @@ func encoderProfileForTest(t *testing.T, profile domain.TransportMode) domain.Pr
 	}
 	return parsed
 }
+
+func TestSDF3HeaderProbeRecoversAfterBadInitialDescriptor(t *testing.T) {
+	decoder, err := NewStreamDecoder(domain.SSDVQPSK1600, 48000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first descriptor is intentionally undecodable, as can happen when
+	// acquisition begins late or a short fade covers its repeated header.
+	badHeader := make([]float32, fec.BurstHeaderWireBits)
+	for i := range badHeader {
+		badHeader[i] = 8 // all-zero hard decisions, not a valid SDF3 header
+	}
+	decoder.consumeMARYSoft(badHeader)
+	if decoder.maryFECMode != 3 {
+		t.Fatalf("after damaged descriptor mode=%d, want legacy-probing", decoder.maryFECMode)
+	}
+
+	raw := make([]byte, 260)
+	header := fec.NewPacketBurstHeaderWithProfile(raw, fec.PacketFECProfileRate56)
+	encoded, err := header.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := fec.RepeatBurstHeader(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	llrs := make([]float32, 0, len(wire)*8)
+	for _, value := range wire {
+		for bit := 7; bit >= 0; bit-- {
+			if value&(1<<uint(bit)) != 0 {
+				llrs = append(llrs, -16)
+			} else {
+				llrs = append(llrs, 16)
+			}
+		}
+	}
+	// Split the repeated header across arbitrary audio callback boundaries.
+	for offset := 0; offset < len(llrs); offset += 17 {
+		end := min(offset+17, len(llrs))
+		decoder.consumeMARYSoft(llrs[offset:end])
+	}
+	if decoder.maryFECMode != 2 || decoder.maryPacketHeader == nil {
+		t.Fatalf("valid later SDF3 descriptor did not recover packetized mode: %+v", decoder.Diagnostics())
+	}
+	if decoder.maryPacketHeader.RawBytes != uint32(len(raw)) || decoder.maryPacketHeader.CodeProfile != fec.PacketFECProfileRate56 {
+		t.Fatalf("recovered wrong SDF3 descriptor: %+v", *decoder.maryPacketHeader)
+	}
+	if decoder.marySDF3HeaderRecoveries != 1 {
+		t.Fatalf("header recovery count=%d, want 1", decoder.marySDF3HeaderRecoveries)
+	}
+}
