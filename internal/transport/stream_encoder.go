@@ -105,7 +105,14 @@ func (e *Encoder) streamCCSDSFSK(ctx context.Context, profile domain.Profile, pa
 }
 
 func (e *Encoder) streamMARY(ctx context.Context, profile domain.Profile, packets [][]byte, sink *pcmStreamSink) (int64, error) {
-	mod, err := mary.NewStreamModulator(mary.Config{SampleRate: profile.SampleRate, SymbolRate: profile.SymbolRate, BitsPerSymbol: profile.BitsPerSymbol, CarrierHz: profile.CarrierHz})
+	return e.streamMARYWithCarrierImpairment(ctx, profile, packets, sink, 0, 0)
+}
+
+// streamMARYWithCarrierImpairment is the deterministic channel-test path.
+// Impairments are applied inside the complex modulator before real-audio
+// projection, rather than by translating the already-real passband waveform.
+func (e *Encoder) streamMARYWithCarrierImpairment(ctx context.Context, profile domain.Profile, packets [][]byte, sink *pcmStreamSink, offsetHz, driftHzPerSecond float64) (int64, error) {
+	mod, err := mary.NewStreamModulator(mary.Config{SampleRate: profile.SampleRate, SymbolRate: profile.SymbolRate, BitsPerSymbol: profile.BitsPerSymbol, CarrierHz: profile.CarrierHz, CarrierOffsetHz: offsetHz, CarrierDriftHzPerSecond: driftHzPerSecond})
 	if err != nil {
 		return 0, err
 	}

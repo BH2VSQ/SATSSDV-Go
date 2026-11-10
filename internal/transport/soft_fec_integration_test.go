@@ -181,16 +181,45 @@ func TestSoftFECMARYStreamRoundTripWithAWGN(t *testing.T) {
 	}
 }
 
-// TestSoftFECMARYWithAudioCFOAndAWGN exercises the current SDF3 production
-// transmitter and streaming receiver together. This deliberately does not use
-// EncodePackets, which is retained for legacy-format compatibility testing.
-func TestSoftFECMARYWithAudioCFOAndAWGN(t *testing.T) {
+// encodeMARYWithCarrierImpairment builds a production SDF3 stream while
+// applying a physical carrier offset/drift inside the complex modulator. This
+// avoids using a one-sided analytic-signal shifter on a wideband real waveform
+// whose lower sideband touches DC at the 1600 Hz / 1600 baud operating point.
+func encodeMARYWithCarrierImpairment(t *testing.T, profileID domain.TransportMode, packets [][]byte, offsetHz, driftHzPerSecond float64) []float32 {
+	t.Helper()
+	profile, err := domain.ParseProfile(string(profileID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoder, err := NewEncoder(Config{Profile: profileID, AudioSampleRate: profile.SampleRate, MARYBurstGroupSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waveform []float32
+	sink, err := newPCMStreamSink(profile.SampleRate, profile.SampleRate, false, func(block []float32) error {
+		waveform = append(waveform, block...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = encoder.streamMARYWithCarrierImpairment(context.Background(), profile, packets, sink, offsetHz, driftHzPerSecond); err != nil {
+		t.Fatal(err)
+	}
+	return waveform
+}
+
+// TestSoftFECMARYGIFSingleUnitGroupsWithAudioCFOAndAWGN exercises the
+// packet-progressive GIF SDF3 configuration through the production transmitter
+// and streaming receiver. Each image unit has its own FEC group so a damaged
+// unit cannot hold later image packets behind a larger grouped decode.
+func TestSoftFECMARYGIFSingleUnitGroupsWithAudioCFOAndAWGN(t *testing.T) {
 	packets := makeSoftFECTestPackets(t, 8)
 	profiles := []domain.TransportMode{domain.SSDVQPSK1600, domain.SSDV8PSK1600, domain.SSDV16QAM1600}
 	for _, profile := range profiles {
 		profile := profile
 		t.Run(string(profile), func(t *testing.T) {
-			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000})
+			encoder, err := NewEncoder(Config{Profile: profile, AudioSampleRate: 48000, MARYBurstGroupSize: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -212,13 +241,10 @@ func TestSoftFECMARYWithAudioCFOAndAWGN(t *testing.T) {
 
 			for _, offsetHz := range []float64{-200, 0, 200} {
 				t.Run(fmt.Sprintf("snr-%.0fdB-cfo-%+0.fHz", snrDB, offsetHz), func(t *testing.T) {
-					shifted, shiftErr := dsp.ShiftFrequency(waveform, 48000, offsetHz)
-					if shiftErr != nil {
-						t.Fatal(shiftErr)
-					}
+					impaired := encodeMARYWithCarrierImpairment(t, profile, packets, offsetHz, 0)
 					rng := rand.New(rand.NewSource(0x5eed + int64(len(profile))))
-					input := make([]float32, 2048, 2048+len(shifted)+4800)
-					for _, sample := range shifted {
+					input := make([]float32, 2048, 2048+len(impaired)+4800)
+					for _, sample := range impaired {
 						input = append(input, sample+float32(rng.NormFloat64()*noiseRMS))
 					}
 					// Keep the receiver running after PTT drops so the resampler and
@@ -250,10 +276,9 @@ func TestSoftFECMARYWithAudioCFOAndAWGN(t *testing.T) {
 			// satellite Doppler curve rather than only a fixed tuning error.
 			for _, ramp := range [][2]float64{{-150, 150}, {150, -150}} {
 				t.Run(fmt.Sprintf("cfo-ramp-%+.0f-to-%+.0fHz", ramp[0], ramp[1]), func(t *testing.T) {
-					ramped, rampErr := dsp.ShiftFrequencyRamp(waveform, 48000, ramp[0], ramp[1])
-					if rampErr != nil {
-						t.Fatal(rampErr)
-					}
+					durationSeconds := float64(len(waveform)) / 48000.0
+					driftHzPerSecond := (ramp[1] - ramp[0]) / durationSeconds
+					ramped := encodeMARYWithCarrierImpairment(t, profile, packets, ramp[0], driftHzPerSecond)
 					input := append(make([]float32, 2048), ramped...)
 					input = append(input, make([]float32, 4800)...)
 					decoder, decodeErr := NewStreamDecoder(profile, 48000)
@@ -697,10 +722,30 @@ func TestSDF3MARYReacquiresAcrossNoisyGroupGuards(t *testing.T) {
 			const snrDB = 6.0
 			noiseRMS := activeRMS / math.Pow(10, snrDB/20)
 			rng := rand.New(rand.NewSource(0x5344463300 + int64(len(profile))))
-			input := make([]float32, 2048, 2048+len(waveform)+9600)
-			for _, sample := range waveform {
-				input = append(input, sample+float32(rng.NormFloat64()*noiseRMS))
+			guarded := append([]float32(nil), waveform...)
+			guardSamples := 0
+			for start := 0; start < len(guarded); {
+				if math.Abs(float64(guarded[start])) > 1e-8 {
+					start++
+					continue
+				}
+				end := start + 1
+				for end < len(guarded) && math.Abs(float64(guarded[end])) <= 1e-8 {
+					end++
+				}
+				if end-start >= 4800 {
+					guardSamples += end - start
+					for i := start; i < end; i++ {
+						guarded[i] = float32(rng.NormFloat64() * noiseRMS)
+					}
+				}
+				start = end
 			}
+			if guardSamples == 0 {
+				t.Fatal("test waveform contained no inter-group quiet guard to noise")
+			}
+			input := make([]float32, 2048, 2048+len(guarded)+9600)
+			input = append(input, guarded...)
 			for i := 0; i < 9600; i++ {
 				input = append(input, float32(rng.NormFloat64()*noiseRMS))
 			}
@@ -904,7 +949,7 @@ func TestMARYGIFAudioLoopbackToleratesSoundcardClockOffset(t *testing.T) {
 				t.Fatal(err)
 			}
 			waveform = append(waveform, make([]float32, 4800)...)
-			for _, ppm := range []float64{-100, 100} {
+			for _, ppm := range []float64{-500, 500} {
 				t.Run(fmt.Sprintf("clock-%+.0fppm", ppm), func(t *testing.T) {
 					input := resampleForClockOffset(waveform, ppm)
 					var power float64

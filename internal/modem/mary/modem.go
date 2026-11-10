@@ -18,6 +18,12 @@ type Config struct {
 	SymbolRate    int
 	BitsPerSymbol int
 	CarrierHz     int
+
+	// CarrierOffsetHz and CarrierDriftHzPerSecond are transmitter-only
+	// impairments used by deterministic channel tests. A zero value preserves
+	// the normal LUT-based transmitter path.
+	CarrierOffsetHz         float64
+	CarrierDriftHzPerSecond float64
 }
 
 type StreamDemodulator struct {
@@ -539,17 +545,13 @@ func sampleComplexLinear(samples []complex64, position float64) complex128 {
 // fractional symbol period measured from the training edges. This separates
 // sample-clock error from carrier-frequency offset.
 func (d *StreamDemodulator) refineTrainingCandidateTimed(start, period float64, candidate trainingCandidate) trainingCandidate {
-	coarseHz := candidate.phaseStep * float64(d.cfg.SymbolRate) / (2 * math.Pi)
-	const searchSpanHz = 12.0
-	const searchStepHz = 1.0
-	minimumHz := math.Max(-float64(d.cfg.SymbolRate)*0.49, coarseHz-searchSpanHz)
-	maximumHz := math.Min(float64(d.cfg.SymbolRate)*0.49, coarseHz+searchSpanHz)
-	bestHz := coarseHz
-	bestScore := -1.0
-	var bestCorrelation complex128
-	bestMagnitude := 0.0
-	bestAmplitude := 0.0
-	for frequencyHz := minimumHz; frequencyHz <= maximumHz+searchStepHz*0.25; frequencyHz += searchStepHz {
+	coarseHz := candidate.phaseStep * float64(d.cfg.SampleRate) / (2 * math.Pi * period)
+	const coarseSpanHz = 12.0
+	const coarseStepHz = 1.0
+	minimumHz := math.Max(-float64(d.cfg.SymbolRate)*0.49, coarseHz-coarseSpanHz)
+	maximumHz := math.Min(float64(d.cfg.SymbolRate)*0.49, coarseHz+coarseSpanHz)
+
+	evaluate := func(frequencyHz float64) (complex128, float64, float64, float64) {
 		var correlation complex128
 		magnitude := 0.0
 		amplitudeSum := 0.0
@@ -574,15 +576,54 @@ func (d *StreamDemodulator) refineTrainingCandidateTimed(start, period float64, 
 			}
 		}
 		score := cmplx.Abs(correlation) / (magnitude + 1e-15)
+		return correlation, magnitude, amplitudeSum / trainingSymbols, score
+	}
+
+	// Coarse search obtains the correct CFO basin. A 1 Hz grid alone is not
+	// sufficient for long SDF3 groups: even a tenth of a hertz can accumulate
+	// several radians over thousands of payload symbols. Refine the winner to
+	// 0.01 Hz while the known training word is still available.
+	bestHz := coarseHz
+	bestScore := -1.0
+	bestMagnitude, bestAmplitude := 0.0, 0.0
+	consider := func(frequencyHz float64) {
+		_, magnitude, amplitude, score := evaluate(frequencyHz)
 		if score > bestScore {
-			bestScore, bestHz, bestCorrelation, bestMagnitude = score, frequencyHz, correlation, magnitude
-			bestAmplitude = amplitudeSum / trainingSymbols
+			bestScore, bestHz = score, frequencyHz
+			bestMagnitude, bestAmplitude = magnitude, amplitude
 		}
+	}
+	for frequencyHz := minimumHz; frequencyHz <= maximumHz+coarseStepHz*0.25; frequencyHz += coarseStepHz {
+		consider(frequencyHz)
+	}
+	const fineSpanHz = 1.0
+	const fineStepHz = 0.01
+	fineMinimum := math.Max(minimumHz, bestHz-fineSpanHz)
+	fineMaximum := math.Min(maximumHz, bestHz+fineSpanHz)
+	for frequencyHz := fineMinimum; frequencyHz <= fineMaximum+fineStepHz*0.25; frequencyHz += fineStepHz {
+		consider(frequencyHz)
 	}
 	if bestMagnitude <= 1e-15 {
 		return candidate
 	}
-	candidate.phase = cmplx.Phase(bestCorrelation)
+	// The full-symbol CFO objective is robust for frequency, but its phase can
+	// retain a small bias from the quadrature-mixer image. Re-estimate the
+	// training phase from short symbol-center apertures; the high-frequency
+	// image rotates across the known 96-symbol word and cancels coherently.
+	var centerCorrelation complex128
+	for symbol := 0; symbol < trainingSymbols; symbol++ {
+		var aperture complex128
+		for sampleOffset := -2; sampleOffset <= 2; sampleOffset++ {
+			position := start + (float64(symbol)+0.5)*period + float64(sampleOffset)
+			if position < 0 || position >= float64(len(d.baseband)-1) {
+				continue
+			}
+			rotation := cmplx.Rect(1, -2*math.Pi*bestHz*(position-start)/float64(d.cfg.SampleRate))
+			aperture += sampleComplexLinear(d.baseband, position) * rotation
+		}
+		centerCorrelation += aperture * complex(float64(trainingSequence[symbol]), 0)
+	}
+	candidate.phase = cmplx.Phase(centerCorrelation)
 	candidate.phaseStep = 2 * math.Pi * bestHz * period / float64(d.cfg.SampleRate)
 	candidate.amplitude = bestAmplitude
 	candidate.score = bestScore
@@ -642,12 +683,31 @@ func (d *StreamDemodulator) tryAcquire() {
 		if bestStart < 0 || best.score < 0.70 {
 			continue
 		}
+		// Refine carrier offset at nominal symbol timing first. The timing
+		// estimator then uses this lower-residual CFO to avoid confusing carrier
+		// rotation with the BPSK training transitions used for clock recovery.
+		best = d.refineTrainingCandidateTimed(float64(bestStart), float64(d.sps), best)
 		timingStart, timingPeriod, timingOK := d.estimateTrainingTiming(bestStart, best)
 		if !timingOK {
 			timingStart = float64(bestStart)
 			timingPeriod = float64(d.sps)
+		} else {
+			// Rebase the first CFO estimate from the coarse integer start to the
+			// fractional timing origin, and express phase advance using the measured
+			// sample period. The second CFO refinement is accepted only if its
+			// coherent score does not regress; otherwise preserve the known-good
+			// first estimate rather than rejecting a valid acquisition.
+			first := best
+			firstHz := first.phaseStep * float64(d.cfg.SampleRate) / (2 * math.Pi * float64(d.sps))
+			first.phase += 2 * math.Pi * firstHz * (timingStart - float64(bestStart)) / float64(d.cfg.SampleRate)
+			first.phaseStep = 2 * math.Pi * firstHz * timingPeriod / float64(d.cfg.SampleRate)
+			refined := d.refineTrainingCandidateTimed(timingStart, timingPeriod, first)
+			if refined.score >= first.score {
+				best = refined
+			} else {
+				best = first
+			}
 		}
-		best = d.refineTrainingCandidateTimed(timingStart, timingPeriod, best)
 		if best.score < 0.70 {
 			continue
 		}

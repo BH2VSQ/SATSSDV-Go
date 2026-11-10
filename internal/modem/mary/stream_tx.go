@@ -9,16 +9,18 @@ import (
 // The training word is emitted once, while bit packing and carrier phase are
 // retained between WriteBytes calls.
 type StreamModulator struct {
-	cfg         Config
-	sps         int
-	period      int
-	cosLUT      []float64
-	sinLUT      []float64
-	sampleIndex uint64
-	pending     [4]bool
-	pendingN    int
-	started     bool
-	closed      bool
+	cfg            Config
+	sps            int
+	period         int
+	cosLUT         []float64
+	sinLUT         []float64
+	sampleIndex    uint64
+	carrierPhase   float64
+	dynamicCarrier bool
+	pending        [4]bool
+	pendingN       int
+	started        bool
+	closed         bool
 }
 
 func NewStreamModulator(cfg Config) (*StreamModulator, error) {
@@ -28,11 +30,16 @@ func NewStreamModulator(cfg Config) (*StreamModulator, error) {
 	if cfg.CarrierHz <= 0 {
 		cfg.CarrierHz = cfg.SymbolRate
 	}
-	if cfg.CarrierHz >= cfg.SampleRate/2 {
-		return nil, errors.New("M-ary carrier must be below Nyquist")
+	effectiveCarrier := float64(cfg.CarrierHz) + cfg.CarrierOffsetHz
+	if effectiveCarrier <= 0 || effectiveCarrier >= float64(cfg.SampleRate)/2 {
+		return nil, errors.New("M-ary effective carrier must be above zero and below Nyquist")
+	}
+	if math.IsNaN(cfg.CarrierOffsetHz) || math.IsInf(cfg.CarrierOffsetHz, 0) || math.IsNaN(cfg.CarrierDriftHzPerSecond) || math.IsInf(cfg.CarrierDriftHzPerSecond, 0) {
+		return nil, errors.New("M-ary carrier offset and drift must be finite")
 	}
 	period := cfg.SampleRate / gcd(cfg.SampleRate, cfg.CarrierHz)
-	m := &StreamModulator{cfg: cfg, sps: cfg.SampleRate / cfg.SymbolRate, period: period, cosLUT: make([]float64, period), sinLUT: make([]float64, period)}
+	dynamicCarrier := cfg.CarrierOffsetHz != 0 || cfg.CarrierDriftHzPerSecond != 0
+	m := &StreamModulator{cfg: cfg, sps: cfg.SampleRate / cfg.SymbolRate, period: period, cosLUT: make([]float64, period), sinLUT: make([]float64, period), dynamicCarrier: dynamicCarrier}
 	for i := 0; i < period; i++ {
 		phase := 2 * math.Pi * float64(cfg.CarrierHz) * float64(i) / float64(cfg.SampleRate)
 		m.cosLUT[i], m.sinLUT[i] = math.Cos(phase), math.Sin(phase)
@@ -146,8 +153,22 @@ func (m *StreamModulator) Close() ([]float32, error) {
 func (m *StreamModulator) writeSymbol(symbol complex64, out []float32, pos *int) {
 	iPart, qPart := float64(real(symbol)), float64(imag(symbol))
 	for j := 0; j < m.sps; j++ {
-		lut := int(m.sampleIndex % uint64(m.period))
-		out[*pos] = float32(defaultAmplitude * (iPart*m.cosLUT[lut] - qPart*m.sinLUT[lut]))
+		var cosine, sine float64
+		if !m.dynamicCarrier {
+			lut := int(m.sampleIndex % uint64(m.period))
+			cosine, sine = m.cosLUT[lut], m.sinLUT[lut]
+		} else {
+			// Apply CFO in the complex transmitter before the real-audio
+			// projection. This is a physically faithful carrier impairment for
+			// wideband M-ary audio whose lower sideband approaches DC; shifting
+			// the real waveform via a one-sided analytic-signal transform is not
+			// equivalent in that case.
+			cosine, sine = math.Cos(m.carrierPhase), math.Sin(m.carrierPhase)
+			t := float64(m.sampleIndex) / float64(m.cfg.SampleRate)
+			instantaneousHz := float64(m.cfg.CarrierHz) + m.cfg.CarrierOffsetHz + m.cfg.CarrierDriftHzPerSecond*t
+			m.carrierPhase = math.Remainder(m.carrierPhase+2*math.Pi*instantaneousHz/float64(m.cfg.SampleRate), 2*math.Pi)
+		}
+		out[*pos] = float32(defaultAmplitude * (iPart*cosine - qPart*sine))
 		(*pos)++
 		m.sampleIndex++
 	}

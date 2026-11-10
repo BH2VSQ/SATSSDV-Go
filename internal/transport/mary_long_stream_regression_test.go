@@ -85,68 +85,70 @@ func TestMARYLongGIFLoopbackAutoDetection(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			for _, ppm := range []float64{-500, 0, 500} {
-				ppm := ppm
-				t.Run(fmt.Sprintf("clock_%+.0fppm", ppm), func(t *testing.T) {
-					loopback := resampleMARYClockOffset(waveform, ppm)
-					loopback = addMARYLoopbackNoise(loopback, 24, int64(0x4d415259+profileIndex(profile)*100+int(ppm)))
-					auto, err := NewAutoStreamDecoder(48000)
+
+			// One 70-packet automatic-detection run per constellation keeps CI
+			// bounded while testing a substantial positive clock mismatch. The
+			// shorter sound-card clock test covers both polarities for all modes.
+			ppm := 500.0
+			t.Run(fmt.Sprintf("clock_%+.0fppm", ppm), func(t *testing.T) {
+				loopback := resampleMARYClockOffset(waveform, ppm)
+				loopback = addMARYLoopbackNoise(loopback, 24, int64(0x4d415259+profileIndex(profile)*100+int(ppm)))
+				auto, err := NewAutoStreamDecoder(48000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				seen := make(map[uint16]bool)
+				multi := 0
+				for offset := 0; offset < len(loopback); offset += 997 {
+					end := min(offset+997, len(loopback))
+					decoded, err := auto.Feed(loopback[offset:end])
 					if err != nil {
-						t.Fatal(err)
+						t.Fatalf("Feed offset=%d: %v", offset, err)
 					}
-					seen := make(map[uint16]bool)
-					multi := 0
-					for offset := 0; offset < len(loopback); offset += 997 {
-						end := min(offset+997, len(loopback))
-						decoded, err := auto.Feed(loopback[offset:end])
-						if err != nil {
-							t.Fatalf("Feed offset=%d: %v", offset, err)
-						}
-						if len(decoded) > 1 {
-							multi++
-						}
-						for _, packet := range decoded {
-							seen[packet.PacketID] = true
-						}
+					if len(decoded) > 1 {
+						multi++
 					}
-					expected := make(map[uint16]bool)
-					for _, raw := range packets {
-						expected[uint16(raw[7])<<8|uint16(raw[8])] = true
+					for _, packet := range decoded {
+						seen[packet.PacketID] = true
 					}
-					missing := make([]uint16, 0)
-					for id := range expected {
-						if !seen[id] {
-							missing = append(missing, id)
-						}
+				}
+				expected := make(map[uint16]bool)
+				for _, raw := range packets {
+					expected[uint16(raw[7])<<8|uint16(raw[8])] = true
+				}
+				missing := make([]uint16, 0)
+				for id := range expected {
+					if !seen[id] {
+						missing = append(missing, id)
 					}
-					diagnostics := auto.Diagnostics()
-					if len(missing) != 0 {
-						t.Fatalf("auto loopback recovered %d/%d unique image packets; missing=%v multi-packet callbacks=%d diagnostics=%+v", len(seen), len(expected), missing[:min(12, len(missing))], multi, diagnostics)
+				}
+				diagnostics := auto.Diagnostics()
+				if len(missing) != 0 {
+					t.Fatalf("auto loopback recovered %d/%d unique image packets; missing=%v multi-packet callbacks=%d diagnostics=%+v", len(seen), len(expected), missing[:min(12, len(missing))], multi, diagnostics)
+				}
+				if multi != 0 {
+					t.Fatalf("one audio callback delivered multiple image packets %d times", multi)
+				}
+				locked := false
+				fecOK, fecBad, selectedSamples := uint64(0), uint64(0), uint64(0)
+				maxOtherSamples := uint64(0)
+				for _, candidate := range diagnostics.MARYCandidates {
+					if candidate.Profile == string(profile) {
+						locked = candidate.DecodedPackets == uint64(len(seen))
+						fecOK, fecBad = candidate.FECChunksOK, candidate.FECChunksBad
+						selectedSamples = candidate.InputSamples
+					} else if candidate.InputSamples > maxOtherSamples {
+						maxOtherSamples = candidate.InputSamples
 					}
-					if multi != 0 {
-						t.Fatalf("one audio callback delivered multiple image packets %d times", multi)
-					}
-					locked := false
-					fecOK, fecBad, selectedSamples := uint64(0), uint64(0), uint64(0)
-					maxOtherSamples := uint64(0)
-					for _, candidate := range diagnostics.MARYCandidates {
-						if candidate.Profile == string(profile) {
-							locked = candidate.DecodedPackets == uint64(len(seen))
-							fecOK, fecBad = candidate.FECChunksOK, candidate.FECChunksBad
-							selectedSamples = candidate.InputSamples
-						} else if candidate.InputSamples > maxOtherSamples {
-							maxOtherSamples = candidate.InputSamples
-						}
-					}
-					if !locked || fecOK+fecBad < uint64(len(packets)) || fecBad > 3 {
-						t.Fatalf("selected MARY branch did not preserve packet/FEC recovery: locked=%v FEC=%d/%d; diagnostics=%+v", locked, fecOK, fecBad, diagnostics)
-					}
-					if selectedSamples > 0 && maxOtherSamples > selectedSamples/8 {
-						t.Fatalf("automatic detector continued feeding inactive MARY candidates: selected=%d samples, other=%d; diagnostics=%+v", selectedSamples, maxOtherSamples, diagnostics)
-					}
-					t.Logf("clock=%+.0f ppm SNR=24 dB recovered %d/%d image IDs; callbacks with >1 packet=%d; FEC=%d/%d; selected samples=%d other max=%d", ppm, len(seen), len(expected), multi, fecOK, fecBad, selectedSamples, maxOtherSamples)
-				})
-			}
+				}
+				if !locked || fecOK+fecBad < uint64(len(packets)) || fecBad > 3 {
+					t.Fatalf("selected MARY branch did not preserve packet/FEC recovery: locked=%v FEC=%d/%d; diagnostics=%+v", locked, fecOK, fecBad, diagnostics)
+				}
+				if selectedSamples > 0 && maxOtherSamples > selectedSamples/8 {
+					t.Fatalf("automatic detector continued feeding inactive MARY candidates: selected=%d samples, other=%d; diagnostics=%+v", selectedSamples, maxOtherSamples, diagnostics)
+				}
+				t.Logf("clock=%+.0f ppm SNR=24 dB recovered %d/%d image IDs; callbacks with >1 packet=%d; FEC=%d/%d; selected samples=%d other max=%d", ppm, len(seen), len(expected), multi, fecOK, fecBad, selectedSamples, maxOtherSamples)
+			})
 		})
 	}
 }
